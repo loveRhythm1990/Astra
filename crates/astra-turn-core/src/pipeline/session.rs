@@ -29,8 +29,8 @@ use crate::pipeline_config::PipelineConfig;
 use crate::pipeline_stats::PipelineStats;
 use crate::recovery_state::RecoveryState;
 use crate::session_latches::SessionLatches;
-use crate::shadow_diff::{ShadowDiffResult, diff_pipeline_outputs};
 use crate::working_memory::WorkingMemoryState;
+use std::sync::Arc;
 
 /// Per-turn input provided by the agentic loop to `PipelineSession::run_turn()`.
 pub struct TurnInput<'a> {
@@ -64,12 +64,6 @@ pub struct TurnOutput {
     pub metrics: PipelineRunMetrics,
 }
 
-/// Shadow mode comparison result (when running dual paths during rollout).
-pub struct ShadowTurnOutput {
-    pub pipeline_output: TurnOutput,
-    pub diff: ShadowDiffResult,
-}
-
 /// Session-scoped pipeline orchestrator.
 ///
 /// Instantiated once per session. Accumulates statistics, latches, emergent
@@ -77,6 +71,7 @@ pub struct ShadowTurnOutput {
 /// `run_turn()` before each LLM request and `record_feedback()` after.
 pub struct PipelineSession {
     pipeline: ContextPipeline,
+    static_sections: Option<Arc<StaticSections>>,
     pub stats: PipelineStats,
     pub latches: SessionLatches,
     pub emergent: EmergentContext,
@@ -168,6 +163,7 @@ impl PipelineSession {
     ) -> Self {
         Self {
             pipeline: ContextPipeline::new(config),
+            static_sections: None,
             stats: PipelineStats::default(),
             latches: SessionLatches::default(),
             emergent: EmergentContext::default(),
@@ -193,6 +189,7 @@ impl PipelineSession {
     ) -> Self {
         Self {
             pipeline: ContextPipeline::new(config),
+            static_sections: None,
             stats,
             latches: SessionLatches::default(),
             emergent: EmergentContext::default(),
@@ -224,6 +221,7 @@ impl PipelineSession {
     ) -> Self {
         Self {
             pipeline: ContextPipeline::new(config),
+            static_sections: None,
             stats,
             latches,
             emergent: EmergentContext::default(),
@@ -244,6 +242,18 @@ impl PipelineSession {
     #[must_use]
     pub fn turns_completed(&self) -> u32 {
         self.turns_completed
+    }
+
+    /// Return the immutable prompt sections owned by this pipeline session,
+    /// building them once on first use. The returned `Arc` lets the caller
+    /// borrow the sections while mutably advancing the rest of the session.
+    pub fn static_sections_or_init(
+        &mut self,
+        init: impl FnOnce() -> StaticSections,
+    ) -> Arc<StaticSections> {
+        self.static_sections
+            .get_or_insert_with(|| Arc::new(init()))
+            .clone()
     }
 
     /// Run the pipeline for one turn. Returns the serialized provider request
@@ -435,22 +445,6 @@ impl PipelineSession {
             );
         }
         accepted
-    }
-
-    /// Run the pipeline in shadow mode: produce pipeline output AND compare
-    /// against a pre-computed legacy `ContextOptimized` for diffing.
-    pub fn run_turn_shadow(
-        &mut self,
-        input: TurnInput<'_>,
-        legacy_output: &ContextOptimized,
-    ) -> Result<ShadowTurnOutput, PipelineAbort> {
-        let turn_index = input.turn.turn_index;
-        let output = self.run_turn(input)?;
-        let diff = diff_pipeline_outputs(legacy_output, &output.optimized, turn_index);
-        Ok(ShadowTurnOutput {
-            pipeline_output: output,
-            diff,
-        })
     }
 
     /// Record feedback from the API response. Updates stats, recovery state,
@@ -847,6 +841,7 @@ impl PipelineSession {
 
         Self {
             pipeline: ContextPipeline::new(config),
+            static_sections: None,
             stats,
             latches,
             emergent,
@@ -1076,6 +1071,32 @@ mod tests {
         assert_eq!(actual.system_blocks, expected.system_blocks);
         assert_eq!(actual.tools_hash, expected.tools_hash);
         assert_eq!(actual.cache_eligible_tokens, 7_225);
+    }
+
+    #[test]
+    fn static_sections_cache_is_scoped_to_pipeline_session() {
+        let mut first_session = PipelineSession::new(PipelineConfig::default());
+        let first = first_session.static_sections_or_init(|| {
+            let mut sections = StaticSections::test_default();
+            sections.core_rules.text = "first session".into();
+            sections
+        });
+        let reused = first_session.static_sections_or_init(|| {
+            panic!("a pipeline session must build static sections only once")
+        });
+
+        assert!(Arc::ptr_eq(&first, &reused));
+        assert_eq!(reused.core_rules.text, "first session");
+
+        let mut second_session = PipelineSession::new(PipelineConfig::default());
+        let second = second_session.static_sections_or_init(|| {
+            let mut sections = StaticSections::test_default();
+            sections.core_rules.text = "second session".into();
+            sections
+        });
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.core_rules.text, "second session");
     }
 
     fn test_external() -> ExternalSources {
@@ -1337,44 +1358,6 @@ mod tests {
         sess.record_feedback("model", "repl", &mut feedback, None);
         assert_eq!(sess.recovery.consecutive_ptl_errors, 0);
         assert!(!sess.recovery.is_in_recovery());
-    }
-
-    #[test]
-    fn shadow_mode_detects_no_diff_on_same_output() {
-        let mut sess = PipelineSession::new(PipelineConfig::default());
-        let statics = test_statics();
-        let agent = AgentContext::default();
-        let session = test_session_context();
-        let turn = test_turn_state(1);
-        let external = test_external();
-        let limits = OptimizeLimits::default();
-
-        let input = TurnInput {
-            statics: &statics,
-            agent: &agent,
-            session: &session,
-            turn: &turn,
-            external: &external,
-            optimize_limits: &limits,
-            model_id: "model",
-            query_source: "repl",
-        };
-
-        let output = sess.run_turn(input).unwrap();
-
-        let input2 = TurnInput {
-            statics: &statics,
-            agent: &agent,
-            session: &session,
-            turn: &turn,
-            external: &external,
-            optimize_limits: &limits,
-            model_id: "model",
-            query_source: "repl",
-        };
-
-        let shadow = sess.run_turn_shadow(input2, &output.optimized).unwrap();
-        assert!(shadow.diff.is_clean());
     }
 
     #[test]
