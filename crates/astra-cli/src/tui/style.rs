@@ -28,10 +28,12 @@ pub(crate) fn proposed_plan_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Styl
     user_message_style_for(terminal_bg)
 }
 
+type SurfaceTint = fn((u8, u8, u8)) -> (u8, u8, u8);
+
 fn surface_style(
     theme: &super::theme::Theme,
     terminal_bg: Option<(u8, u8, u8)>,
-    tint: fn((u8, u8, u8)) -> (u8, u8, u8),
+    tint: SurfaceTint,
 ) -> Style {
     // Plain/unknown themes must stay uncoloured even when environment hints
     // are present. Explicit theme selection wins over conflicting hints.
