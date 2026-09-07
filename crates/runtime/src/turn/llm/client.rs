@@ -4796,6 +4796,21 @@ async fn call_llm_and_collect_with_total_budget(
         // `ControlledProviderAttemptObserver` above. Keep deadline ownership in
         // that single layer so a durable-admission stall is classified as an
         // inference-ledger failure instead of racing an outer provider timer.
+        let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
+            Some(
+                astra_services::byok_endpoint::endpoint_client(&url)
+                    .await
+                    .map_err(|error| {
+                        astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::InvalidRequest,
+                            error,
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        let client = compatible_client.as_deref().unwrap_or(client);
         let observed_attempt = match attempt_observer {
             Some(observer) => Some(observer.begin_attempt(prepared_request.identity()).await?),
             None => None,
@@ -6949,6 +6964,18 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     );
     let _registered_endpoint_permit =
         acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
+    let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
+        Some(
+            astra_services::byok_endpoint::endpoint_client(&url)
+                .await
+                .map_err(|error| {
+                    astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
+                })?,
+        )
+    } else {
+        None
+    };
+    let client = compatible_client.as_deref().unwrap_or(client);
     let observed_attempt = match attempt_observer {
         Some(observer) => Some(observer.begin_attempt(prepared_request.identity()).await?),
         None => None,
@@ -7526,6 +7553,82 @@ pub(crate) fn parse_openai_sse_json_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_byok_compatible_reuses_openai_message_and_tool_wire_format() {
+        let messages = vec![json!({"role":"user","content":"Use the calculator"})];
+        let tools = vec![json!({"type":"function", "function":{
+            "name":"calculator", "description":"Add numbers",
+            "parameters":{"type":"object", "properties":{"a":{"type":"number"}}}
+        }})];
+        for streaming in [false, true] {
+            let body = build_provider_request_body(
+                &messages,
+                &tools,
+                "upstream-model",
+                "openai-compatible",
+                Some(128),
+                None,
+                streaming,
+                &ThinkingConfig::Off,
+            );
+            let expected = build_provider_request_body(
+                &messages,
+                &tools,
+                "upstream-model",
+                "openai",
+                Some(128),
+                None,
+                streaming,
+                &ThinkingConfig::Off,
+            );
+            assert_eq!(body, expected);
+            assert_eq!(body["model"], "upstream-model");
+            assert_eq!(body["tools"][0]["function"]["name"], "calculator");
+        }
+    }
+
+    #[tokio::test]
+    async fn cloud_byok_compatible_blocks_private_endpoint_in_both_transports() {
+        let messages = vec![json!({"role":"user","content":"hello"})];
+        for streaming in [false, true] {
+            let call = LlmCall {
+                purpose: astra_turn_types::InferencePurpose::SubAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    model_name: "test-model",
+                    wire_model_name: None,
+                    api_key: "sk-private-secret",
+                    base_url: "http://127.0.0.1:9/v1",
+                    provider: "openai-compatible",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: Some(128),
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            };
+            let result = if streaming {
+                call_llm_and_collect(call, LlmCancel::None).await
+            } else {
+                call_llm_nonstream(
+                    global_llm_client(),
+                    call,
+                    std::time::Duration::from_secs(10),
+                )
+                .await
+            };
+            let error = result.expect_err("private endpoint must fail before network I/O");
+            assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+            assert!(error.message.contains("HTTPS"));
+            assert!(!error.to_string().contains("sk-private-secret"));
+        }
+    }
     use axum::Router;
     use axum::body::Body;
     use axum::extract::State;

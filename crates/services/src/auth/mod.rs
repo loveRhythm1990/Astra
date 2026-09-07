@@ -43,9 +43,11 @@ mod admin;
 mod encryption;
 pub mod external;
 mod jwt;
+pub mod memoria;
 pub mod provider_request;
 pub mod session;
 mod validation;
+mod verified;
 
 pub use admin::{
     DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminFeedbackStatsReader,
@@ -409,15 +411,28 @@ pub trait AuthService: Send + Sync {
         request: AuthLoginRequestData,
     ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)>;
 
-    /// Issue an Astra session for an identity already verified by a trusted
-    /// first-party integration boundary (for example, a scoped Memoria key).
-    async fn login_verified_identity(
+    /// The authentication service owns verification, identity, session and binding.
+    async fn login_memoria(
         &self,
-        _request: VerifiedIdentityLoginRequestData,
-    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        _connection_key: &str,
+    ) -> Result<memoria::MemoriaLogin, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "Verified identity login is not configured",
+        ))
+    }
+
+    fn memoria_credentials(&self) -> Option<memoria::MemoriaCredentialResolver> {
+        None
+    }
+
+    async fn disconnect_memoria(
+        &self,
+        _user_id: &str,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Memoria connection is not configured",
         ))
     }
 
@@ -575,12 +590,6 @@ pub struct AuthLoginRequestData {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerifiedIdentityLoginRequestData {
-    pub user_id: String,
-    pub provider: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthRefreshRequestData {
     pub refresh_token: String,
 }
@@ -661,6 +670,10 @@ impl AuthPrincipal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthPrincipalOrigin {
     Internal,
+    VerifiedProvider {
+        provider_id: String,
+        external_subject: String,
+    },
     ProviderAuthorizedRequest(AuthProviderAuthorizedRequestContext),
 }
 
@@ -705,6 +718,7 @@ pub struct DatabaseAuthService {
     control_pool: Option<SharedPool>,
     jwt: JwtSettings,
     encryptor: Option<FernetTokenEncryptor>,
+    memoria_provider: Option<memoria::MemoriaProvider>,
     ext_providers: Vec<ExternalAuthProviderConfig>,
     external_client: std::sync::Arc<dyn ExternalProviderClient>,
     provider_request_auth: Vec<ProviderRequestAuthConfig>,
@@ -780,6 +794,7 @@ impl DatabaseAuthService {
             pool: None,
             control_pool: None,
             encryptor: None,
+            memoria_provider: None,
             ext_providers: Vec::new(),
             external_client: HttpExternalProviderClient::shared(),
             provider_request_auth: Vec::new(),
@@ -907,7 +922,14 @@ impl DatabaseAuthService {
                 iat: 0,
                 jti: String::new(),
             },
-            ChronoDuration::minutes(i64::from(self.jwt.access_token_expire_minutes)),
+            ChronoDuration::seconds(i64::from(
+                if origin == "memoria" || origin.starts_with("verified:memoria:") {
+                    self.access_token_expires_in_seconds()
+                        .min(memoria::ACCESS_TTL_SECONDS)
+                } else {
+                    self.access_token_expires_in_seconds()
+                },
+            )),
         )
     }
 
@@ -1254,7 +1276,8 @@ impl DatabaseAuthService {
             .clone()
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Invalid token origin"))?;
         match origin.as_str() {
-            "internal" => Ok((session_id, origin, None)),
+            "internal" | "memoria" => Ok((session_id, origin, None)),
+            value if value.starts_with("verified:memoria:") => Ok((session_id, origin, None)),
             _ => Err(error_response(
                 StatusCode::UNAUTHORIZED,
                 "Invalid token origin",
@@ -1303,69 +1326,19 @@ impl DatabaseAuthService {
         let now = Utc::now();
         let external_expires_at = self.parse_provider_expires_at(&response.expires_at)?;
         let astra_session_id = Uuid::new_v4().to_string();
-        let astra_user_id = Uuid::new_v4().to_string();
-        let internal_username = format!("ext_{}", astra_user_id.replace('-', ""));
-        let internal_email = format!("{internal_username}@external.astra.invalid");
 
         let mut tx = pool
             .begin()
             .await
             .map_err(|e| map_auth_sqlx(e, "external.begin_tx", Some(&pool)))?;
-        let existing_identity = query(
-            "SELECT astra_user_id FROM auth_external_identities \
-             WHERE provider_id = ? AND external_subject = ? LIMIT 1",
-        )
-        .bind(&provider.id)
-        .bind(&external_subject)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| map_auth_sqlx(e, "external.fetch_identity", Some(&pool)))?;
-
-        let astra_user_id = if let Some(row) = existing_identity {
-            let existing_user_id: String = row.try_get("astra_user_id").unwrap_or_default();
-            query(
-                "UPDATE auth_external_identities \
-                 SET username = ?, email = ?, display_name = ?, updated_at = NOW() \
-                 WHERE provider_id = ? AND external_subject = ?",
-            )
-            .bind(&external_username)
-            .bind(&external_email)
-            .bind(&external_display_name)
-            .bind(&provider.id)
-            .bind(&external_subject)
-            .execute(&mut *tx)
-            .await
+        let user = self
+            .resolve_verified_provider_identity(&mut tx, &provider.id, &external_subject, None)
+            .await?;
+        let astra_user_id = user.user_id;
+        query("UPDATE auth_external_identities SET username = ?, email = ?, display_name = ?, updated_at = NOW() WHERE provider_id = ? AND external_subject = ?")
+            .bind(&external_username).bind(&external_email).bind(&external_display_name)
+            .bind(&provider.id).bind(&external_subject).execute(&mut *tx).await
             .map_err(|e| map_auth_sqlx(e, "external.update_identity", Some(&pool)))?;
-            existing_user_id
-        } else {
-            query(
-                "INSERT INTO auth_users \
-                 (user_id, username, email, password_hash, display_name, is_active) \
-                 VALUES (?, ?, ?, '', ?, 1)",
-            )
-            .bind(&astra_user_id)
-            .bind(&internal_username)
-            .bind(&internal_email)
-            .bind(&external_display_name)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "external.insert_auth_user", Some(&pool)))?;
-            query(
-                "INSERT INTO auth_external_identities \
-                 (provider_id, external_subject, astra_user_id, username, email, display_name) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&provider.id)
-            .bind(&external_subject)
-            .bind(&astra_user_id)
-            .bind(&external_username)
-            .bind(&external_email)
-            .bind(&external_display_name)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "external.insert_identity", Some(&pool)))?;
-            astra_user_id
-        };
 
         query(
             "INSERT INTO auth_external_sessions \
@@ -1763,130 +1736,16 @@ impl AuthService for DatabaseAuthService {
         })
     }
 
-    async fn login_verified_identity(
-        &self,
-        request: VerifiedIdentityLoginRequestData,
-    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-        let user_id = request.user_id.trim();
-        if user_id.is_empty() || user_id.len() > 128 || request.provider != "memoria" {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                "Invalid verified identity",
-            ));
-        }
-        let pool = self
-            .get_pool()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "verified_identity.get_pool", None))?;
-        self.ensure_default_roles(&pool)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "verified_identity.ensure_default_roles", Some(&pool)))?;
+    async fn login_memoria(&self, key: &str) -> Result<memoria::MemoriaLogin, AuthHttpError> {
+        self.memoria_login(key).await
+    }
 
-        let digest = sha256_hex(user_id);
-        let astra_user_id = format!("memoria_{digest}");
-        let username = format!("memoria_{}", &digest[..24]);
-        let email = format!("memoria_{digest}@external.astra.invalid");
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "verified_identity.begin_tx", Some(&pool)))?;
-        let mapped_user_id = query(
-            "SELECT astra_user_id FROM auth_memoria_identities \
-             WHERE memoria_user_id = ? LIMIT 1",
-        )
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| map_auth_sqlx(e, "verified_identity.fetch_mapping", Some(&pool)))?
-        .and_then(|row| row.try_get::<String, _>("astra_user_id").ok());
-        let existing = if let Some(mapped_user_id) = mapped_user_id.as_deref() {
-            self.fetch_user_by_id_or_username(&mut *tx, mapped_user_id, None)
-                .await
-                .map_err(|e| map_auth_sqlx(e, "verified_identity.fetch_user", Some(&pool)))?
-        } else {
-            None
-        };
-        let user = if let Some(user) = existing {
-            if !user.is_active {
-                tx.rollback().await.ok();
-                return Err(error_response(StatusCode::FORBIDDEN, "User is inactive"));
-            }
-            user
-        } else {
-            query(
-                "INSERT INTO auth_users \
-                 (user_id, username, email, password_hash, display_name, is_active) \
-                 VALUES (?, ?, ?, '', 'Memoria user', 1)",
-            )
-            .bind(&astra_user_id)
-            .bind(&username)
-            .bind(&email)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "verified_identity.insert_user", Some(&pool)))?;
-            query(
-                "INSERT INTO auth_memoria_identities (memoria_user_id, astra_user_id) \
-                 VALUES (?, ?)",
-            )
-            .bind(user_id)
-            .bind(&astra_user_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "verified_identity.insert_mapping", Some(&pool)))?;
-            query(
-                "INSERT IGNORE INTO auth_user_roles (user_id, role_id) \
-                 SELECT ?, role_id FROM auth_roles WHERE role_name = 'astra_user'",
-            )
-            .bind(&astra_user_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "verified_identity.assign_role", Some(&pool)))?;
-            DatabaseUserRecord {
-                user_id: astra_user_id,
-                username: username.clone(),
-                email,
-                password_hash: String::new(),
-                display_name: Some("Memoria user".to_string()),
-                is_active: true,
-            }
-        };
+    fn memoria_credentials(&self) -> Option<memoria::MemoriaCredentialResolver> {
+        self.credential_resolver()
+    }
 
-        let session_id = Uuid::new_v4().to_string();
-        let access_token = self
-            .create_access_token(&user.user_id, &user.username, &session_id, "internal")
-            .map_err(internal_error)?;
-        let refresh_token = self
-            .create_refresh_token(&user.user_id, &session_id, "internal")
-            .map_err(internal_error)?;
-        query("UPDATE auth_users SET last_login_at = NOW() WHERE user_id = ?")
-            .bind(&user.user_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "verified_identity.update_login", Some(&pool)))?;
-        query(
-            "INSERT INTO auth_refresh_tokens \
-             (token_id, user_id, session_id, token_hash, expires_at, is_revoked) \
-             VALUES (?, ?, ?, ?, ?, 0)",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(&user.user_id)
-        .bind(&session_id)
-        .bind(sha256_hex(&refresh_token))
-        .bind(self.refresh_token_expires_at_string(Utc::now()))
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| map_auth_sqlx(e, "verified_identity.insert_refresh", Some(&pool)))?;
-        tx.commit()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "verified_identity.commit", Some(&pool)))?;
-
-        Ok(AuthTokenRecord {
-            user_id: user.user_id,
-            access_token,
-            refresh_token,
-            token_type: "bearer".to_string(),
-            expires_in: self.access_token_expires_in_seconds(),
-        })
+    async fn disconnect_memoria(&self, user_id: &str) -> Result<(), AuthHttpError> {
+        self.memoria_disconnect(user_id).await
     }
 
     async fn refresh(
@@ -1936,6 +1795,29 @@ impl AuthService for DatabaseAuthService {
             .map_err(|e| map_auth_sqlx(e, "refresh.fetch_user_by_id", Some(&pool)))?
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "User not found"))?;
 
+        if !user.is_active {
+            return Err(error_response(StatusCode::UNAUTHORIZED, "User is inactive"));
+        }
+        let memoria_owner = self.memoria_owner(&pool, &user_id).await?;
+        let origin = if let Some(owner) = memoria_owner.as_deref() {
+            self.revalidate_memoria_connection(&pool, &user_id, owner)
+                .await?;
+            format!(
+                "verified:{}",
+                self.memoria_provider
+                    .as_ref()
+                    .ok_or_else(|| internal_error("Memoria provider unavailable"))?
+                    .provider_id
+            )
+        } else if origin == "memoria" || origin.starts_with("verified:memoria:") {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Memoria identity binding is missing",
+            ));
+        } else {
+            origin
+        };
+
         let access_token = self
             .create_access_token(&user.user_id, &user.username, &session_id, &origin)
             .map_err(internal_error)?;
@@ -1945,15 +1827,27 @@ impl AuthService for DatabaseAuthService {
         let new_refresh_token_hash = sha256_hex(&new_refresh_token);
         let expires_at = self.refresh_token_expires_at_string(Utc::now());
 
-        let mut tx = pool
-            .begin()
+        let mut tx = pool.begin().await.map_err(internal_error)?;
+        query("SELECT user_id FROM auth_users WHERE user_id = ? FOR UPDATE")
+            .bind(&user_id)
+            .fetch_one(&mut *tx)
             .await
-            .map_err(|e| map_auth_sqlx(e, "refresh.begin_tx", Some(&pool)))?;
-        query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE token_hash = ?")
-            .bind(&refresh_token_hash)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "refresh.revoke_old_token", Some(&pool)))?;
+            .map_err(internal_error)?;
+        // A concurrent disconnect revokes this row under the same user lock;
+        // the compare-and-revoke prevents refresh from resurrecting it.
+        let revoked = query(
+            "UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE token_hash = ? AND is_revoked = 0",
+        )
+        .bind(&refresh_token_hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_auth_sqlx(e, "refresh.revoke_old_token", Some(&pool)))?;
+        if revoked.rows_affected() != 1 {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Token expired or revoked",
+            ));
+        }
         query(
             "INSERT INTO auth_refresh_tokens (token_id, user_id, session_id, token_hash, expires_at, is_revoked) \
              VALUES (?, ?, ?, ?, ?, 0)",
@@ -1975,7 +1869,12 @@ impl AuthService for DatabaseAuthService {
             access_token,
             refresh_token: new_refresh_token,
             token_type: "bearer".to_string(),
-            expires_in: self.access_token_expires_in_seconds(),
+            expires_in: if origin == "memoria" || origin.starts_with("verified:memoria:") {
+                self.access_token_expires_in_seconds()
+                    .min(memoria::ACCESS_TTL_SECONDS)
+            } else {
+                self.access_token_expires_in_seconds()
+            },
         })
     }
 
@@ -2175,7 +2074,7 @@ impl AuthService for DatabaseAuthService {
             .sub
             .clone()
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Invalid token"))?;
-        let (session_id, _, _) = self.parse_token_session(&claims)?;
+        let (session_id, token_origin, _) = self.parse_token_session(&claims)?;
         let pool = self
             .get_pool()
             .await
@@ -2191,11 +2090,37 @@ impl AuthService for DatabaseAuthService {
             ));
         }
 
+        // Bound legacy Memoria tokens too: earlier builds issued them with
+        // `internal` origin and the self-hosted deployment's longer TTL.
+        let memoria_owner = self.memoria_owner(&pool, &user_id).await?;
+        if (token_origin == "memoria" || token_origin.starts_with("verified:memoria:"))
+            && memoria_owner.is_none()
+        {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Memoria identity binding is missing",
+            ));
+        }
+        if memoria_owner.is_some()
+            && !claims.iat.is_some_and(|iat| {
+                Utc::now().timestamp() - iat < i64::from(memoria::ACCESS_TTL_SECONDS)
+            })
+        {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Memoria access token expired; refresh required",
+            ));
+        }
+
         let user = self
             .fetch_user_by_id_or_username(&pool, &user_id, None)
             .await
             .map_err(|e| map_auth_sqlx(e, "current_user.fetch_user", Some(&pool)))?
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "User not found"))?;
+
+        if !user.is_active {
+            return Err(error_response(StatusCode::UNAUTHORIZED, "User is inactive"));
+        }
 
         Ok(AuthPrincipal {
             user: AuthUserRecord {
@@ -2205,7 +2130,28 @@ impl AuthService for DatabaseAuthService {
                 display_name: user.display_name,
             },
             session_id: Some(session_id),
-            origin: AuthPrincipalOrigin::Internal,
+            origin: if let Some(subject) = memoria_owner {
+                let resolver = self
+                    .credential_resolver()
+                    .ok_or_else(|| internal_error("Memoria provider unavailable"))?;
+                if resolver
+                    .resolve(&user_id)
+                    .await
+                    .map_err(internal_error)?
+                    .is_none()
+                {
+                    return Err(error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "Memoria connection disconnected",
+                    ));
+                }
+                AuthPrincipalOrigin::VerifiedProvider {
+                    provider_id: resolver.provider.provider_id,
+                    external_subject: subject,
+                }
+            } else {
+                AuthPrincipalOrigin::Internal
+            },
         })
     }
 

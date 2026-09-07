@@ -235,6 +235,7 @@ impl HttpMemoriaPort {
             api_key,
             http: astra_core::net::build_internal_http_client(
                 reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
                     .connect_timeout(std::time::Duration::from_secs(10))
                     .timeout(std::time::Duration::from_secs(60)),
                 "memoria compact client",
@@ -334,83 +335,41 @@ impl HttpMemoriaPort {
 /// implicit end-user consent path.
 #[derive(Clone)]
 pub struct UserScopedMemoriaPort {
-    base_url: String,
-    pool: astra_core::SharedPool,
-    encryptor: astra_services::FernetTokenEncryptor,
+    resolver: astra_services::auth::memoria::MemoriaCredentialResolver,
     owner_user_id: Option<String>,
 }
-
 impl UserScopedMemoriaPort {
     pub fn new(
-        base_url: String,
-        pool: astra_core::SharedPool,
-        encryptor: astra_services::FernetTokenEncryptor,
+        resolver: astra_services::auth::memoria::MemoriaCredentialResolver,
         owner_user_id: String,
     ) -> Self {
         Self {
-            base_url,
-            pool,
-            encryptor,
+            resolver,
             owner_user_id: Some(owner_user_id),
         }
     }
-
-    pub fn template(
-        base_url: String,
-        pool: astra_core::SharedPool,
-        encryptor: astra_services::FernetTokenEncryptor,
-    ) -> Self {
+    pub fn template(resolver: astra_services::auth::memoria::MemoriaCredentialResolver) -> Self {
         Self {
-            base_url,
-            pool,
-            encryptor,
+            resolver,
             owner_user_id: None,
         }
     }
-
     fn owner_user_id(&self) -> Result<&str, String> {
         self.owner_user_id
             .as_deref()
-            .ok_or_else(|| "Memoria transport requires an authenticated owner binding".to_string())
+            .ok_or_else(|| "Memoria requires an authenticated owner".into())
     }
-
     async fn client(&self, write: bool) -> Result<(HttpMemoriaPort, String), String> {
-        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-            "SELECT encrypted_value, CAST(metadata AS CHAR) \
-             FROM auth_tokens \
-             WHERE type = 'memoria_connection' AND provider = 'memoria' \
-               AND scope_user_id = ? AND is_active = 1 \
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(self.owner_user_id()?)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|error| format!("Memoria credential lookup failed: {error}"))?
-        .ok_or_else(|| "memory access is not enabled for this Astra account".to_string())?;
-        let metadata: Value = serde_json::from_str(row.1.as_deref().unwrap_or("{}"))
-            .map_err(|_| "Memoria credential metadata is invalid".to_string())?;
-        let access = metadata
-            .get("memory_access")
-            .and_then(Value::as_str)
-            .unwrap_or("none");
-        enforce_memory_access(access, write)?;
-        let encrypted = row
-            .0
-            .ok_or_else(|| "Memoria connection key is unavailable".to_string())?;
-        let key = self
-            .encryptor
-            .decrypt(&encrypted)
-            .map_err(|_| "Memoria connection key could not be decrypted".to_string())?;
-        let memoria_user_id = metadata
-            .get("memoria_user_id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| "Memoria credential owner is unavailable".to_string())?
-            .to_string();
+        let credential = self
+            .resolver
+            .resolve(self.owner_user_id()?)
+            .await?
+            .ok_or("memory access is not enabled")?;
+        enforce_memory_access(credential.access.as_str(), write)?;
         Ok((
-            HttpMemoriaPort::new(self.base_url.clone(), key)
-                .with_owner_user_id(memoria_user_id.clone()),
-            memoria_user_id,
+            HttpMemoriaPort::new(self.resolver.provider.base_url.clone(), credential.key)
+                .with_owner_user_id(credential.owner.clone()),
+            credential.owner,
         ))
     }
 }
@@ -430,6 +389,13 @@ fn enforce_memory_access(access: &str, write: bool) -> Result<(), String> {
 
 #[async_trait::async_trait]
 impl MemoriaPort for UserScopedMemoriaPort {
+    async fn admits_operation(&self, write: bool) -> Result<bool, String> {
+        Ok(self
+            .resolver
+            .resolve(self.owner_user_id()?)
+            .await?
+            .is_some_and(|credential| credential.access.allows(write)))
+    }
     fn bind_owner(&self, user_id: &str) -> Result<std::sync::Arc<dyn MemoriaPort>, String> {
         if self
             .owner_user_id
@@ -1356,6 +1322,10 @@ pub async fn compact_with_memoria(
     compact_config: Option<&CompactConfig>,
     summary_client: Option<&dyn SummaryLlmClient>,
 ) -> CompactResult {
+    let client = match client {
+        Some(client) if client.admits_operation(false).await.unwrap_or(false) => Some(client),
+        _ => None,
+    };
     // Check if we should attempt Memoria retrieval
     let should_retrieve = params.current_tokens >= config.min_tokens_for_retrieval
         && params.tier != CompactionTier::Normal

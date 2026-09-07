@@ -1913,7 +1913,7 @@ pub(crate) async fn close_session_handler(
 /// per-session debouncer prevents duplicate close requests from writing two
 /// episodes or purging twice.
 fn schedule_session_end_governance(state: &AppState, owner_id: String, session_id: String) {
-    let Some(pool) = state.shared_pool.clone() else {
+    let Some(resolver) = state.auth_service.memoria_credentials() else {
         tracing::debug!(
             owner_id = %owner_id,
             session_id = %session_id,
@@ -1921,13 +1921,8 @@ fn schedule_session_end_governance(state: &AppState, owner_id: String, session_i
         );
         return;
     };
-    let memory = astra_core::MemoriaSettings::from_env();
-    let memoria_client = crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::new(
-        memory.base_url,
-        pool,
-        state.fernet_encryptor.clone(),
-        owner_id.clone(),
-    );
+    let memoria_client =
+        crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::new(resolver, owner_id.clone());
 
     tokio::spawn(async move {
         let debouncer = crate::turn::session_end_debounce::global();

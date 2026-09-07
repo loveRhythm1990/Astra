@@ -478,6 +478,17 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
+    pub async fn get_auth_methods(&self) -> Result<Value, ThinClientError> {
+        let response = self
+            .http
+            .get(self.url(paths::AUTH_METHODS)?)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+        let text = Self::text_or_api(response).await?;
+        Ok(serde_json::from_str(&text)?)
+    }
+
     pub async fn get_auth_me_text_timeout(
         &self,
         token: &str,

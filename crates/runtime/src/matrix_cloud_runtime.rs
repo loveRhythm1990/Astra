@@ -174,25 +174,20 @@ impl MatrixCloudRuntime {
     /// (the sole persistence target for L1 session memory). The port resolves
     /// each owner's consented credential at operation time; users without
     /// write access never cause a Memoria request.
-    pub fn with_encryptor(mut self, enc: Arc<astra_services::FernetTokenEncryptor>) -> Self {
+    pub fn with_encryptor(
+        mut self,
+        enc: Arc<astra_services::FernetTokenEncryptor>,
+        memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
+    ) -> Self {
         self.encryptor = Some(Arc::clone(&enc));
         let ingestion = self.ingestion.lock().ok().and_then(|g| g.as_ref().cloned());
-        if let Some(ingestion) = ingestion {
+        if let (Some(ingestion), Some(memoria_client)) = (ingestion, memoria_client) {
             let resolver: Arc<dyn crate::session_memory::MemoryInferenceResolver> =
                 Arc::new(PoolMemoryInferenceResolver {
                     pool: self.shared_pool.clone(),
                     encryptor: Arc::clone(&enc),
                 });
             let broker = Arc::new(crate::session_memory::BackgroundActivityBroker::new());
-            let memory = astra_core::MemoriaSettings::from_env();
-            let memoria_client: Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort> =
-                Arc::new(
-                    crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::template(
-                        memory.base_url,
-                        self.shared_pool.clone(),
-                        enc.as_ref().clone(),
-                    ),
-                );
             let svc = Arc::new(
                 crate::session_memory::MemoryExtractionService::new_owner_scoped_template(
                     resolver,
