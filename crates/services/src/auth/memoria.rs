@@ -164,6 +164,31 @@ pub struct MemoriaCredential {
     pub generation: String,
     pub access: MemoryAccess,
 }
+
+#[derive(PartialEq, Eq)]
+pub(super) struct ReauthenticationBinding {
+    provider_id: String,
+    owner: String,
+    generation: String,
+}
+
+pub(super) fn reauthentication_proof_hash(
+    proof: &str,
+    binding: Option<&ReauthenticationBinding>,
+) -> String {
+    match binding {
+        Some(binding) => sha256_hex(
+            &serde_json::json!([
+                proof,
+                binding.provider_id,
+                binding.owner,
+                binding.generation
+            ])
+            .to_string(),
+        ),
+        None => sha256_hex(proof),
+    }
+}
 #[derive(Clone)]
 pub struct MemoriaCredentialResolver {
     pub provider: MemoriaProvider,
@@ -215,6 +240,98 @@ impl MemoriaCredentialResolver {
     }
 }
 impl DatabaseAuthService {
+    pub(super) async fn reauthentication_binding(
+        &self,
+        pool: &sqlx::MySqlPool,
+        user: &str,
+    ) -> Result<Option<ReauthenticationBinding>, AuthHttpError> {
+        let Some(owner) = self.memoria_owner(pool, user).await? else {
+            return Ok(None);
+        };
+        let resolver = self.credential_resolver().ok_or_else(reconnect)?;
+        let credential = resolver
+            .resolve(user)
+            .await
+            .map_err(|_| unavailable())?
+            .ok_or_else(reconnect)?;
+        let verified = resolver.provider.verify(&credential.key).await?;
+        if verified.memoria_user_id != owner
+            || credential.owner != owner
+            || verified.key_id != credential.generation
+        {
+            return Err(reconnect());
+        }
+        Ok(Some(ReauthenticationBinding {
+            provider_id: resolver.provider.provider_id,
+            owner,
+            generation: credential.generation,
+        }))
+    }
+
+    pub(super) async fn verify_memoria_step_up(
+        &self,
+        binding: &ReauthenticationBinding,
+        proof: &str,
+        purpose: super::ReauthenticationPurpose,
+    ) -> Result<(), AuthHttpError> {
+        if !proof.starts_with("msu_")
+            || proof.len() != 68
+            || !proof[4..].bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Fresh account verification is required",
+            ));
+        }
+        let provider = self.memoria_provider.as_ref().ok_or_else(reconnect)?;
+        let web = provider.web_url.as_ref().ok_or_else(|| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Account reauthentication website is not configured",
+            )
+        })?;
+        // Only the composition-time trusted website may attest fresh authentication.
+        // A caller cannot supply a verifier URL or a different identity authority.
+        let mut response = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
+            .build().map_err(|_| unavailable())?
+            .post(format!("{web}/api/auth/astra/reauthentication/consume"))
+            .json(&serde_json::json!({"proof":proof,"subject":binding.owner,"key_id":binding.generation,"purpose":purpose}))
+            .send().await.map_err(|_| unavailable())?;
+        if matches!(response.status().as_u16(), 400 | 401 | 403 | 409) {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Account verification is invalid, expired or already used",
+            ));
+        }
+        if !response.status().is_success() {
+            return Err(unavailable());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| unavailable())? {
+            if bytes.len() + chunk.len() > 4096 {
+                return Err(unavailable());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
+        let now = chrono::Utc::now().timestamp();
+        let authenticated_at = value["authenticated_at"].as_i64().ok_or_else(reconnect)?;
+        let expires_at = value["expires_at"].as_i64().ok_or_else(reconnect)?;
+        if value["subject"] != binding.owner
+            || value["key_id"] != binding.generation
+            || value["purpose"] != purpose.as_str()
+            || authenticated_at > now + 5
+            || now - authenticated_at > 120
+            || expires_at <= now
+            || expires_at > authenticated_at + 120
+        {
+            return Err(reconnect());
+        }
+        Ok(())
+    }
+
     pub fn with_memoria_settings(mut self, settings: &MemoriaSettings) -> Result<Self, String> {
         self.memoria_provider = Some(MemoriaProvider::new(settings)?);
         Ok(self)
@@ -449,6 +566,52 @@ async fn verify_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn step_up_proof_hash_binds_issuer_subject_and_generation_without_ambiguous_fields() {
+        let binding = ReauthenticationBinding {
+            provider_id: "memoria:one".into(),
+            owner: "owner".into(),
+            generation: "key".into(),
+        };
+        let expected = reauthentication_proof_hash("rp_test", Some(&binding));
+        for other in [
+            ReauthenticationBinding {
+                provider_id: "memoria:two".into(),
+                owner: "owner".into(),
+                generation: "key".into(),
+            },
+            ReauthenticationBinding {
+                provider_id: "memoria:one".into(),
+                owner: "other".into(),
+                generation: "key".into(),
+            },
+            ReauthenticationBinding {
+                provider_id: "memoria:one".into(),
+                owner: "owner".into(),
+                generation: "rotated".into(),
+            },
+        ] {
+            assert_ne!(
+                expected,
+                reauthentication_proof_hash("rp_test", Some(&other))
+            );
+        }
+        assert_ne!(expected, reauthentication_proof_hash("rp_test", None));
+        let left = ReauthenticationBinding {
+            provider_id: "p".into(),
+            owner: "x\0y".into(),
+            generation: "z".into(),
+        };
+        let right = ReauthenticationBinding {
+            provider_id: "p".into(),
+            owner: "x".into(),
+            generation: "y\0z".into(),
+        };
+        assert_ne!(
+            reauthentication_proof_hash("rp_test", Some(&left)),
+            reauthentication_proof_hash("rp_test", Some(&right))
+        );
+    }
     use axum::{Json, Router, routing::get};
     use std::sync::{
         Arc,

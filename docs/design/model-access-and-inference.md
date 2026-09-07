@@ -155,8 +155,11 @@ their own provider account.
   validated public DNS address set and forbids redirects. DNS queries go directly
   to system-configured nameservers instead of OS synthetic-address caches;
   `ASTRA_BYOK_DNS_SERVERS` optionally selects comma-separated DNS IPs (ports
-  optional). Nameserver priority is preserved instead of racing answers from
-  different DNS servers. There is no hardcoded public DNS or OS resolver fallback.
+  optional); prefix an entry with `tcp://` for TCP-only DNS without a UDP
+  attempt or UDP fallback. This is an explicit operator route, not automatic
+  retry of rejected private/Fake-IP answers. Nameserver priority is preserved
+  instead of racing answers from different DNS servers. There is no hardcoded
+  public DNS or OS resolver fallback.
   Direct egress is the default. Operators may set `ASTRA_BYOK_PROXY_URL` to an
   HTTP/HTTPS CONNECT or SOCKS5/SOCKS5h proxy. A request-owned authenticated
   loopback adapter sends only validated public IP targets to that proxy,
@@ -183,6 +186,11 @@ their own provider account.
   Server-authenticated users. `self-hosted` (the default) retains deployment
   models for non-Memoria users. Admin registry management is separate from
   end-user inference eligibility. Unknown mode values do not grant access.
+- Background memory selectors obey the same owner eligibility and fresh
+  admission checks. A memory read/write grant never authorizes spending a
+  deployment model credential. Without an explicitly eligible background model
+  route, personal Cloud BYOK uses the existing deterministic/degraded path;
+  it does not silently select the deployment registry or a personal default.
 - Missing a personal default in Cloud BYOK requires model configuration or
   selection; it never falls back to a deployment reasoning model. The same
   owner gate applies when resuming runs and executing child runs.

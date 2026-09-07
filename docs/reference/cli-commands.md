@@ -42,6 +42,11 @@ queries to the Server's configured DNS servers, not OS Fake-IP caches. Operators
 may override DNS IPs with `ASTRA_BYOK_DNS_SERVERS` and select an HTTP(S) CONNECT
 or SOCKS5 proxy with `ASTRA_BYOK_PROXY_URL`. Proxies connect to validated public
 IPs, retaining origin TLS verification; ambient proxy variables are not used.
+Direct UDP DNS can still be intercepted by a VPN/proxy. Use an explicit
+TCP-only entry such as `ASTRA_BYOK_DNS_SERVERS=tcp://10.0.0.53:53` when a
+reachable DNS server supports TCP. TCP-only entries never fall back to UDP;
+private/Fake-IP answers remain rejected. DNS failures retain resolver diagnostics
+in Server logs without exposing them in public API errors.
 These are Server settings, not options ordinary CLI users need to fill in.
 The default policy is `public-https`; invalid values fail closed. Upgrade the
 Server together with the CLI to provide `/me/models/validate-endpoint`.

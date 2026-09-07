@@ -698,7 +698,9 @@ pub struct AuthRefreshRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthReauthenticateRequest {
+    #[serde(default)]
     pub password: String,
+    pub memoria_proof: Option<String>,
     pub purpose: ReauthenticationPurpose,
 }
 
@@ -1869,6 +1871,7 @@ impl From<AuthReauthenticateRequest> for ReauthenticationRequestData {
     fn from(value: AuthReauthenticateRequest) -> Self {
         Self {
             password: value.password,
+            memoria_proof: value.memoria_proof,
             purpose: value.purpose,
         }
     }

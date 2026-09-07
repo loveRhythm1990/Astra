@@ -307,25 +307,16 @@ async fn effective_model_catalog(
         .model_catalog_revision(user_id.clone(), is_admin)
         .await?;
     let mut declared = Vec::new();
-    if is_admin
+    let allows_deployment = is_admin
         || state
             .model_service
             .allows_deployment_models(user_id.clone())
-            .await?
-    {
+            .await?;
+    if allows_deployment {
         declared.push(DeclaredModelAccess {
             id: "self-hosted".to_string(),
             kind: ModelAccessKind::SelfHosted,
             label: "Self-hosted".to_string(),
-            execution_placement: ModelExecutionPlacement::Server,
-            availability: ModelAccessAvailability::Ready,
-        });
-    }
-    if !is_admin {
-        declared.push(DeclaredModelAccess {
-            id: "cloud-byok".to_string(),
-            kind: ModelAccessKind::CloudByok,
-            label: "Cloud BYOK".to_string(),
             execution_placement: ModelExecutionPlacement::Server,
             availability: ModelAccessAvailability::Ready,
         });
@@ -341,19 +332,38 @@ async fn effective_model_catalog(
         });
     // Model Access needs the complete catalog both to resolve a default and
     // to publish per-access counts that stay stable across pagination.
-    let default_catalog = if active_only || provider_default.is_some() {
-        Some(
-            state
-                .model_service
-                .list_models(user.user_id, false)
-                .await?
-                .into_iter()
-                .map(ModelListItemResponse::from)
-                .collect(),
-        )
-    } else {
-        None
-    };
+    let default_catalog: Option<Vec<ModelListItemResponse>> =
+        if !is_admin || active_only || provider_default.is_some() {
+            Some(
+                state
+                    .model_service
+                    .list_models(user.user_id, false)
+                    .await?
+                    .into_iter()
+                    .map(ModelListItemResponse::from)
+                    .collect(),
+            )
+        } else {
+            None
+        };
+    // Match run admission, and inspect the complete catalog rather than the
+    // current page so access sources cannot disappear across pagination.
+    if !is_admin
+        && (!allows_deployment
+            || default_catalog.as_ref().is_some_and(|catalog| {
+                catalog
+                    .iter()
+                    .any(|offering| offering.access_kind == ModelAccessKind::CloudByok)
+            }))
+    {
+        declared.push(DeclaredModelAccess {
+            id: "cloud-byok".to_string(),
+            kind: ModelAccessKind::CloudByok,
+            label: "Cloud BYOK".to_string(),
+            execution_placement: ModelExecutionPlacement::Server,
+            availability: ModelAccessAvailability::Ready,
+        });
+    }
     Ok(EffectiveModelCatalog {
         declared,
         offerings: page.items,
@@ -484,7 +494,7 @@ pub async fn get_memory_model_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<MemoryInferenceOfferingsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _user = state.auth_service.current_user(&headers).await?;
+    let user = state.auth_service.current_user(&headers).await?;
     let matrixone = crate::matrix_cloud_runtime::matrix_settings_from_env().map_err(|e| {
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -492,14 +502,15 @@ pub async fn get_memory_model_handler(
         )
     })?;
     let pool_ref = state.shared_pool.as_ref().map(|sp| sp.get());
-    let resolved = resolve_memory_offerings(&matrixone, &state.fernet_encryptor, pool_ref)
-        .await
-        .map_err(|e| {
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Memory model resolution failed: {e}"),
-            )
-        })?;
+    let resolved =
+        resolve_memory_offerings(&matrixone, &state.fernet_encryptor, &user.user_id, pool_ref)
+            .await
+            .map_err(|e| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Memory model resolution failed: {e}"),
+                )
+            })?;
     let offerings = resolved
         .into_iter()
         .map(|offering| MemoryInferenceOfferingResponse {

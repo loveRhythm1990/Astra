@@ -401,6 +401,12 @@ pub enum EdgeTokenBinding {
 
 #[async_trait]
 pub trait AuthService: Send + Sync {
+    async fn reauthentication_options(
+        &self,
+        _user_id: &str,
+    ) -> Result<serde_json::Value, AuthHttpError> {
+        Ok(serde_json::json!({"method":"password"}))
+    }
     async fn register(
         &self,
         request: AuthRegisterRequestData,
@@ -615,6 +621,7 @@ impl ReauthenticationPurpose {
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReauthenticationRequestData {
     pub password: String,
+    pub memoria_proof: Option<String>,
     pub purpose: ReauthenticationPurpose,
 }
 
@@ -1553,6 +1560,29 @@ fn map_auth_sqlx(
 
 #[async_trait]
 impl AuthService for DatabaseAuthService {
+    async fn reauthentication_options(
+        &self,
+        user_id: &str,
+    ) -> Result<serde_json::Value, AuthHttpError> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        if self.memoria_owner(&pool, user_id).await?.is_some() {
+            let web = self
+                .memoria_provider
+                .as_ref()
+                .and_then(|p| p.web_url.as_ref())
+                .ok_or_else(|| {
+                    error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Account reauthentication website is not configured",
+                    )
+                })?;
+            Ok(
+                serde_json::json!({"method":"memoria","verification_url":format!("{web}/astra/reauthenticate")}),
+            )
+        } else {
+            Ok(serde_json::json!({"method":"password"}))
+        }
+    }
     async fn register(
         &self,
         request: AuthRegisterRequestData,
@@ -1943,12 +1973,6 @@ impl AuthService for DatabaseAuthService {
         user_id: &str,
         request: ReauthenticationRequestData,
     ) -> Result<ReauthenticationProofRecord, (StatusCode, Json<ErrorResponse>)> {
-        if request.password.is_empty() || request.password.len() > AUTH_PASSWORD_MAX_BYTES {
-            return Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                "Reauthentication failed",
-            ));
-        }
         let pool = self
             .get_pool()
             .await
@@ -1958,7 +1982,41 @@ impl AuthService for DatabaseAuthService {
             .await
             .map_err(|e| map_auth_sqlx(e, "reauthenticate.fetch_user", Some(&pool)))?
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Reauthentication failed"))?;
-        if !user.is_active
+        if !user.is_active {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Reauthentication failed",
+            ));
+        }
+        let binding = self.reauthentication_binding(&pool, user_id).await?;
+        if let Some(binding) = &binding {
+            if !request.password.is_empty() {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Choose one reauthentication method",
+                ));
+            }
+            self.verify_memoria_step_up(
+                binding,
+                request.memoria_proof.as_deref().unwrap_or(""),
+                request.purpose,
+            )
+            .await?;
+            // Disconnect/rotation while the provider was verifying must fail closed.
+            if self
+                .reauthentication_binding(&pool, user_id)
+                .await?
+                .as_ref()
+                != Some(binding)
+            {
+                return Err(error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "Reauthentication binding changed",
+                ));
+            }
+        } else if request.memoria_proof.is_some()
+            || request.password.is_empty()
+            || request.password.len() > AUTH_PASSWORD_MAX_BYTES
             || !bcrypt_verify(request.password.as_str(), &user.password_hash).unwrap_or(false)
         {
             return Err(error_response(
@@ -1968,7 +2026,7 @@ impl AuthService for DatabaseAuthService {
         }
 
         let proof = format!("rp_{}_{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        let proof_hash = sha256_hex(&proof);
+        let proof_hash = memoria::reauthentication_proof_hash(&proof, binding.as_ref());
         let expires_at = Utc::now() + ChronoDuration::seconds(REAUTHENTICATION_PROOF_TTL_SECONDS);
         query(
             "INSERT INTO auth_reauthentication_proofs
@@ -2007,6 +2065,7 @@ impl AuthService for DatabaseAuthService {
             .get_pool()
             .await
             .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
+        let binding = self.reauthentication_binding(&pool, user_id).await?;
         let result = query(
             "UPDATE auth_reauthentication_proofs
              SET consumed_at = NOW(6)
@@ -2015,7 +2074,10 @@ impl AuthService for DatabaseAuthService {
         )
         .bind(user_id)
         .bind(purpose.as_str())
-        .bind(sha256_hex(proof))
+        .bind(memoria::reauthentication_proof_hash(
+            proof,
+            binding.as_ref(),
+        ))
         .execute(&pool)
         .await
         .map_err(|e| map_auth_sqlx(e, "reauthenticate.consume_proof", Some(&pool)))?;

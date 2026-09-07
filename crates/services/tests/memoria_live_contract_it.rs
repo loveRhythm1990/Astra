@@ -1,5 +1,7 @@
 //! Opt-in contract against a running Memoria API, not a whoami fixture.
 mod common;
+#[path = "common/isolated_database.rs"]
+mod isolated_database;
 
 use astra_core::JwtSettings;
 use astra_services::{
@@ -10,13 +12,9 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 
 #[tokio::test]
-#[ignore = "requires isolated review_ DB and ASTRA_TEST_MEMORIA_URL / ASTRA_TEST_MEMORIA_MASTER_KEY"]
+#[ignore = "requires isolated ASTRA_TEST_DATABASE and ASTRA_TEST_MEMORIA_URL / ASTRA_TEST_MEMORIA_MASTER_KEY"]
 async fn scoped_key_api_v1_preserves_identity_modes_and_revocation() {
-    assert!(
-        std::env::var("ASTRA_DATABASE")
-            .unwrap()
-            .starts_with("review_")
-    );
+    isolated_database::require_isolated_database(&common::require_db_it_env().database);
     let base = std::env::var("ASTRA_TEST_MEMORIA_URL").unwrap();
     let master = std::env::var("ASTRA_TEST_MEMORIA_MASTER_KEY").unwrap();
     let (pool, settings) = common::setup_pool_and_settings().await;

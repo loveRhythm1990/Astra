@@ -33,6 +33,49 @@ Refresh validates the current Memoria credential online. Compare-and-revoke of t
 
 The old `auth_memoria_identities` table is a read-only migration source. Its missing issuer cannot safely be guessed. Administrators must set `MEMORIA_LEGACY_ISSUER` to the known original issuer, matching the configured issuer. A fresh verified login then moves that mapping to the canonical table, preserves the Astra user ID and its models/Work, replaces the credential, and revokes old sessions in one transaction. Without that assertion, login fails with 409 and legacy refresh sessions fail closed. Do not set this option when pointing an old Astra database at a different Memoria instance.
 
+## Fresh reauthentication
+
+Normal sign-in is separate from authorizing device trust, device re-enrollment,
+or forced session takeover. `GET /auth/reauthenticate` is authenticated discovery:
+local accounts receive `method: password`; Memoria accounts receive
+`method: memoria` and a verification page under the configured `MEMORIA_WEB_URL`.
+This URL is a trusted identity-verification endpoint, not a caller-selected URL.
+It requires HTTPS except for explicit loopback development.
+
+The website requires a fresh email code sent to the current account's email.
+This also works for GitHub/Google-created accounts with an accessible email;
+an existing OAuth login session by itself is not fresh verification. Private
+API-key login deployments keep their existing local-password reauthentication.
+The email names the sensitive action. Codes are purpose/account/key-generation
+bound, expire in five minutes, allow five attempts, and have a 60-second resend
+cooldown. Code hashes use an application-keyed HMAC. Normal login codes cannot
+be used here. Verification neither rotates the connection key nor changes
+memory consent.
+
+Successful verification returns an opaque `msu_` proof, valid for two minutes.
+The user copies it back to the originating action. It stays out of URLs,
+browser storage, and logs. The SDK accepts
+`reauthenticate({ memoriaProof }, purpose)`; the HTTP request is
+`POST /auth/reauthenticate` with `{ "memoria_proof": "msu_…", "purpose": "device_trust" }`.
+The existing password request remains supported for local accounts. Mixing
+methods is rejected.
+
+Astra validates the active issuer/subject/connection generation online, then
+consumes the website proof over the fixed HTTPS backchannel
+`/api/auth/astra/reauthentication/consume`, with redirects disabled and a bounded
+response. It checks the returned subject, key generation, purpose and timestamps
+and revalidates its binding before issuing the existing five-minute `rp_` proof.
+That proof is single-use, purpose-bound and additionally bound to the Memoria
+identity and connection generation. Device trust still requires the separate
+device-possession challenge. Both proof exchanges fail closed on upstream
+revocation, disconnect, identity mismatch or replay; failed exchanges require
+fresh evidence rather than bypassing proof checks.
+
+The website must be deployed with the reauthentication API before Astra clients
+can use this path. An unavailable verifier blocks only the sensitive operation,
+not ordinary sign-in or chat. Astra does not need a Memoria master key or a new
+shared signing secret.
+
 ## Client/deployment contract
 
 `GET /auth/methods` advertises the Server's website and issuer. An unset website retains interactive password login, including all-in-one deployments. The CLI falls back to the older password journey only on discovery 404, not on outages or malformed configuration. Explicit username/password and manual scoped-key login remain available.
@@ -43,15 +86,15 @@ Browser login URLs require HTTPS except for explicit loopback development addres
 
 Focused coverage lives in `memoria_auth_db_it`, `memoria_auth_http`, CLI auth-flow tests and runtime consent-admission tests. It includes issuer separation, concurrent login/relink, post-write failure rollback, legacy migration, disconnect, inactive-account retention, source-configuration mismatch, read-only extraction and login discovery. Actual Windows browser launch and live OAuth callbacks require platform/deployment testing in addition to deterministic contracts.
 
-`memoria_live_contract_it` additionally runs against a real Memoria API implementing scoped-key API version 1. It creates disposable identity-only, read-only and read-write keys, verifies stable Astra account mapping, and revokes each key through Memoria before checking refresh rejection. Run only against an isolated Memoria test service and a `review_` Astra database:
+`memoria_live_contract_it` additionally runs against a real Memoria API implementing scoped-key API version 1. It creates disposable identity-only, read-only and read-write keys, verifies stable Astra account mapping, and revokes each key through Memoria before checking refresh rejection. Run only against an isolated Memoria test service and an explicitly designated test database:
 
 ```bash
 # Set the isolated MatrixOne connection variables as in the DB testing guide.
 export ASTRA_TEST_DB_IT=1
-export ASTRA_DATABASE=review_memoria_contract
+export ASTRA_TEST_DATABASE=review_memoria_contract
 export ASTRA_TEST_MEMORIA_URL=http://127.0.0.1:18104
 # Set ASTRA_TEST_MEMORIA_MASTER_KEY to the isolated Memoria service's test key.
-cargo test -p astra-services --test memoria_live_contract_it -- --ignored --test-threads=1
+make test-memoria-auth-online-contract
 ```
 
 The test issues and revokes upstream keys; never point it at a production service.

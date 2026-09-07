@@ -42,6 +42,32 @@ cargo check --manifest-path Cargo.toml
 
 ## Live MatrixOne system E2E
 
+Memoria identity/credential fixtures require `ASTRA_TEST_DB_IT=1` and an
+explicit `ASTRA_TEST_DATABASE` matching the effective database name. The normal
+online runner supplies its isolated lane database; local callers must designate
+their disposable database rather than relying on a developer-specific prefix.
+
+Contracts requiring an external scoped-key Memoria API or a real provider are
+separately gated by the services `external-contract-tests` feature. They are not
+selected by ordinary MatrixOne online lanes. To run the scoped Memoria contract,
+provision a test Memoria API with scoped keys, set `ASTRA_TEST_MEMORIA_URL`,
+`ASTRA_TEST_MEMORIA_MASTER_KEY`, `ASTRA_TEST_DATABASE` and the test MatrixOne
+connection variables, then run `make test-memoria-auth-online-contract`.
+Missing configuration fails the explicitly selected contract; it is not reported
+as a passing test. No production credentials are needed in fork CI.
+
+The key-free BYOK network smoke is also explicit:
+
+```bash
+ASTRA_BYOK_DNS_SERVERS=tcp://223.5.5.5 \
+ASTRA_TEST_BYOK_MODELS_URL=https://api.moonshot.cn/v1/models \
+CARGO_INCREMENTAL=0 cargo test --locked -p astra-services \
+  --features external-contract-tests --test byok_live_network -- --ignored
+```
+
+It expects HTTP 401 with no provider key and proves DNS/TLS/HTTP reachability,
+not successful model inference.
+
 ```bash
 ASTRA_TEST_DB_IT=1 \
 ASTRA_TEST_E2E_SECRET=system-matrix-e2e-secret \

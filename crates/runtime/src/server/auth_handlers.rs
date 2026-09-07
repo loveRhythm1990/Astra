@@ -172,7 +172,7 @@ pub(super) async fn auth_reauthenticate_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<AuthReauthenticateRequest>,
-) -> Result<Json<AuthReauthenticateResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let proof = state
         .auth_service
@@ -185,7 +185,26 @@ pub(super) async fn auth_reauthenticate_handler(
         purpose = proof.purpose.as_str(),
         "reauthentication proof issued"
     );
-    Ok(Json(AuthReauthenticateResponse::from(proof)))
+    Ok(axum::response::IntoResponse::into_response((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(AuthReauthenticateResponse::from(proof)),
+    )))
+}
+
+pub(super) async fn auth_reauthentication_options_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    Ok(axum::response::IntoResponse::into_response((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(
+            state
+                .auth_service
+                .reauthentication_options(&user.user_id)
+                .await?,
+        ),
+    )))
 }
 
 pub(super) async fn auth_me_handler(

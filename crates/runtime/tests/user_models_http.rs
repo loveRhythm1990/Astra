@@ -28,6 +28,8 @@ struct TestModelService {
     rows: Arc<Mutex<HashMap<(String, String), UserModelRecord>>>,
     preflights: Arc<Mutex<Vec<(String, String)>>>,
     preflight_network_failure: bool,
+    allows_deployment: bool,
+    catalog: Vec<ModelListItem>,
 }
 
 fn unsupported<T>() -> Result<T, HttpError> {
@@ -40,7 +42,7 @@ fn unsupported<T>() -> Result<T, HttpError> {
 #[async_trait]
 impl ModelService for TestModelService {
     async fn allows_deployment_models(&self, _: String) -> Result<bool, HttpError> {
-        Ok(false)
+        Ok(self.allows_deployment)
     }
 
     async fn validate_user_model_endpoint(
@@ -165,7 +167,7 @@ impl ModelService for TestModelService {
         unsupported()
     }
     async fn list_models(&self, _: String, _: bool) -> Result<Vec<ModelListItem>, HttpError> {
-        unsupported()
+        Ok(self.catalog.clone())
     }
     async fn get_model(&self, _: String) -> Result<ModelRecord, HttpError> {
         unsupported()
@@ -185,6 +187,76 @@ impl ModelService for TestModelService {
     }
     async fn check_model(&self, _: String) -> Result<ModelRecord, HttpError> {
         unsupported()
+    }
+}
+
+#[tokio::test]
+async fn model_access_matches_run_eligibility_across_catalog_pages() {
+    use astra_services::{ModelAccessKind, ModelExecutionPlacement};
+    let offering = |name: &str, kind: ModelAccessKind| ModelListItem {
+        offering_id: name.into(),
+        access_id: if kind == ModelAccessKind::CloudByok {
+            "cloud-byok"
+        } else {
+            "self-hosted"
+        }
+        .into(),
+        access_kind: kind,
+        access_label: if kind == ModelAccessKind::CloudByok {
+            "Cloud BYOK"
+        } else {
+            "Self-hosted"
+        }
+        .into(),
+        execution_placement: ModelExecutionPlacement::Server,
+        name: name.into(),
+        provider: "mock".into(),
+        description: None,
+        is_active: true,
+        context_window: 128000,
+        max_completion_tokens: None,
+        architecture: None,
+        thinking_capability: None,
+    };
+    for (allows_deployment, catalog, expected) in [
+        (
+            true,
+            vec![offering("a-deployment", ModelAccessKind::SelfHosted)],
+            vec!["self-hosted"],
+        ),
+        (false, vec![], vec!["cloud-byok"]),
+        (
+            true,
+            vec![
+                offering("a-deployment", ModelAccessKind::SelfHosted),
+                offering("z-personal", ModelAccessKind::CloudByok),
+            ],
+            vec!["cloud-byok", "self-hosted"],
+        ),
+    ] {
+        let service = TestModelService {
+            allows_deployment,
+            catalog,
+            ..Default::default()
+        };
+        let (status, body) = request(
+            app(service),
+            "GET",
+            "/model-access?limit=1",
+            Some("ordinary-user"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let mut ids = body["accesses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, expected);
     }
 }
 

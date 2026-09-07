@@ -1,4 +1,6 @@
 mod common;
+#[path = "common/isolated_database.rs"]
+mod isolated_database;
 use astra_core::JwtSettings;
 use astra_services::{
     DatabaseModelService, FernetTokenEncryptor, ModelService,
@@ -18,13 +20,9 @@ use std::sync::{
 use uuid::Uuid;
 
 #[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1 and isolated review_ ASTRA_DATABASE"]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and explicitly isolated ASTRA_TEST_DATABASE"]
 async fn memoria_refresh_revocation_and_deployment_model_isolation() {
-    assert!(
-        std::env::var("ASTRA_DATABASE")
-            .unwrap_or_default()
-            .starts_with("review_")
-    );
+    isolated_database::require_isolated_database(&common::require_db_it_env().database);
     let (shared, settings) = common::setup_pool_and_settings().await;
     let pool = shared.get();
     let owner = Uuid::new_v4().to_string();
@@ -213,13 +211,9 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
 }
 
 #[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1 and isolated review_ ASTRA_DATABASE"]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and explicitly isolated ASTRA_TEST_DATABASE"]
 async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
-    assert!(
-        std::env::var("ASTRA_DATABASE")
-            .unwrap_or_default()
-            .starts_with("review_")
-    );
+    isolated_database::require_isolated_database(&common::require_db_it_env().database);
     let (shared, db) = common::setup_pool_and_settings().await;
     let subject = format!("review-{}", Uuid::new_v4());
     let subject_for_http = subject.clone();

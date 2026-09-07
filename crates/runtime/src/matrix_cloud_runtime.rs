@@ -56,6 +56,7 @@ impl crate::session_memory::MemoryInferenceResolver for PoolMemoryInferenceResol
         let offerings = match astra_services::models::resolve_memory_offerings(
             settings,
             &self.encryptor,
+            user_id,
             Some(pool),
         )
         .await
@@ -72,29 +73,14 @@ impl crate::session_memory::MemoryInferenceResolver for PoolMemoryInferenceResol
         };
         offerings
             .into_iter()
-            .filter_map(|offering| {
-                let offering_id = offering.offering_id.clone();
-                let model_name = offering.model.model_name.clone();
-                match crate::memory_hooks::DurableMemoryInferenceClient::from_offering(
-                    offering,
+            .map(|offering| {
+                Arc::new(crate::memory_hooks::DurableMemoryInferenceClient::new(
+                    offering.offering_id,
+                    offering.model.model_name,
                     self.pool.clone(),
+                    self.encryptor.clone(),
                     user_id,
-                ) {
-                    Ok(client) => {
-                        Some(std::sync::Arc::new(client)
-                            as crate::memory_hooks::MemoryInferenceClient)
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "astra_runtime::memory_model",
-                            %offering_id,
-                            %model_name,
-                            %error,
-                            "memory model execution configuration is invalid"
-                        );
-                        None
-                    }
-                }
+                )) as crate::memory_hooks::MemoryInferenceClient
             })
             .collect()
     }

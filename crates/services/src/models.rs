@@ -1992,9 +1992,17 @@ fn rank_memory_model_candidate_indices(
 pub async fn resolve_memory_offerings(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
+    user_id: &str,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
 ) -> Result<Vec<ResolvedModelOffering>, String> {
     let pool = require_pool(pool, matrixone).await?;
+
+    // A memory-write grant is not authorization to spend deployment credentials.
+    // Personal BYOK has no implicit background selector binding: use the
+    // existing deterministic extraction path until one is explicitly admitted.
+    if !deployment_models_allowed(&pool, user_id).await? {
+        return Ok(Vec::new());
+    }
 
     let rows = sqlx::query(&format!(
         "SELECT model_id, {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"

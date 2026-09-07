@@ -15,6 +15,9 @@ use std::sync::{
 };
 use tower::ServiceExt;
 
+#[path = "../../services/tests/common/isolated_database.rs"]
+mod isolated_database;
+
 struct Healthy;
 #[async_trait]
 impl HealthChecker for Healthy {
@@ -54,11 +57,11 @@ async fn request(
 }
 
 #[tokio::test]
-#[ignore = "requires isolated review_ ASTRA_DATABASE and ASTRA_TEST_DB_IT=1"]
+#[ignore = "requires isolated ASTRA_TEST_DATABASE and ASTRA_TEST_DB_IT=1"]
 async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
     assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
     let db = MatrixOneSettings::from_env();
-    assert!(db.database.starts_with("review_"));
+    isolated_database::require_isolated_database(&db.database);
     astra_services::storage::ensure_core_schema(&db, "mysql")
         .await
         .unwrap();

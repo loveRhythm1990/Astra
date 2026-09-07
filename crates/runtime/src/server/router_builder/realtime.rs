@@ -21,7 +21,8 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/auth/logout", post(auth_handlers::auth_logout_handler))
         .route(
             "/auth/reauthenticate",
-            post(auth_handlers::auth_reauthenticate_handler),
+            post(auth_handlers::auth_reauthenticate_handler)
+                .get(auth_handlers::auth_reauthentication_options_handler),
         )
         .route("/auth/me", get(auth_handlers::auth_me_handler))
         .route(

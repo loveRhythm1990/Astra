@@ -8,6 +8,16 @@ publish = false
 [features]
 openssl-vendored = ["dep:openssl", "openssl/vendored"]
 e2e-hooks = []
+# External services are not provisioned by the ordinary MatrixOne CI lanes.
+external-contract-tests = []
+
+[[test]]
+name = "memoria_live_contract_it"
+required-features = ["external-contract-tests"]
+
+[[test]]
+name = "byok_live_network"
+required-features = ["external-contract-tests"]
 
 [dependencies]
 astra-config.workspace = true
