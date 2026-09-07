@@ -2,8 +2,7 @@
 
 This guide defines the maintainer workflow for publishing Astra from the
 `matrixorigin/Astra` repository. One protected workflow owns the source tag,
-GitHub Release, client archives, public server image, rolling Docker tags, and
-optional registry mirror. A release is selected once, verified as one candidate
+GitHub Release, client archives, public server image, and rolling Docker tags. A release is selected once, verified as one candidate
 set, and only then made visible to users.
 
 ## What one release contains
@@ -36,9 +35,9 @@ therefore lets obsolete automation become the release control plane.
 The **Release Astra** workflow is manually dispatched from the protected
 default branch instead. It selects the current `main` commit, validates the
 complete version and release contract, builds every candidate, and creates the
-annotated tag only after all candidates pass. GitHub does not start a second
-workflow for a tag created with `GITHUB_TOKEN`, so one run remains the sole
-release owner.
+annotated tag only after all candidates pass. The release workflow has no
+tag-push trigger; its annotated tag records the sole release owner. Tags created with
+`GITHUB_TOKEN` do not trigger additional tag-push workflows.
 
 Publication is deliberately ordered:
 
@@ -48,8 +47,19 @@ Publication is deliberately ordered:
 4. create or validate the immutable annotated tag;
 5. create or verify the exact Docker version manifest;
 6. stage and publish the GitHub Release with verified client assets;
-7. update stable rolling Docker tags;
-8. copy the already-public manifest to an optional private mirror.
+7. update stable rolling Docker tags.
+
+The protected publication job uses the built-in `GITHUB_TOKEN`. Immediately
+before creating a new tag, it requires the selected source to still be the
+current `main` head. If `main` advanced during builds or approval, publication
+stops before creating a tag or versioned Docker manifest. Start a new normal
+release run from current `main`; rerunning the old candidates cannot fix this.
+
+This check is not an atomic lock on `main`: a concurrent update can still cause
+GitHub to reject tag creation. Existing-tag recovery remains available, but
+does not promise to overcome GitHub workflow-permission restrictions on a
+historical source. If recovery encounters that restriction, stop and inspect
+the partial publication; never move the immutable tag or overwrite its assets.
 
 The GitHub Release is not published until the exact Docker version exists. If
 a late step fails, rerun the failed jobs from the same Actions run so its
@@ -78,8 +88,7 @@ Provide `DOCKERHUB_USERNAME` and a least-privilege `DOCKERHUB_TOKEN`, capable
 of writing only `matrixorigin/astra`, as repository or organization Actions
 secrets. Candidate jobs use them to push untagged digests for runtime smoke;
 only the environment-gated publication job gives those digests a user-visible
-tag. Keep `IDC_REGISTRY_USERNAME` and `IDC_REGISTRY_PASSWORD` as repository or
-organization secrets when the optional mirror is enabled.
+tag.
 
 After migration, remove the unused `ASTRA_SUITE_PAT` secret and
 `RELEASE_MIRROR_REPOSITORY` variable once a repository search confirms that no
@@ -97,14 +106,10 @@ A manually created tag cannot publish anything and cannot be adopted by
 recovery, but it will reserve that version until an administrator removes it.
 
 Repository Actions should default to read-only permissions. The release
-controller grants `contents: write` only to the publication job that creates
-the tag and GitHub Release.
-
-The optional registry mirror is enabled only when both
-`CONTAINER_MIRROR_REGISTRY` and `CONTAINER_MIRROR_IMAGE` repository variables
-are set. Proxy and runner variables are documented in `release.yml`. Mirror
-failure is reported without invalidating a public release that has already
-completed.
+controller grants `contents: write` only to the approved publication job.
+That same token performs draft lookup, body preparation, staged verification,
+and publication; draft visibility requires push access. No GitHub App, App
+private key, or personal access token is required.
 
 The source tree versions `@astra/sdk` and the Helm chart, but the workflow does
 not yet publish either to npm or a chart registry. Treat them as explicit
@@ -117,6 +122,42 @@ annotated tags created by this unified workflow. For the first repository-owned
 release, choose a new version whose tag and Docker version do not exist; until
 that release is complete, latest-release installation will fail explicitly
 instead of silently installing a legacy package.
+
+## Build an IDC image independently
+
+Run **build_push_to_idc** (`build_push_to_idc.yml`) manually from `main`. Its
+`source_ref` defaults to the latest `main`; set it to `moi-dev` for that
+branch's latest commit, or to a full commit SHA that is contained in the
+current `main` or `moi-dev` history. Other branches, tags, abbreviated SHAs,
+and commits outside those histories are rejected. The workflow controller and
+host-side verification scripts always come from the current protected `main`
+revision. This workflow does not create Git tags or GitHub Releases and does
+not push to Docker Hub.
+
+Configure repository variables `CONTAINER_MIRROR_REGISTRY` (host and optional
+port), `CONTAINER_MIRROR_IMAGE` (full untagged repository), and
+`CONTAINER_MIRROR_RUNNER` (a Linux AMD64 Docker-capable self-hosted runner
+label). Store `IDC_REGISTRY_USERNAME` and `IDC_REGISTRY_PASSWORD` exclusively
+as secrets in the `idc-publication` Environment; its deployment branch policy
+must admit only `main`. Do not keep copies as repository or organization
+secrets. This external policy is the trust boundary that prevents a workflow
+definition selected from another branch from receiving IDC credentials. Missing
+configuration fails before build work, and the admitted ARC runner verifies
+`runner.environment` before checkout or registry login. Optional proxy variables are `CONTAINER_MIRROR_HTTP_PROXY`,
+`CONTAINER_MIRROR_HTTPS_PROXY`, and `CONTAINER_MIRROR_NO_PROXY`.
+
+The workflow builds a Linux AMD64 candidate only in the admitted runner's local
+Docker store, runs the existing all-in-one smoke test, and authenticates to
+Harbor only after verification succeeds. It then publishes
+`idc-<UTC YYYYMMDDTHHMMSSZ>-<full commit SHA>-<run ID>-amd64` directly to IDC.
+No candidate manifest or BuildKit cache is pushed to the runtime repository, so
+MOI's newest-artifact resolver cannot observe an untagged pre-publication
+object. Reruns verify an existing immutable tag against the locally verified
+image instead of overwriting it. The final image records the full selected
+source commit, its selected branch or SHA, and the canonical
+`https://github.com/matrixorigin/astra` OCI source label used by MOI's Astra
+revision resolver. The runner must support the existing all-in-one stack,
+Python 3, and Docker Buildx. Formal release tags and `latest` are not changed.
 
 ## Prepare a release
 
