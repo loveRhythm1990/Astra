@@ -97,7 +97,7 @@ help:
 	@echo ""
 	@echo "All-in-One Docker Deployment:"
 	@echo "  make stack-env          - Create .env and generate stack secrets"
-	@echo "  make stack-setup        - Interactive first-run setup (embedding, admin, model)"
+	@echo "  make stack-setup        - Complete guided setup from any stack state (admin/model optional)"
 	@echo "  make stack-start        - Initialize, start, and verify the Compose stack"
 	@echo "  make stack-up           - Start MatrixOne + Memoria + API"
 	@echo "  make stack-up-server-only - Start compose stack without local edge provider"
@@ -145,7 +145,10 @@ DOCKER_METADATA_BUILD_ARGS := --build-arg IMAGE_VERSION=$(IMAGE_VERSION) --build
 DEFAULT_API_PORT := 17001
 STACK_DIR := deployment/all-in-one
 STACK_ENV := $(STACK_DIR)/.env
-STACK_COMPOSE := cd $(STACK_DIR) && env UID=$$(id -u) GID=$$(id -g) docker compose --env-file $(abspath $(STACK_ENV))
+# Always resolve the Compose project from the selected env file. Explicit
+# --project-name/--file plus clearing the two process-level overrides keeps
+# stack-setup's isolation decision authoritative even in a user's shell.
+STACK_COMPOSE := cd $(STACK_DIR) && project_name="$$(. "$(abspath scripts/lib/env_file.sh)"; env_file_read "$(abspath $(STACK_ENV))" ASTRA_STACK_NAME 2>/dev/null || true)"; project_name="$${project_name:-all-in-one}"; env -u COMPOSE_PROJECT_NAME -u COMPOSE_FILE UID=$$(id -u) GID=$$(id -g) ASTRA_STACK_ENV_FILE="$(abspath $(STACK_ENV))" docker compose --project-name "$$project_name" --file "$(abspath $(STACK_DIR)/docker-compose.yml)" --env-file "$(abspath $(STACK_ENV))"
 STACK_SECRET_ENV := ASTRA_JWT_SECRET ASTRA_TOKEN_ENCRYPTION_KEY ASTRA_RUNTIME_ROOT_SECRET MEMORIA_MASTER_KEY
 STACK_EMBEDDING_ENV := MEMORIA_EMBEDDING_BASE_URL
 STACK_RECREATE ?= 0
@@ -534,7 +537,34 @@ release-check:
 	@scripts/validate-release-version.sh "$(VERSION)"
 	@python3 scripts/ci/validate_repository.py
 	@echo "✅ Release metadata, installer, artifacts, and workflow contracts are consistent"
-	@echo "   Commit and merge the reviewed version changes, then run Release Astra from main."
+	@echo "   Commit and merge the reviewed version changes, then run make release-publish VERSION=$(VERSION) from main."
+
+.PHONY: release-publish
+release-publish:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "❌ VERSION is required, for example: make release-publish VERSION=0.2.0"; \
+		exit 1; \
+	fi
+	@scripts/validate-release-version.sh "$(VERSION)"
+	@command -v gh >/dev/null 2>&1 || { echo "❌ GitHub CLI (gh) is required to start a release"; exit 1; }
+	@gh auth status -h github.com >/dev/null 2>&1 || { echo "❌ Authenticate gh with permission to dispatch repository workflows"; exit 1; }
+	@default_branch="$$(gh repo view matrixorigin/Astra --json defaultBranchRef --jq '.defaultBranchRef.name')"; \
+	if [ "$$(git branch --show-current)" != "$$default_branch" ]; then \
+		echo "❌ Run release-publish from $$default_branch after the release PR merges"; \
+		exit 1; \
+	fi; \
+	if ! git diff --quiet || ! git diff --cached --quiet; then \
+		echo "❌ Commit or stash local changes before starting a release"; \
+		exit 1; \
+	fi; \
+	git fetch origin "$$default_branch"; \
+	if [ "$$(git rev-parse HEAD)" != "$$(git rev-parse "origin/$$default_branch")" ]; then \
+		echo "❌ Local $$default_branch is not at origin/$$default_branch; fast-forward it before starting a release"; \
+		exit 1; \
+	fi
+	@gh workflow run release.yml --repo matrixorigin/Astra --ref main \
+		-f version="$(VERSION)" -f recover_existing_tag=false
+	@echo "✅ Release Astra started for $(VERSION). Candidate builds run before the protected release approval."
 
 # ============================================================================
 # Compose Stack Deployment
@@ -652,7 +682,7 @@ stack-start: stack-env
 	@$(MAKE) stack-verify
 	@echo ""
 	@echo "✅ Astra local stack is ready"
-	@echo "   Next: astra admin setup"
+	@echo "   Next: make stack-setup STACK_ENV=\"$(STACK_ENV)\" (resume guided status and optional chat setup)"
 	@echo "   Try:  astra chat -m \"Explain what you can do in this deployment\""
 
 .PHONY: stack-up
@@ -674,11 +704,11 @@ stack-up: stack-config
 		if [ -n "$$failed_services" ]; then \
 			( $(STACK_COMPOSE) logs --no-color --tail=80 $$failed_services ) || true; \
 		else \
-			echo "No failed container was identified; run 'make stack-logs' for full logs."; \
+			echo "No failed container was identified; run 'make stack-logs STACK_ENV=\"$(STACK_ENV)\"' for full logs."; \
 		fi; \
 		echo ""; \
-		echo "Fix the first reported error, then rerun 'make stack-up'."; \
-		echo "The partial stack is left running so it can be inspected; use 'make stack-down' to stop it."; \
+		echo "Fix the first reported error, then rerun 'make stack-up STACK_ENV=\"$(STACK_ENV)\"'."; \
+		echo "The partial stack is left running so it can be inspected; use 'make stack-down STACK_ENV=\"$(STACK_ENV)\"' to stop it."; \
 		exit 1; \
 	fi
 	@echo "✅ Compose stack started"

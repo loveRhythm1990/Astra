@@ -7,14 +7,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use astra_pipeline::{step_protocol::InMemoryIdempotencyCache, step_recorder::StepRecorder};
 use astra_runtime::{
     orchestration::{
         CancellationOrigin, InheritedPermissions, PermissionSummary, SpawnAgentExecutor,
         SpawnRunConfig, SpawnRunResult, project_subrun_status_to_spawn,
         spawn_completion_status_from_finish_reason,
     },
-    pipeline::step_protocol::InMemoryIdempotencyCache,
-    pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
     turn::agentic_loop::finalization::run_agentic_loop_with_host,
     turn::agentic_loop::host::{
@@ -944,7 +943,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             current_session_id: server_session_id,
             current_run_id: Some(config.run_id.clone()),
             current_run_owner_generation: None,
-            provider_canonical_wal_head_transition_id: None,
+            provider_canonical_wal_head: None,
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),
@@ -1061,7 +1060,6 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             runtime_tool_executor: None,
             interruption: None,

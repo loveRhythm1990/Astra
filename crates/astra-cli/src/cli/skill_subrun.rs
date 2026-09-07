@@ -10,9 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use astra_pipeline::{step_protocol::InMemoryIdempotencyCache, step_recorder::StepRecorder};
 use astra_runtime::{
-    pipeline::step_protocol::InMemoryIdempotencyCache,
-    pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
     turn::agentic::headless_round::HeadlessStderrStyle,
     turn::agentic_loop::finalization::run_agentic_loop_with_host,
@@ -1195,7 +1194,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             current_session_id: Some(parent_session_id.to_string()),
             current_run_id: Some(parent_run_id.to_string()),
             current_run_owner_generation: None,
-            provider_canonical_wal_head_transition_id: None,
+            provider_canonical_wal_head: None,
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),
@@ -1313,7 +1312,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             runtime_tool_executor: None,
             interruption: None,

@@ -53,7 +53,7 @@
 | Command | Description |
 | --- | --- |
 | `make stack-env` | Create deployment environment files and generate local secrets |
-| `make stack-start` | Start the published all-in-one stack, wait for health, and print the next CLI steps |
+| `make stack-start` | Start the published all-in-one stack, wait for health, and point to `make stack-setup` for the guided continuation |
 | `make stack-up` | Start or resume the configured stack without running the guided verification |
 | `make stack-verify` | Check stack health and run a memory round trip |
 | `make stack-down` | Stop the stack while preserving its data |
@@ -65,9 +65,11 @@
 | --- | --- |
 | `make release-prepare VERSION=X.Y.Z` | Safely synchronize release versions without committing, tagging, building, or publishing |
 | `make release-check VERSION=X.Y.Z` | Read-only preflight for synchronized versions, installer/archive unhappy paths, repository workflow contracts, and documentation links |
+| `make release-publish VERSION=X.Y.Z` | From a clean local `main` equal to `origin/main`, dispatch the protected Release Astra workflow with recovery disabled |
 
 Publication itself is owned by the protected **Release Astra** GitHub workflow;
-neither Make target creates a tag or publishes an artifact. `release-prepare`
+the publish target only dispatches it, and the workflow creates the tag and
+artifacts after its candidate checks and Environment approval. `release-prepare`
 refuses to overwrite existing version-file edits and leaves MatrixOne/Memoria
 digest changes for deliberate maintainer review.
 
@@ -88,7 +90,7 @@ dependency data; that command prompts before deletion.
 
 | Command | Description |
 | --- | --- |
-| `make stack-setup` | State-aware wizard for embedding preflight, data-preserving stack reconciliation, runtime verification, admin, and model probe |
+| `make stack-setup` | Single guided setup from any local stack state: installation selection, embedding preflight, data-preserving reconciliation, runtime verification, status snapshot, and optional admin/model setup |
 | `make stack-start` | Non-interactively initialize configuration, start the stack, and verify health plus a memory round trip |
 | `make stack-env` | Create local `.env` and generate secrets without prompting |
 | `make stack-up` | Start the configured Compose stack |
