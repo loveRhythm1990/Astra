@@ -84,12 +84,17 @@ mod task_status;
 mod terminal;
 mod terminal_palette;
 mod theme;
+
 mod timeline;
 pub(crate) mod turn_event;
 pub(crate) mod ui_adapter;
 pub(crate) mod work_board_projection;
 mod worktrees;
 mod wrapping;
+
+// Shared terminal palette for CLI output rendered outside the TUI.
+pub(crate) use custom_terminal::to_crossterm_color;
+pub(crate) use theme::current as current_theme;
 
 pub(crate) use event_loop::{can_run_tui, run_tui_session as run_tui};
 

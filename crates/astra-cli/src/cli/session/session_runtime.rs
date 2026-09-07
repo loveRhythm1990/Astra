@@ -1534,11 +1534,11 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     ];
     let left_footer = format!(
         " {} {} {}",
-        style_banner_text(model_display, BannerTextStyle::YellowBold, colors_enabled),
-        style_banner_text("·", BannerTextStyle::WhiteBold, colors_enabled),
+        style_banner_text(model_display, BannerTextStyle::WarningBold, colors_enabled),
+        style_banner_text("·", BannerTextStyle::Bold, colors_enabled),
         style_banner_text(
             format!("v{version} · {pname}"),
-            BannerTextStyle::WhiteBold,
+            BannerTextStyle::Bold,
             colors_enabled,
         )
     );
@@ -1551,13 +1551,13 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
         } else if *line == "    astra" {
             left.push(style_banner_text(
                 *line,
-                BannerTextStyle::MagentaBold,
+                BannerTextStyle::BrandBold,
                 colors_enabled,
             ));
         } else {
             left.push(style_banner_text(
                 *line,
-                BannerTextStyle::Magenta,
+                BannerTextStyle::Brand,
                 colors_enabled,
             ));
         }
@@ -1601,32 +1601,32 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     let mut right: Vec<String> = Vec::new();
     right.push(style_banner_text(
         trunc_vis("Tips", right_col_w),
-        BannerTextStyle::WhiteBold,
+        BannerTextStyle::Bold,
         colors_enabled,
     ));
     right.push(style_banner_text(
         trunc_vis("/help for all commands", right_col_w),
-        BannerTextStyle::WhiteBold,
+        BannerTextStyle::Bold,
         colors_enabled,
     ));
     right.push(style_banner_text(
         trunc_vis("Ctrl+K command picker", right_col_w),
-        BannerTextStyle::WhiteBold,
+        BannerTextStyle::Bold,
         colors_enabled,
     ));
     right.push(style_banner_text(
         trunc_vis("Alt+Enter multi-line input", right_col_w),
-        BannerTextStyle::WhiteBold,
+        BannerTextStyle::Bold,
         colors_enabled,
     ));
     right.push(style_banner_text(
         sep_line,
-        BannerTextStyle::WhiteBold,
+        BannerTextStyle::Bold,
         colors_enabled,
     ));
     right.push(style_banner_text(
         trunc_vis("Status", right_col_w),
-        BannerTextStyle::WhiteBold,
+        BannerTextStyle::Bold,
         colors_enabled,
     ));
     right.push(style_banner_text(
@@ -1641,14 +1641,14 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
             ),
             right_col_w,
         ),
-        BannerTextStyle::WhiteBold,
+        BannerTextStyle::Bold,
         colors_enabled,
     ));
     if let Some(line) = pending_recovery_status_line(state) {
         let truncated = trunc_vis(&line, right_col_w);
         right.push(style_banner_text(
             truncated,
-            BannerTextStyle::YellowBold,
+            BannerTextStyle::WarningBold,
             colors_enabled,
         ));
     }
@@ -1731,7 +1731,7 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
                     let s = STARS[(next(rng) % STARS.len() as u64) as usize];
                     out.push_str(&style_banner_text(
                         s,
-                        BannerTextStyle::DarkGrey,
+                        BannerTextStyle::Muted,
                         colors_enabled,
                     ));
                 } else {
@@ -1744,31 +1744,31 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
         // Header — title is embedded inline; brighter so it stands out.
         eprint!(
             "{}",
-            style_banner_text("╭", BannerTextStyle::WhiteBold, colors_enabled)
+            style_banner_text("╭", BannerTextStyle::Bold, colors_enabled)
         );
         eprint!(
             "{}",
             style_banner_text(
                 "─".repeat(*lead_dash),
-                BannerTextStyle::WhiteBold,
+                BannerTextStyle::Bold,
                 colors_enabled,
             )
         );
         eprint!(
             "{}",
-            style_banner_text(*title_padded, BannerTextStyle::BoldCyan, colors_enabled,)
+            style_banner_text(*title_padded, BannerTextStyle::AccentBold, colors_enabled,)
         );
         eprint!(
             "{}",
             style_banner_text(
                 "─".repeat(*trail_dash),
-                BannerTextStyle::WhiteBold,
+                BannerTextStyle::Bold,
                 colors_enabled,
             )
         );
         eprintln!(
             "{}",
-            style_banner_text("╮", BannerTextStyle::WhiteBold, colors_enabled)
+            style_banner_text("╮", BannerTextStyle::Bold, colors_enabled)
         );
         // Body
         for row in 0..*total_rows {
@@ -1776,21 +1776,21 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
             let r_pad = starfield_pad(*right_col_w, vis_w(&right[row]), &mut rng_seed, 8);
             eprintln!(
                 "{} {}{} {} {}{} {}",
-                style_banner_text("│", BannerTextStyle::WhiteBold, colors_enabled),
+                style_banner_text("│", BannerTextStyle::Bold, colors_enabled),
                 left[row],
                 l_pad,
-                style_banner_text("│", BannerTextStyle::WhiteBold, colors_enabled),
+                style_banner_text("│", BannerTextStyle::Bold, colors_enabled),
                 right[row],
                 r_pad,
-                style_banner_text("│", BannerTextStyle::WhiteBold, colors_enabled),
+                style_banner_text("│", BannerTextStyle::Bold, colors_enabled),
             );
         }
         // Footer
         eprintln!(
             "{}{}{}",
-            style_banner_text("╰", BannerTextStyle::WhiteBold, colors_enabled),
-            style_banner_text(*h_bar, BannerTextStyle::WhiteBold, colors_enabled),
-            style_banner_text("╯", BannerTextStyle::WhiteBold, colors_enabled)
+            style_banner_text("╰", BannerTextStyle::Bold, colors_enabled),
+            style_banner_text(*h_bar, BannerTextStyle::Bold, colors_enabled),
+            style_banner_text("╯", BannerTextStyle::Bold, colors_enabled)
         );
         let _ = std::io::stderr().flush();
     }
@@ -1842,36 +1842,35 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     let model_hint = if model_display == "auto" {
         format!(
             "{} {}",
-            style_banner_text("auto", BannerTextStyle::Yellow, colors_enabled),
-            style_banner_text("mode", BannerTextStyle::Grey, colors_enabled)
+            style_banner_text("auto", BannerTextStyle::Warning, colors_enabled),
+            style_banner_text("mode", BannerTextStyle::Muted, colors_enabled)
         )
     } else {
         format!(
             "{} {}",
-            style_banner_text(model_display, BannerTextStyle::Cyan, colors_enabled),
-            style_banner_text("mode", BannerTextStyle::Grey, colors_enabled)
+            style_banner_text(model_display, BannerTextStyle::Accent, colors_enabled),
+            style_banner_text("mode", BannerTextStyle::Muted, colors_enabled)
         )
     };
     eprintln!(
         "  {} {} {}",
-        style_banner_text(welcome, BannerTextStyle::Cyan, colors_enabled),
+        style_banner_text(welcome, BannerTextStyle::Accent, colors_enabled),
         model_hint,
-        style_banner_text("· /model to change", BannerTextStyle::Grey, colors_enabled)
+        style_banner_text("· /model to change", BannerTextStyle::Muted, colors_enabled)
     );
     eprintln!();
 }
 
 #[derive(Clone, Copy)]
 enum BannerTextStyle {
-    WhiteBold,
-    Magenta,
-    MagentaBold,
-    Yellow,
-    YellowBold,
-    BoldCyan,
-    Cyan,
-    Grey,
-    DarkGrey,
+    Bold,
+    Brand,
+    BrandBold,
+    Warning,
+    WarningBold,
+    AccentBold,
+    Accent,
+    Muted,
 }
 
 fn style_banner_text(
@@ -1883,16 +1882,22 @@ fn style_banner_text(
     if !colors_enabled {
         return text;
     }
-    match style {
-        BannerTextStyle::WhiteBold => text.white().bold().to_string(),
-        BannerTextStyle::Magenta => text.magenta().to_string(),
-        BannerTextStyle::MagentaBold => text.magenta().bold().to_string(),
-        BannerTextStyle::Yellow => text.yellow().to_string(),
-        BannerTextStyle::YellowBold => text.bold().yellow().to_string(),
-        BannerTextStyle::BoldCyan => text.bold().cyan().to_string(),
-        BannerTextStyle::Cyan => text.cyan().to_string(),
-        BannerTextStyle::Grey => text.grey().to_string(),
-        BannerTextStyle::DarkGrey => text.dark_grey().to_string(),
+    let palette = crate::tui::current_theme();
+    let (color, bold) = match style {
+        BannerTextStyle::Bold => (palette.fg, true),
+        BannerTextStyle::Brand => (palette.gutter, false),
+        BannerTextStyle::BrandBold => (palette.gutter, true),
+        BannerTextStyle::Warning => (palette.warn, false),
+        BannerTextStyle::WarningBold => (palette.warn, true),
+        BannerTextStyle::AccentBold => (palette.accent, true),
+        BannerTextStyle::Accent => (palette.accent, false),
+        BannerTextStyle::Muted => (palette.dim, false),
+    };
+    let styled = text.with(crate::tui::to_crossterm_color(color));
+    if bold {
+        styled.bold().to_string()
+    } else {
+        styled.to_string()
     }
 }
 
@@ -3455,12 +3460,25 @@ mod tests {
 
     #[test]
     fn banner_style_omits_ansi_when_colors_are_disabled() {
-        let plain = style_banner_text("Message", BannerTextStyle::WhiteBold, false);
+        let plain = style_banner_text("Message", BannerTextStyle::Bold, false);
         assert_eq!(plain, "Message");
         assert!(!plain.contains('\x1b'));
 
-        let colored = style_banner_text("Message", BannerTextStyle::WhiteBold, true);
+        let colored = style_banner_text("Message", BannerTextStyle::Bold, true);
         assert!(colored.contains('\x1b'));
+    }
+
+    #[test]
+    fn banner_body_preserves_terminal_foreground() {
+        let output = style_banner_text("Tips", BannerTextStyle::Bold, true);
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(output.as_bytes());
+        assert_eq!(parser.screen().contents(), "Tips");
+        for col in 0..4 {
+            let cell = parser.screen().cell(0, col).unwrap();
+            assert_eq!(cell.fgcolor(), vt100::Color::Default);
+            assert!(cell.bold());
+        }
     }
 
     #[test]

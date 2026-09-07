@@ -166,7 +166,7 @@ impl Theme {
         Self {
             is_light: true,
             fg: Color::Reset,
-            dim: Color::Gray,
+            dim: Color::Rgb(90, 102, 115),
             accent: Color::Rgb(39, 98, 149),
             selected_bg: Color::Rgb(226, 235, 243),
             selected_fg: Color::Rgb(23, 34, 45),
@@ -177,7 +177,7 @@ impl Theme {
             error: Color::Rgb(163, 66, 67),
             quote: Color::Rgb(51, 119, 104),
             link: Color::Rgb(39, 98, 149),
-            path_dim: Color::Gray,
+            path_dim: Color::Rgb(90, 102, 115),
             path_file: Color::Black,
             command: Color::Rgb(25, 112, 147),
             md_heading: Color::Rgb(39, 98, 149),
@@ -191,7 +191,7 @@ impl Theme {
             diff_del_fg: Color::Rgb(31, 35, 40),
             diff_del_bg: Color::Rgb(255, 235, 233),
             diff_hunk: Color::Rgb(39, 98, 149),
-            diff_context: Color::Gray,
+            diff_context: Color::Rgb(90, 102, 115),
             // Status indicator: stall thresholds use warn/error colors.
             stall_warn: Color::Rgb(139, 100, 38),
             stall_error: Color::Rgb(163, 66, 67),
@@ -258,6 +258,7 @@ impl Theme {
     /// truecolor (notably a number of remote shells and multiplexers).
     pub fn dark_ansi() -> Self {
         let mut theme = Self::dark();
+        theme.dim = Color::DarkGray;
         theme.accent = Color::LightBlue;
         theme.selected_bg = Color::DarkGray;
         theme.selected_fg = Color::White;
@@ -293,15 +294,16 @@ impl Theme {
     /// low-contrast RGB down-conversion that prompted this profile.
     pub fn light_ansi() -> Self {
         let mut theme = Self::light();
+        theme.dim = Color::DarkGray;
         theme.accent = Color::Blue;
         theme.selected_bg = Color::Gray;
         theme.selected_fg = Color::Black;
         theme.gutter = Color::Magenta;
         theme.gutter_frozen = Color::DarkGray;
-        theme.success = Color::LightGreen;
+        theme.success = Color::Green;
         theme.warn = Color::Yellow;
-        theme.error = Color::LightRed;
-        theme.quote = Color::LightGreen;
+        theme.error = Color::Red;
+        theme.quote = Color::Green;
         theme.link = Color::Blue;
         theme.path_dim = Color::DarkGray;
         theme.path_file = Color::Black;
@@ -309,7 +311,7 @@ impl Theme {
         theme.md_heading = Color::Blue;
         theme.md_code = Color::Blue;
         theme.md_link = Color::Blue;
-        theme.md_blockquote = Color::LightGreen;
+        theme.md_blockquote = Color::Green;
         theme.md_list_marker = Color::Blue;
         // See `dark_ansi`: direction remains a row-level surface rather than
         // collapsing into coloured punctuation on limited terminals.
@@ -320,7 +322,7 @@ impl Theme {
         theme.diff_hunk = Color::Blue;
         theme.diff_context = Color::DarkGray;
         theme.stall_warn = Color::Yellow;
-        theme.stall_error = Color::LightRed;
+        theme.stall_error = Color::Red;
         theme
     }
 
@@ -371,38 +373,49 @@ impl Theme {
         }
     }
 
-    /// Select a preset automatically based on terminal background.
-    /// Falls back to `dark` when no signal is available.
+    /// Select a preset from known terminal colours and capabilities. Without
+    /// background information, inherit terminal colours instead of guessing dark.
     pub fn auto() -> Self {
-        let light = is_light_background();
-        if supports_truecolor() {
-            return if light { Self::light() } else { Self::dark() };
-        }
-        if super::terminal_palette::stdout_color_level()
-            == super::terminal_palette::StdoutColorLevel::Ansi256
-        {
-            return if light {
-                Self::light_256()
-            } else {
-                Self::dark_256()
-            };
-        }
-        if light {
-            Self::light_ansi()
+        use super::terminal_palette::{StdoutColorLevel, default_bg, stdout_color_level};
+        let level = if supports_truecolor() {
+            StdoutColorLevel::TrueColor
         } else {
-            Self::dark_ansi()
+            stdout_color_level()
+        };
+        Self::auto_for(default_bg(), level)
+    }
+
+    fn auto_for(
+        background: Option<(u8, u8, u8)>,
+        level: super::terminal_palette::StdoutColorLevel,
+    ) -> Self {
+        use super::terminal_palette::StdoutColorLevel;
+        let Some(background) = background else {
+            return Self::plain();
+        };
+        let light = super::color::is_light(background);
+        match (light, level) {
+            (true, StdoutColorLevel::TrueColor) => Self::light(),
+            (false, StdoutColorLevel::TrueColor) => Self::dark(),
+            (true, StdoutColorLevel::Ansi256) => Self::light_256(),
+            (false, StdoutColorLevel::Ansi256) => Self::dark_256(),
+            (true, _) => Self::light_ansi(),
+            (false, _) => Self::dark_ansi(),
         }
     }
 
     /// Produce a dimmer variant of the accent for low-emphasis uses.
     pub fn accent_dim(&self) -> Color {
-        let acc = color_to_rgb(self.accent);
+        let Color::Rgb(r, g, b) = self.accent else {
+            return self.accent;
+        };
+        let acc = (r, g, b);
         let bg = if self.is_light {
             (240, 240, 240)
         } else {
             (17, 17, 17)
         };
-        let (r, g, b) = blend(bg, acc, 0.6);
+        let (r, g, b) = blend(bg, acc, if self.is_light { 0.1 } else { 0.2 });
         Color::Rgb(r, g, b)
     }
 
@@ -459,24 +472,6 @@ impl Theme {
     pub fn stall_error_style(&self) -> Style {
         Style::default().fg(self.stall_error)
     }
-}
-
-fn is_light_background() -> bool {
-    // 1. Direct query from terminal (disabled on crossterm 0.28 for now,
-    //    but the helper returns Some if ever re-enabled).
-    if let Some((r, g, b)) = super::terminal_palette::default_bg() {
-        return perceived_lightness(r, g, b) > 0.5;
-    }
-    // 2. COLORFGBG env var (e.g. "15;0" meaning fg=15 bg=0).
-    if let Ok(v) = std::env::var("COLORFGBG")
-        && let Some((_, bg_str)) = v.split_once(';')
-        && let Ok(bg_idx) = bg_str.trim().parse::<u8>()
-    {
-        // Low indices 0..=7 are dark; 8..=15 mixed; but in practice a
-        // COLORFGBG with bg>=10 is *very* likely a light terminal.
-        return bg_idx >= 10;
-    }
-    false
 }
 
 fn supports_truecolor() -> bool {
@@ -668,6 +663,39 @@ mod tests {
     }
 
     #[test]
+    fn light_text_roles_have_readable_contrast_on_white() {
+        fn luminance(color: Color) -> f64 {
+            let Color::Rgb(r, g, b) = color else {
+                panic!("expected explicit RGB colour")
+            };
+            let linear = |value: u8| {
+                let value = f64::from(value) / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+        }
+        let theme = Theme::light();
+        for color in [
+            theme.dim,
+            theme.path_dim,
+            theme.diff_context,
+            theme.accent,
+            theme.accent_dim(),
+            theme.success,
+            theme.warn,
+            theme.error,
+            theme.md_code,
+        ] {
+            let ratio = 1.05 / (luminance(color) + 0.05);
+            assert!(ratio >= 4.5, "{color:?}: contrast {ratio:.2}");
+        }
+    }
+
+    #[test]
     fn light_theme_readable_selection_contrast() {
         // Selected_fg should be dark enough on a light selected_bg.
         let l = Theme::light();
@@ -692,17 +720,110 @@ mod tests {
     }
 
     #[test]
-    fn auto_without_signal_is_dark() {
-        // With no COLORFGBG and no terminal query, auto must default to dark.
-        let original = std::env::var("COLORFGBG").ok();
-        // SAFETY: tests in this file run single-threaded within the process
-        // via cargo test's default, but env writes can race other tests.
-        // The tradeoff here is limited to the audit case below.
-        unsafe { std::env::remove_var("COLORFGBG") };
-        let t = Theme::auto();
-        assert!(!t.is_light);
-        if let Some(v) = original {
-            unsafe { std::env::set_var("COLORFGBG", v) };
+    fn auto_without_background_preserves_terminal_colours() {
+        use super::super::terminal_palette::StdoutColorLevel;
+        for level in [
+            StdoutColorLevel::TrueColor,
+            StdoutColorLevel::Ansi256,
+            StdoutColorLevel::Ansi16,
+            StdoutColorLevel::Unknown,
+        ] {
+            let theme = Theme::auto_for(None, level);
+            assert_eq!(theme, Theme::plain());
+            assert_eq!(theme.accent_dim(), Color::Reset);
+        }
+    }
+
+    #[test]
+    fn auto_known_background_selects_matching_palette() {
+        use super::super::terminal_palette::StdoutColorLevel;
+        for (background, light) in [((255, 255, 255), true), ((17, 22, 28), false)] {
+            for level in [
+                StdoutColorLevel::TrueColor,
+                StdoutColorLevel::Ansi256,
+                StdoutColorLevel::Ansi16,
+            ] {
+                let theme = Theme::auto_for(Some(background), level);
+                assert_eq!(theme.is_light, light);
+                assert_ne!(theme.selected_bg, Color::Reset);
+                assert_ne!(theme.selected_fg, Color::Reset);
+                if level == StdoutColorLevel::Ansi16 {
+                    assert!(!matches!(theme.accent_dim(), Color::Rgb(..)));
+                    assert!(!matches!(theme.dim, Color::Rgb(..)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_profile_environment_reaches_surfaces_and_highlighting() {
+        const CASE: &str = "ASTRA_TEST_TERMINAL_PROFILE";
+        if let Ok(expected) = std::env::var(CASE) {
+            let theme = current();
+            match expected.as_str() {
+                "plain" => assert_eq!(*theme, Theme::plain()),
+                "light" => assert!(theme.is_light),
+                "dark" => assert!(!theme.is_light && theme.accent != Color::Reset),
+                _ => panic!("unexpected test case"),
+            }
+            for style in [
+                crate::tui::style::user_message_style(),
+                crate::tui::style::composer_surface_style(),
+                crate::tui::style::queue_panel_style(),
+            ] {
+                if expected == "plain" {
+                    assert!(style.bg.is_none() || style.bg == Some(Color::Reset));
+                    assert!(style.fg.is_none() || style.fg == Some(Color::Reset));
+                } else {
+                    assert_eq!(style.fg, Some(theme.selected_fg));
+                    assert_ne!(style.bg, Some(Color::Reset));
+                }
+            }
+            let code =
+                crate::tui::render::highlight::highlight_code_to_lines("let x = 42;", "rust");
+            let keyword = code[0].spans.iter().find(|s| s.content == "let").unwrap();
+            assert_eq!(keyword.style.fg, Some(theme.md_heading));
+            return;
+        }
+        let test = format!(
+            "{}::terminal_profile_environment_reaches_surfaces_and_highlighting",
+            module_path!().split_once("::").unwrap().1
+        );
+        for (profile, bg, no_color, expected) in [
+            ("auto", None, false, "plain"),
+            ("auto", Some("#ffffff"), false, "light"),
+            ("auto", Some("#11161c"), false, "dark"),
+            ("light", None, false, "light"),
+            ("dark", None, false, "dark"),
+            ("light-ansi", None, false, "light"),
+            ("dark-ansi", None, false, "dark"),
+            ("plain", Some("#ffffff"), false, "plain"),
+            ("light", Some("#ffffff"), true, "plain"),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", &test, "--nocapture"])
+                .env(CASE, expected)
+                .env("ASTRA_TUI_THEME", profile)
+                .env("COLORTERM", "truecolor")
+                .env_remove("NO_COLOR")
+                .env_remove("COLORFGBG")
+                .env_remove("ASTRA_TERMINAL_BG")
+                .env_remove("ASTRA_TERMINAL_FG");
+            if let Some(bg) = bg {
+                child
+                    .env("ASTRA_TERMINAL_BG", bg)
+                    .env("ASTRA_TERMINAL_FG", "#808080");
+            }
+            if no_color {
+                child.env("NO_COLOR", "1");
+            }
+            let output = child.output().expect("isolated theme test");
+            assert!(output.status.success(), "{profile}/{expected}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{output:?}"
+            );
         }
     }
 
