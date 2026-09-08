@@ -34,6 +34,12 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
             "/chat/completions",
             post(
                 |headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
+                    // Each simulated upstream enforces its own documented
+                    // field; do not reuse the serializer under test here.
+                    let (limit, forbidden) = match body["model"].as_str() {
+                        Some("deepseek-chat") => ("max_tokens", "max_completion_tokens"),
+                        _ => ("max_completion_tokens", "max_tokens"),
+                    };
                     let status = if headers
                         .get("authorization")
                         .is_none_or(|v| v != "Bearer valid-key" && v != "Bearer rotated-key")
@@ -41,9 +47,7 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
                         StatusCode::UNAUTHORIZED
                     } else if body["model"] != "deepseek-chat" && body["model"] != "o3" {
                         StatusCode::NOT_FOUND
-                    } else if body["max_completion_tokens"] != 32
-                        || body.get("max_tokens").is_some()
-                    {
+                    } else if body[limit] != 32 || body.get(forbidden).is_some() {
                         StatusCode::BAD_REQUEST
                     } else {
                         StatusCode::OK

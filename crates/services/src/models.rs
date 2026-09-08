@@ -7507,8 +7507,15 @@ mod tests {
                 "deepseek",
                 "deepseek-chat",
                 "/chat/completions",
-                "max_completion_tokens",
                 "max_tokens",
+                "max_completion_tokens",
+            ),
+            (
+                "deepseek",
+                "deepseek-v4-flash",
+                "/chat/completions",
+                "max_tokens",
+                "max_completion_tokens",
             ),
             (
                 "anthropic",

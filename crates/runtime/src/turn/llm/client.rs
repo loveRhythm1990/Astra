@@ -3279,7 +3279,7 @@ fn build_provider_request_body_with_cache_capability(
             }
             if let Some(max_out) = max_output_tokens {
                 // When thinking is active, providers like DeepSeek allocate a
-                // thinking_budget that must be LESS than max_completion_tokens.
+                // thinking_budget that must be LESS than the output token limit.
                 // If max_out is too small, the request will 400. Bump to at
                 // least thinking_budget + a headroom for the visible answer.
                 //
@@ -3297,7 +3297,7 @@ fn build_provider_request_body_with_cache_capability(
                         tracing::debug!(
                             user_max = max_out,
                             bumped_to = required_floor,
-                            "max_completion_tokens bumped to fit thinking budget"
+                            "output token limit bumped to fit thinking budget"
                         );
                         required_floor
                     } else {
@@ -16884,9 +16884,53 @@ mod tests {
         assert!(stop_slot["properties"].get("slots").is_none());
     }
 
-    // --- Regression: max_completion_tokens bump respects user's ceiling ---
     #[test]
-    fn max_completion_tokens_honors_user_when_above_floor() {
+    fn build_provider_request_body_output_limits_follow_provider_contract() {
+        for (provider, model, limit, forbidden) in [
+            ("openai", "o3", "max_completion_tokens", "max_tokens"),
+            ("openai", "gpt-4o", "max_completion_tokens", "max_tokens"),
+            (
+                "openai-compatible",
+                "custom-model",
+                "max_completion_tokens",
+                "max_tokens",
+            ),
+            (
+                "deepseek",
+                "deepseek-v4-flash",
+                "max_tokens",
+                "max_completion_tokens",
+            ),
+            (
+                "anthropic",
+                "claude-sonnet-4-5",
+                "max_tokens",
+                "max_completion_tokens",
+            ),
+        ] {
+            for streaming in [false, true] {
+                let body = build_provider_request_body(
+                    &[json!({"role": "user", "content": "hi"})],
+                    &[],
+                    model,
+                    provider,
+                    Some(4096),
+                    None,
+                    streaming,
+                    &ThinkingConfig::Off,
+                );
+                assert_eq!(
+                    body[limit], 4096,
+                    "{provider}, streaming={streaming}: {body}"
+                );
+                assert!(body.get(forbidden).is_none(), "{provider}: {body}");
+            }
+        }
+    }
+
+    // --- Regression: output-limit bump respects user's ceiling ---
+    #[test]
+    fn deepseek_max_tokens_honors_user_when_above_floor() {
         use astra_turn_core::thinking_config::ThinkingConfig;
         // User sets 128K, thinking budget is 32K → floor = 40K → must keep 128K.
         let thinking = ThinkingConfig::Enabled {
@@ -16903,14 +16947,15 @@ mod tests {
             &thinking,
         );
         assert_eq!(
-            body["max_completion_tokens"].as_u64(),
+            body["max_tokens"].as_u64(),
             Some(128_000),
             "user ceiling above floor must not be bumped"
         );
+        assert!(body.get("max_completion_tokens").is_none());
     }
 
     #[test]
-    fn max_completion_tokens_bumps_when_user_below_floor() {
+    fn deepseek_max_tokens_bumps_when_user_below_floor() {
         use astra_turn_core::thinking_config::ThinkingConfig;
         // User sets 8K, thinking budget is 32K → floor = 32K + 8K = 40K → bump to 40K.
         let thinking = ThinkingConfig::Enabled {
@@ -16927,14 +16972,15 @@ mod tests {
             &thinking,
         );
         assert_eq!(
-            body["max_completion_tokens"].as_u64(),
+            body["max_tokens"].as_u64(),
             Some(40_192),
             "configured max below thinking_budget+headroom must be bumped to floor"
         );
+        assert!(body.get("max_completion_tokens").is_none());
     }
 
     #[test]
-    fn max_completion_tokens_unchanged_when_thinking_off() {
+    fn deepseek_max_tokens_unchanged_when_thinking_off() {
         use astra_turn_core::thinking_config::ThinkingConfig;
         let body = build_provider_request_body(
             &[json!({"role": "user", "content": "hi"})],
@@ -16947,10 +16993,11 @@ mod tests {
             &ThinkingConfig::Off,
         );
         assert_eq!(
-            body["max_completion_tokens"].as_u64(),
+            body["max_tokens"].as_u64(),
             Some(4_096),
             "thinking=off must never bump user's max"
         );
+        assert!(body.get("max_completion_tokens").is_none());
     }
 
     #[test]

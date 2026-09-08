@@ -181,10 +181,12 @@ their own provider account.
 - Inference admission revalidates `(user_id, offering_id, is_active)` and
   decrypts the current credential immediately before provider execution.
 - Create, credential rotation and explicit probe validate connectivity with a
-  small output budget using the same wire-field rule as inference: OpenAI-style
-  Chat Completions uses `max_completion_tokens` (including o-series), while
-  native Anthropic Messages uses `max_tokens`. Provider credential/model errors
-  remain failures; failed checks do not persist a new or rotated credential.
+  small output budget using the same provider-specific wire-field rule as
+  inference: OpenAI (including o-series) and the generic OpenAI-compatible
+  adapter use `max_completion_tokens`; native DeepSeek Chat Completions and
+  Anthropic Messages use `max_tokens`. Sharing the Chat Completions message
+  format does not imply identical optional parameters. Provider credential/model
+  errors remain failures; failed checks do not persist a new or rotated credential.
 - Memoria-authenticated identities can only use their own BYOK Offerings;
   deployment Offerings are excluded from both their catalog and execution.
   `ASTRA_DEPLOYMENT_MODE=cloud-byok` applies the same restriction to all
