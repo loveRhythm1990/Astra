@@ -3887,14 +3887,12 @@ pub async fn validate_connectivity(
                 }
             }
         }
-        let send_result = req
-            .json(&serde_json::json!({
-               "model": model_name,
-               "max_tokens": 1,
-               "messages": [{"role": "user", "content": "hi"}]
-            }))
-            .send()
-            .await;
+        let mut body = serde_json::json!({
+            "model": model_name,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        astra_core::model_wire::apply_chat_output_token_limit(&mut body, provider, 32);
+        let send_result = req.json(&body).send().await;
         (send_result, probe)
     } else if provider == "bedrock" {
         let Some(base_url_value) = base_url.map(str::trim).filter(|url| !url.is_empty()) else {
@@ -3962,14 +3960,12 @@ pub async fn validate_connectivity(
                 }
             }
         }
-        let send_result = req
-            .json(&serde_json::json!({
-                "model": model_name,
-                "max_tokens": 1,
-                "messages": [{"role": "user", "content": "hi"}]
-            }))
-            .send()
-            .await;
+        let mut body = serde_json::json!({
+            "model": model_name,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        astra_core::model_wire::apply_chat_output_token_limit(&mut body, provider, 32);
+        let send_result = req.json(&body).send().await;
         (send_result, probe)
     };
 
@@ -7488,6 +7484,91 @@ mod tests {
     }
 
     // ── Provider-aware probe regression tests ─────────────────────────
+
+    #[tokio::test]
+    async fn connectivity_probe_uses_native_token_budget_and_preserves_provider_errors() {
+        use axum::{Json, Router, http::HeaderMap, routing::post};
+        for (provider, model, path, token_field, wrong_field) in [
+            (
+                "openai",
+                "o3",
+                "/chat/completions",
+                "max_completion_tokens",
+                "max_tokens",
+            ),
+            (
+                "openai",
+                "gpt-4o",
+                "/chat/completions",
+                "max_completion_tokens",
+                "max_tokens",
+            ),
+            (
+                "deepseek",
+                "deepseek-chat",
+                "/chat/completions",
+                "max_completion_tokens",
+                "max_tokens",
+            ),
+            (
+                "anthropic",
+                "claude-sonnet-4-5",
+                "/v1/messages",
+                "max_tokens",
+                "max_completion_tokens",
+            ),
+        ] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let captured = calls.clone();
+            let app = Router::new().route(
+                path,
+                post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                    captured.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move {
+                        let auth = if provider == "anthropic" {
+                            assert_eq!(headers["anthropic-version"], "2023-06-01");
+                            headers.get("x-api-key").and_then(|v| v.to_str().ok())
+                                == Some("valid-key")
+                        } else {
+                            headers.get("authorization").and_then(|v| v.to_str().ok())
+                                == Some("Bearer valid-key")
+                        };
+                        let status = if !auth {
+                            StatusCode::UNAUTHORIZED
+                        } else if body["model"] != model {
+                            StatusCode::NOT_FOUND
+                        } else if body[token_field] != 32 || body.get(wrong_field).is_some() {
+                            StatusCode::BAD_REQUEST
+                        } else {
+                            StatusCode::OK
+                        };
+                        (
+                            status,
+                            Json(serde_json::json!({"error":{"message":"fixture rejection"}})),
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let result =
+                validate_connectivity(provider, model, "valid-key", Some(&base), None, None).await;
+            assert!(result.is_none(), "{provider}/{model}: {result:?}");
+            for (key, model_id, expected) in [
+                ("invalid-key", model, "HTTP 401"),
+                ("valid-key", "missing-model", "HTTP 404"),
+            ] {
+                let result =
+                    validate_connectivity(provider, model_id, key, Some(&base), None, None)
+                        .await
+                        .unwrap();
+                assert!(result.contains(expected), "{provider}: {result}");
+            }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+            task.abort();
+        }
+    }
     //
     // Based on real API recordings from 2026-05-04.
     // Each mock simulates the provider's actual response pattern.

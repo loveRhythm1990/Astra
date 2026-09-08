@@ -16,7 +16,7 @@ The provider verifies the scoped-key API contract through `/auth/whoami`: active
 
 ## Atomic binding and sessions
 
-Login verifies the key, takes the canonical account lock, rechecks the key after waiting, and commits identity, encrypted binding and refresh session together. Concurrent first logins resolve one account. A deterministic credential token primary key identifies one binding per provider/account; replacements remove superseded ciphertext in the same transaction. The verified key ID is its binding generation. Failed issuance rolls back every login-owned row.
+Login verifies the key, takes the canonical account lock, rechecks the key after waiting, and commits identity, encrypted binding and refresh session together. Concurrent first logins resolve one account. A deterministic credential token primary key identifies one binding per provider/account; replacements remove superseded ciphertext in the same transaction. The verified key ID identifies the upstream key generation. Astra also persists a local connection lifecycle nonce in credential metadata: ordinary login with the same active binding preserves it; key replacement or reconnect after disconnect generates a new nonce, even when the upstream key ID is unchanged. Failed issuance rolls back every login-owned row.
 
 Refresh validates the current Memoria credential online. Compare-and-revoke of the old refresh token prevents a concurrent disconnect from resurrecting its session. Access TTL is bounded to 15 minutes. Runtime consumers independently resolve current consent and deny inactive/missing accounts.
 
@@ -66,7 +66,13 @@ consumes the website proof over the fixed HTTPS backchannel
 response. It checks the returned subject, key generation, purpose and timestamps
 and revalidates its binding before issuing the existing five-minute `rp_` proof.
 That proof is single-use, purpose-bound and additionally bound to the Memoria
-identity and connection generation. Device trust still requires the separate
+identity, upstream key generation and Astra connection lifecycle. Disconnect
+deletes pending proofs in the same account-locked transaction as the binding.
+The lifecycle binding also prevents an in-flight proof issuance from becoming
+usable after reconnect with the same upstream key. Legacy credential metadata
+without a lifecycle nonce remains readable; the next login assigns one. Proofs
+issued before this binding-format upgrade must be obtained again (their maximum
+lifetime is five minutes). Device trust still requires the separate
 device-possession challenge. Both proof exchanges fail closed on upstream
 revocation, disconnect, identity mismatch or replay; failed exchanges require
 fresh evidence rather than bypassing proof checks.

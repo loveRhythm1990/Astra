@@ -68,6 +68,26 @@ CARGO_INCREMENTAL=0 cargo test --locked -p astra-services \
 It expects HTTP 401 with no provider key and proves DNS/TLS/HTTP reachability,
 not successful model inference.
 
+The provider-wire regression uses a strict loopback HTTP fixture and a disposable
+MatrixOne database, without real provider keys. Create the designated database
+first and supply its `MATRIXONE_*` connection settings. Choose an unused loopback
+port for the fixture:
+
+```bash
+ASTRA_TEST_DB_IT=1 ASTRA_DATABASE_PREFIX= \
+ASTRA_DATABASE=astra_probe_test ASTRA_TEST_DATABASE=astra_probe_test \
+ASTRA_ALLOW_INSECURE_DEFAULTS=1 \
+ASTRA_BYOK_DEEPSEEK_BASE_URL=http://127.0.0.1:18994 \
+CARGO_INCREMENTAL=0 cargo test --locked -p astra-services \
+  --features external-contract-tests --test user_model_probe_db_it -- --ignored
+```
+
+This covers create, credential rotation, explicit probe and failed-write
+preservation. Official OpenAI/Anthropic probe and rotation tests seed only their
+fixture rows with loopback endpoints; production official endpoints remain fixed.
+`memoria_reauthentication_http` separately covers same-key reconnect, pending
+proof invalidation and an in-flight verification crossing disconnect/reconnect.
+
 ```bash
 ASTRA_TEST_DB_IT=1 \
 ASTRA_TEST_E2E_SECRET=system-matrix-e2e-secret \

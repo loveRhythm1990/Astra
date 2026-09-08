@@ -19,6 +19,10 @@ required-features = ["external-contract-tests"]
 name = "byok_live_network"
 required-features = ["external-contract-tests"]
 
+[[test]]
+name = "user_model_probe_db_it"
+required-features = ["external-contract-tests"]
+
 [dependencies]
 astra-config.workspace = true
 astra-core.workspace = true

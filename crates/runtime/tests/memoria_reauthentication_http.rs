@@ -83,6 +83,12 @@ async fn memoria_step_up_authorizes_real_device_and_takeover_routes_without_pass
     let identity_active = active.clone();
     let proofs = Arc::new(Mutex::new(HashMap::<String, Value>::new()));
     let issued = proofs.clone();
+    let pause_attestation = Arc::new(AtomicBool::new(false));
+    let attestation_entered = Arc::new(tokio::sync::Notify::new());
+    let attestation_release = Arc::new(tokio::sync::Notify::new());
+    let pause = pause_attestation.clone();
+    let entered = attestation_entered.clone();
+    let release = attestation_release.clone();
     let upstream = Router::new()
         .route("/auth/whoami",get(move |headers: axum::http::HeaderMap| {
             let owner = identity_owner.clone(); let active = identity_active.load(Ordering::SeqCst);
@@ -93,7 +99,16 @@ async fn memoria_step_up_authorizes_real_device_and_takeover_routes_without_pass
         }))
         .route("/api/auth/astra/reauthentication/consume",post(move |Json(body):Json<Value>| {
             let result = issued.lock().unwrap().remove(body["proof"].as_str().unwrap_or(""));
-            async { match result { Some(value) => (StatusCode::OK,Json(value)), None => (StatusCode::UNAUTHORIZED,Json(json!({}))) } }
+            let paused = pause.swap(false, Ordering::SeqCst);
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                if paused {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                match result { Some(value) => (StatusCode::OK,Json(value)), None => (StatusCode::UNAUTHORIZED,Json(json!({}))) }
+            }
         }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -290,11 +305,97 @@ async fn memoria_step_up_authorizes_real_device_and_takeover_routes_without_pass
     );
     assert_eq!(request(app.clone(),"POST",&format!("{path}/enroll"),token,json!({"device_id":"laptop","device_fingerprint":"fp-3","reauthentication_proof":pending["proof"]})).await.0,StatusCode::UNAUTHORIZED,"revocation after proof issuance");
     active.store(true, Ordering::SeqCst);
+
+    // A routine login must not invalidate an uninterrupted connection's proof.
+    let (status, again) = request(
+        app.clone(),
+        "POST",
+        "/auth/memoria",
+        "",
+        json!({"connection_key":"connection-key"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["user_id"], user);
+    let (status, result) = request(app.clone(),"POST",&format!("{path}/enroll"),token,json!({"device_id":"laptop","device_fingerprint":"fp-3","reauthentication_proof":pending["proof"]})).await;
+    assert!(status.is_success(), "routine login: {status}: {result}");
+
+    let (status, pending) = reauth(
+        &app,
+        token,
+        &evidence(&proofs, &owner, "device_reenroll"),
+        "device_reenroll",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, pending_takeover) = reauth(
+        &app,
+        token,
+        &evidence(&proofs, &owner, "session_forced_takeover"),
+        "session_forced_takeover",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Pause the upstream response after the first binding read. Reconnecting
+    // the exact same upstream key must still change Astra's local lifecycle.
+    pause_attestation.store(true, Ordering::SeqCst);
+    let racing_app = app.clone();
+    let racing_token = token.to_owned();
+    let racing_proof = evidence(&proofs, &owner, "device_reenroll");
+    let racing = tokio::spawn(async move {
+        reauth(&racing_app, &racing_token, &racing_proof, "device_reenroll").await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        attestation_entered.notified(),
+    )
+    .await
+    .expect("attester reached");
     assert!(
         request(app.clone(), "DELETE", "/auth/memoria", token, json!({}))
             .await
             .0
             .is_success()
+    );
+    let (status, relogin) = request(
+        app.clone(),
+        "POST",
+        "/auth/memoria",
+        "",
+        json!({"connection_key":"connection-key"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{relogin}");
+    assert_eq!(relogin["user_id"], user);
+    let token = relogin["access_token"].as_str().unwrap();
+    attestation_release.notify_one();
+    let (status, result) = racing.await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "in-flight proof crossed disconnect: {result}"
+    );
+    let (status, result) = request(app.clone(),"POST",&format!("{path}/enroll"),token,json!({"device_id":"laptop","device_fingerprint":"fp-4","reauthentication_proof":pending["proof"]})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "old proof revived: {result}");
+    let (status, result) = request(app.clone(),"POST",&format!("/sessions/{session}/handoffs"),token,json!({"idempotency_key":uuid::Uuid::new_v4().to_string(),"mode":"forced","to_attachment_id":attachment_id,"from_placement":"cli","reason":"recovery","reauthentication_proof":pending_takeover["proof"]})).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "old takeover proof revived: {result}"
+    );
+    let (status, fresh) = reauth(
+        &app,
+        token,
+        &evidence(&proofs, &owner, "device_reenroll"),
+        "device_reenroll",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{fresh}");
+    let (status, result) = request(app.clone(),"POST",&format!("{path}/enroll"),token,json!({"device_id":"laptop","device_fingerprint":"fp-4","reauthentication_proof":fresh["proof"]})).await;
+    assert!(
+        status.is_success(),
+        "fresh proof after reconnect: {status}: {result}"
     );
     upstream_task.abort();
 }

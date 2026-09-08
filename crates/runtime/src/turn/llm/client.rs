@@ -3233,7 +3233,9 @@ fn build_provider_request_body_with_cache_capability(
                     body["system"] = Value::Array(system);
                 }
                 if let Some(max_out) = max_output_tokens {
-                    body["max_tokens"] = json!(max_out);
+                    astra_core::model_wire::apply_chat_output_token_limit(
+                        &mut body, provider, max_out,
+                    );
                 }
                 if let Some(temp) = temperature {
                     body["temperature"] = json!(temp);
@@ -3304,7 +3306,11 @@ fn build_provider_request_body_with_cache_capability(
                 } else {
                     max_out
                 };
-                body["max_completion_tokens"] = json!(effective_max);
+                astra_core::model_wire::apply_chat_output_token_limit(
+                    &mut body,
+                    provider,
+                    effective_max,
+                );
             }
             if let Some(temp) = temperature {
                 body["temperature"] = json!(temp);

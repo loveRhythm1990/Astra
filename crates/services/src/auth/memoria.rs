@@ -141,6 +141,7 @@ impl MemoriaProvider {
             memory_access: access,
             granted_scopes: scopes,
             issuer: self.issuer.clone(),
+            connection_generation: None,
         })
     }
 }
@@ -151,6 +152,9 @@ struct VerifiedMemoriaIdentity {
     memory_access: MemoryAccess,
     granted_scopes: Vec<String>,
     issuer: String,
+    /// Astra-owned lifecycle nonce, never supplied by the upstream verifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    connection_generation: Option<String>,
 }
 pub struct MemoriaLogin {
     pub tokens: AuthTokenRecord,
@@ -163,6 +167,7 @@ pub struct MemoriaCredential {
     pub owner: String,
     pub generation: String,
     pub access: MemoryAccess,
+    connection_generation: Option<String>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -170,6 +175,7 @@ pub(super) struct ReauthenticationBinding {
     provider_id: String,
     owner: String,
     generation: String,
+    connection_generation: Option<String>,
 }
 
 pub(super) fn reauthentication_proof_hash(
@@ -182,7 +188,8 @@ pub(super) fn reauthentication_proof_hash(
                 proof,
                 binding.provider_id,
                 binding.owner,
-                binding.generation
+                binding.generation,
+                binding.connection_generation
             ])
             .to_string(),
         ),
@@ -236,6 +243,7 @@ impl MemoriaCredentialResolver {
             owner: identity.memoria_user_id,
             generation: identity.key_id,
             access: identity.memory_access,
+            connection_generation: identity.connection_generation,
         }))
     }
 }
@@ -265,6 +273,7 @@ impl DatabaseAuthService {
             provider_id: resolver.provider.provider_id,
             owner,
             generation: credential.generation,
+            connection_generation: credential.connection_generation,
         }))
     }
 
@@ -471,11 +480,30 @@ impl DatabaseAuthService {
         {
             return Err(reconnect());
         }
+        // The canonical account lock serializes login with disconnect. Preserve
+        // the lifecycle only for an uninterrupted binding to the same key.
+        // Upstream key IDs can be reused after disconnect; this nonce cannot.
+        let previous: Option<String> = sqlx::query_scalar("SELECT CAST(metadata AS CHAR) FROM auth_tokens WHERE token_id = ? AND type = 'memoria_connection' AND provider = 'memoria' AND scope_user_id = ? AND is_active = 1")
+            .bind(resolver.token_id(&user.user_id)).bind(&user.user_id)
+            .fetch_optional(&mut *tx).await.map_err(internal_error)?;
+        let previous =
+            previous.and_then(|value| serde_json::from_str::<VerifiedMemoriaIdentity>(&value).ok());
+        let mut stored_identity = identity.clone();
+        stored_identity.connection_generation = Some(
+            previous
+                .filter(|old| {
+                    old.issuer == identity.issuer
+                        && old.memoria_user_id == identity.memoria_user_id
+                        && old.key_id == identity.key_id
+                })
+                .and_then(|old| old.connection_generation)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        );
         sqlx::query("DELETE FROM auth_tokens WHERE type = 'memoria_connection' AND provider = 'memoria' AND scope_user_id = ?")
             .bind(&user.user_id).execute(&mut *tx).await.map_err(internal_error)?;
         sqlx::query("INSERT INTO auth_tokens (token_id,type,provider,encrypted_value,is_active,scope_user_id,metadata) VALUES (?, 'memoria_connection', 'memoria', ?, 1, ?, ?)")
             .bind(resolver.token_id(&user.user_id)).bind(ciphertext).bind(&user.user_id)
-            .bind(serde_json::to_string(identity).map_err(internal_error)?).execute(&mut *tx).await.map_err(internal_error)?;
+            .bind(serde_json::to_string(&stored_identity).map_err(internal_error)?).execute(&mut *tx).await.map_err(internal_error)?;
         if legacy.is_some() {
             sqlx::query("DELETE FROM auth_memoria_identities WHERE astra_user_id = ?")
                 .bind(&user.user_id)
@@ -521,6 +549,11 @@ impl DatabaseAuthService {
         sqlx::query("DELETE FROM auth_tokens WHERE type = 'memoria_connection' AND provider = 'memoria' AND scope_user_id = ?")
             .bind(user).execute(&mut *tx).await.map_err(internal_error)?;
         sqlx::query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE user_id = ?")
+            .bind(user)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+        sqlx::query("DELETE FROM auth_reauthentication_proofs WHERE user_id = ?")
             .bind(user)
             .execute(&mut *tx)
             .await
@@ -572,6 +605,7 @@ mod tests {
             provider_id: "memoria:one".into(),
             owner: "owner".into(),
             generation: "key".into(),
+            connection_generation: Some("lifecycle-1".into()),
         };
         let expected = reauthentication_proof_hash("rp_test", Some(&binding));
         for other in [
@@ -579,16 +613,31 @@ mod tests {
                 provider_id: "memoria:two".into(),
                 owner: "owner".into(),
                 generation: "key".into(),
+                connection_generation: Some("lifecycle-1".into()),
             },
             ReauthenticationBinding {
                 provider_id: "memoria:one".into(),
                 owner: "other".into(),
                 generation: "key".into(),
+                connection_generation: Some("lifecycle-1".into()),
             },
             ReauthenticationBinding {
                 provider_id: "memoria:one".into(),
                 owner: "owner".into(),
                 generation: "rotated".into(),
+                connection_generation: Some("lifecycle-1".into()),
+            },
+            ReauthenticationBinding {
+                provider_id: "memoria:one".into(),
+                owner: "owner".into(),
+                generation: "key".into(),
+                connection_generation: Some("lifecycle-2".into()),
+            },
+            ReauthenticationBinding {
+                provider_id: "memoria:one".into(),
+                owner: "owner".into(),
+                generation: "key".into(),
+                connection_generation: None,
             },
         ] {
             assert_ne!(
@@ -601,11 +650,13 @@ mod tests {
             provider_id: "p".into(),
             owner: "x\0y".into(),
             generation: "z".into(),
+            connection_generation: None,
         };
         let right = ReauthenticationBinding {
             provider_id: "p".into(),
             owner: "x".into(),
             generation: "y\0z".into(),
+            connection_generation: None,
         };
         assert_ne!(
             reauthentication_proof_hash("rp_test", Some(&left)),
