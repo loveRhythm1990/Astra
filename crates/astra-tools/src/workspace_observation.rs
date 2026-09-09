@@ -477,12 +477,20 @@ struct MacOsGenerationTamperWatch {
 #[cfg(target_os = "macos")]
 impl MacOsGenerationTamperWatch {
     fn arm(
-        lock_paths: impl IntoIterator<Item = PathBuf>,
-        binding_paths: impl IntoIterator<Item = PathBuf>,
+        locks: &[CrossProcessFileLock],
+        binding_paths: impl IntoIterator<Item = WorkspacePathIdentity>,
         cancel_token: Option<&CancellationToken>,
     ) -> std::io::Result<Self> {
+        Self::arm_before_register(locks, binding_paths, cancel_token, || {})
+    }
+
+    fn arm_before_register(
+        locks: &[CrossProcessFileLock],
+        binding_paths: impl IntoIterator<Item = WorkspacePathIdentity>,
+        cancel_token: Option<&CancellationToken>,
+        before_register: impl FnOnce(),
+    ) -> std::io::Result<Self> {
         use std::os::fd::{AsRawFd, FromRawFd};
-        use std::os::unix::fs::OpenOptionsExt;
 
         let lock_mask = libc::NOTE_ATTRIB
             | libc::NOTE_DELETE
@@ -492,18 +500,15 @@ impl MacOsGenerationTamperWatch {
             | libc::NOTE_REVOKE
             | libc::NOTE_WRITE;
         let binding_mask = libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE;
-        let mut specifications = HashMap::<PathBuf, u32>::new();
-        for path in lock_paths {
-            specifications
-                .entry(path)
-                .and_modify(|mask| *mask |= lock_mask)
-                .or_insert(lock_mask);
-        }
-        for path in binding_paths {
-            specifications
-                .entry(path)
-                .and_modify(|mask| *mask |= binding_mask)
-                .or_insert(binding_mask);
+        // Duplicate the admitted witness descriptions instead of resolving
+        // their replaceable pathnames again.
+        let mut specifications = locks
+            .iter()
+            .map(|lock| Ok((lock.file.try_clone()?, lock_mask)))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        for identity in binding_paths {
+            let file = Self::open_binding_descriptor(&identity, || {})?;
+            specifications.push((file, binding_mask));
         }
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
             return Err(std::io::Error::new(
@@ -521,26 +526,15 @@ impl MacOsGenerationTamperWatch {
             return Err(std::io::Error::last_os_error());
         }
 
+        before_register();
         let mut watched_paths = Vec::with_capacity(specifications.len());
-        for (path, mask) in specifications {
+        for (file, mask) in specifications {
             if cancel_token.is_some_and(CancellationToken::is_cancelled) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
                     "workspace generation watch registration was cancelled",
                 ));
             }
-            let metadata = fs::symlink_metadata(&path)?;
-            let mut options = fs::OpenOptions::new();
-            options.read(true).custom_flags(
-                libc::O_EVTONLY
-                    | libc::O_CLOEXEC
-                    | if metadata.file_type().is_symlink() {
-                        libc::O_SYMLINK
-                    } else {
-                        0
-                    },
-            );
-            let file = options.open(&path)?;
             let change = libc::kevent {
                 ident: file.as_raw_fd() as libc::uintptr_t,
                 filter: libc::EVFILT_VNODE,
@@ -579,17 +573,56 @@ impl MacOsGenerationTamperWatch {
         })
     }
 
+    fn open_binding_descriptor(
+        identity: &WorkspacePathIdentity,
+        before_validate: impl FnOnce(),
+    ) -> std::io::Result<fs::File> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let mut options = fs::OpenOptions::new();
+        options.read(true).custom_flags(
+            libc::O_EVTONLY
+                | libc::O_CLOEXEC
+                | if identity.file_type == libc::S_IFLNK as u32 {
+                    libc::O_SYMLINK
+                } else {
+                    libc::O_NOFOLLOW
+                },
+        );
+        let file = options.open(&identity.path)?;
+        before_validate();
+        let metadata = file.metadata()?;
+        if metadata.dev() != identity.device
+            || metadata.ino() != identity.inode
+            || metadata.mode() & FILE_TYPE_MASK != identity.file_type
+        {
+            return Err(std::io::Error::other(
+                "workspace watch descriptor identity changed",
+            ));
+        }
+        Ok(file)
+    }
+
     fn is_untampered(&self) -> bool {
+        self.is_untampered_before_poll(|| {})
+    }
+
+    fn is_untampered_before_poll(&self, before_poll: impl FnOnce()) -> bool {
         use std::os::fd::AsRawFd;
 
         if self.tampered.load(std::sync::atomic::Ordering::Acquire) {
             return false;
         }
+        before_poll();
         let Ok(_poll_guard) = self.poll_gate.lock() else {
             self.tampered
                 .store(true, std::sync::atomic::Ordering::Release);
             return false;
         };
+        // Another validator may have consumed the event while we waited.
+        // EV_CLEAR's empty queue must never undo permanent revocation.
+        if self.tampered.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
         let mut event = unsafe { std::mem::zeroed::<libc::kevent>() };
         let timeout = libc::timespec {
             tv_sec: 0,
@@ -616,8 +649,8 @@ impl MacOsGenerationTamperWatch {
 
 impl GenerationTamperWatch {
     fn arm(
-        lock_paths: impl IntoIterator<Item = PathBuf>,
-        binding_paths: impl IntoIterator<Item = PathBuf>,
+        locks: &[CrossProcessFileLock],
+        binding_paths: impl IntoIterator<Item = WorkspacePathIdentity>,
         cancel_token: Option<&CancellationToken>,
     ) -> std::io::Result<Self> {
         #[cfg(target_os = "linux")]
@@ -629,13 +662,13 @@ impl GenerationTamperWatch {
                 | libc::IN_UNMOUNT;
             let binding_mask = libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_UNMOUNT;
             let mut specifications = HashMap::<PathBuf, u32>::new();
-            for path in lock_paths {
+            for path in locks.iter().map(|lock| lock.path.clone()) {
                 specifications
                     .entry(path)
                     .and_modify(|mask| *mask |= lock_mask)
                     .or_insert(lock_mask);
             }
-            for path in binding_paths {
+            for path in binding_paths.into_iter().map(|identity| identity.path) {
                 // Only self-removal/rebinding is generation tamper. Ordinary
                 // writes below a watched workspace directory legitimately
                 // change that directory's metadata and must remain receiptable.
@@ -656,12 +689,12 @@ impl GenerationTamperWatch {
         #[cfg(target_os = "macos")]
         {
             Ok(Self {
-                watcher: MacOsGenerationTamperWatch::arm(lock_paths, binding_paths, cancel_token)?,
+                watcher: MacOsGenerationTamperWatch::arm(locks, binding_paths, cancel_token)?,
             })
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            let _ = (lock_paths, binding_paths, cancel_token);
+            let _ = (locks, binding_paths, cancel_token);
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "workspace generation tamper watch is unavailable",
@@ -1360,7 +1393,7 @@ struct CrossProcessKernelLock {
     _coordination_root: std::fs::File,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct WorkspacePathIdentity {
     path: PathBuf,
     #[cfg(unix)]
@@ -2131,10 +2164,6 @@ async fn acquire_workspace_lease_async(
         };
         locks.push(lock);
     }
-    let watch_lock_paths = locks
-        .iter()
-        .map(|lock| lock.path.clone())
-        .collect::<Vec<_>>();
     let watch_binding_paths = binding_identity
         .path_components
         .iter()
@@ -2142,25 +2171,22 @@ async fn acquire_workspace_lease_async(
         // Watching `/tmp` itself would let unrelated users' traffic revoke
         // every active lease.
         .filter(|identity| !trusted_coordination_root.starts_with(&identity.path))
-        .map(|identity| identity.path.clone())
+        .cloned()
         .collect::<Vec<_>>();
     let watcher_cancel = cancel_token.cloned();
     let tamper_watch = tokio::task::spawn_blocking(move || {
-        let tamper_watch = GenerationTamperWatch::arm(
-            watch_lock_paths,
-            watch_binding_paths,
-            watcher_cancel.as_ref(),
-        )?;
+        let tamper_watch =
+            GenerationTamperWatch::arm(&locks, watch_binding_paths, watcher_cancel.as_ref())?;
         if !tamper_watch.is_untampered() {
             return Err(std::io::Error::other(
                 "workspace generation watcher was revoked before admission completed",
             ));
         }
-        Ok(tamper_watch)
+        Ok((tamper_watch, locks))
     })
     .await;
-    let tamper_watch = match tamper_watch {
-        Ok(Ok(tamper_watch)) => tamper_watch,
+    let (tamper_watch, locks) = match tamper_watch {
+        Ok(Ok(result)) => result,
         Ok(Err(error)) => {
             tracing::warn!(
                 workspace_root = %workspace_root.display(),
@@ -2279,12 +2305,12 @@ fn acquire_workspace_lease_sync(
         locks.push(lock);
     }
     let tamper_watch = GenerationTamperWatch::arm(
-        locks.iter().map(|lock| lock.path.clone()),
+        &locks,
         binding_identity
             .path_components
             .iter()
             .filter(|identity| !trusted_coordination_root.starts_with(&identity.path))
-            .map(|identity| identity.path.clone()),
+            .cloned(),
         cancel_token,
     );
     let tamper_watch = match tamper_watch {
@@ -6568,6 +6594,86 @@ mod tests {
         .expect("independent workspace generation");
         assert!(first.integrity_valid());
         assert!(second.integrity_valid());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_witness_watch_retains_admitted_inode_across_path_substitution() {
+        let workspace = tempfile::tempdir().unwrap();
+        let lease =
+            acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_secs(2))
+                .unwrap();
+        let witness = &lease.locks[0].path;
+        let aside = witness.with_extension("review-original");
+        let substitute = witness.with_extension("review-substitute");
+        fs::rename(witness, &aside).unwrap();
+        fs::write(witness, "").unwrap();
+        let watch =
+            MacOsGenerationTamperWatch::arm_before_register(&lease.locks, Vec::new(), None, || {
+                fs::rename(witness, &substitute).unwrap();
+                fs::rename(&aside, witness).unwrap();
+            })
+            .unwrap();
+        assert!(watch.is_untampered(), "restoration preceded registration");
+        fs::write(witness, "tamper").unwrap();
+        fs::write(witness, "").unwrap();
+        assert!(!watch.is_untampered(), "must observe A, not substituted B");
+        assert!(!watch.is_untampered());
+        fs::remove_file(substitute).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_binding_descriptor_rejects_substitution_after_path_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("binding");
+        let aside = temp.path().join("original");
+        let substitute = temp.path().join("substitute");
+        fs::create_dir(&path).unwrap();
+        let identity = WorkspacePathIdentity::capture(path.clone()).unwrap();
+        fs::rename(&path, &aside).unwrap();
+        fs::create_dir(&path).unwrap();
+        let result = MacOsGenerationTamperWatch::open_binding_descriptor(&identity, || {
+            fs::rename(&path, &substitute).unwrap();
+            fs::rename(&aside, &path).unwrap();
+        });
+        assert!(identity.is_unchanged());
+        assert!(result.is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_concurrent_validators_keep_event_revocation_sticky() {
+        let workspace = tempfile::tempdir().unwrap();
+        let lease =
+            acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_secs(2))
+                .unwrap();
+        let watch = &lease.tamper_watch.watcher;
+        let witness = &lease.locks[0].path;
+        fs::write(witness, "tamper").unwrap();
+        fs::write(witness, "").unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let barrier = &barrier;
+        let (drained, wait_drained) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let result = watch.is_untampered_before_poll(|| {
+                    barrier.wait();
+                });
+                drained.send(()).unwrap();
+                result
+            });
+            let second = scope.spawn(move || {
+                watch.is_untampered_before_poll(|| {
+                    barrier.wait();
+                    wait_drained.recv().unwrap();
+                })
+            });
+            assert!(!first.join().unwrap());
+            assert!(!second.join().unwrap());
+        });
+        assert!(!lease.integrity_valid());
+        assert!(!lease.integrity_valid());
     }
 
     #[cfg(target_os = "macos")]

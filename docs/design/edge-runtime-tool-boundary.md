@@ -99,7 +99,11 @@ coordination authority inside the tool-writable workspace.
 - macOS uses the root-owned sticky `/private/tmp` root, a deterministic OFD
   record-lock byte on that protected directory inode for each workspace
   generation, a per-UID integrity witness, and kqueue vnode-backed sticky
-  tamper evidence. A contender first reserves its byte with a shared OFD lock,
+  tamper evidence. Witness watches retain the admitted file description;
+  opened binding descriptors must match the captured device, inode, and file
+  type. Event polling rechecks permanent revocation under its mutex so a
+  concurrent reader cannot accept an already-revoked generation.
+  A contender first reserves its byte with a shared OFD lock,
   then probes for any other description through a hypothetical exclusive lock.
   Concurrent contenders can retreat together, but cannot both be admitted;
   process-diverse jitter restores progress without a machine-global admission
