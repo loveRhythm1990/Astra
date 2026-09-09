@@ -99,8 +99,11 @@ coordination authority inside the tool-writable workspace.
 - macOS uses the root-owned sticky `/private/tmp` root, a deterministic OFD
   record-lock byte on that protected directory inode for each workspace
   generation, a per-UID integrity witness, and kqueue vnode-backed sticky
-  tamper evidence. A short lock on the protected parent serializes record-lock
-  admission without serializing independent workspace generations.
+  tamper evidence. A contender first reserves its byte with a shared OFD lock,
+  then probes for any other description through a hypothetical exclusive lock.
+  Concurrent contenders can retreat together, but cannot both be admitted;
+  process-diverse jitter restores progress without a machine-global admission
+  gate.
 - Kernel ownership must end automatically when the holder process exits.
   Replacing or unlinking a witness or workspace binding must not admit a second
   generation, and any observed tamper revokes receipt authority permanently

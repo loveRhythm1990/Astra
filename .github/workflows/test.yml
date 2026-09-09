@@ -205,7 +205,7 @@ jobs:
   macos-workspace-coordination:
     name: "Test: macOS workspace coordination"
     needs: scope
-    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_core == 'true') }}
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_core == 'true' || needs.scope.outputs.test_cli == 'true') }}
     runs-on: macos-15
     timeout-minutes: 30
     steps:
@@ -215,6 +215,10 @@ jobs:
       - uses: ./.github/actions/rust-setup
         with:
           shared-key: ci-test-macos-workspace-coordination
+      - name: Lint macOS workspace coordination
+        run: >-
+          cargo clippy --locked --manifest-path Cargo.toml -p astra-tools
+          --all-targets -- -D warnings
       - name: Test macOS workspace coordination invariants
         run: >-
           cargo test --locked --manifest-path Cargo.toml -p astra-tools
@@ -222,7 +226,7 @@ jobs:
       - name: Test macOS CLI Bash execution
         run: >-
           cargo test --locked --manifest-path Cargo.toml -p astra-cli
-          edge_tools::shell::tests::bash_echo_returns_output -- --exact
+          --lib edge_tools::shell::tests::bash_echo_returns_output -- --exact
 
   # Online tests run beside the offline shards instead of waiting for an
   # unrelated compile-only job. CI keeps each live-DB lane serial; the

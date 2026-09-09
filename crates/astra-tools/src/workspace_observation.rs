@@ -1729,6 +1729,25 @@ fn locked_coordination_file(
 /// tool to unlink/rename, are unique across OS users, and disappear when the
 /// last owning descriptor closes (including process crash). An existing bind
 /// is only a contention fact; no bytes or peer identity are trusted.
+#[cfg(target_os = "macos")]
+fn macos_coordination_offset(namespace_key: &str) -> libc::off_t {
+    let digest = Sha256::digest(namespace_key.as_bytes());
+    let mut offset_bytes = [0_u8; 8];
+    offset_bytes.copy_from_slice(&digest[..8]);
+    (u64::from_be_bytes(offset_bytes) & i64::MAX as u64).max(1) as libc::off_t
+}
+
+#[cfg(target_os = "macos")]
+fn macos_coordination_record_lock(offset: libc::off_t, lock_type: libc::c_short) -> libc::flock {
+    libc::flock {
+        l_start: offset,
+        l_len: 1,
+        l_pid: 0,
+        l_type: lock_type,
+        l_whence: libc::SEEK_SET as libc::c_short,
+    }
+}
+
 fn try_acquire_kernel_coordination_namespace(
     namespace_key: &str,
 ) -> std::io::Result<Option<CrossProcessKernelLock>> {
@@ -1787,11 +1806,13 @@ fn try_acquire_kernel_coordination_namespace(
 
         // Darwin has no abstract Unix-domain socket namespace. Instead, use
         // one byte in the stable root directory's vnode as a deterministic
-        // kernel namespace. A short flock on the root's protected parent
-        // serializes admission; the retained OFD read lock then owns the byte
-        // until this descriptor closes, including process crash. OFD locks are
-        // descriptor-scoped, so unrelated library closes cannot release
-        // another live generation.
+        // kernel namespace. Admission first reserves the byte with a retained
+        // OFD read lock, then probes for a hypothetical write lock. F_OFD_GETLK
+        // ignores the calling open file description, but observes a competing
+        // description's read lock. Therefore concurrent contenders may both
+        // retreat, but cannot both be admitted; the outer acquisition loop uses
+        // process-diverse jitter to restore liveness. OFD locks are descriptor-
+        // scoped and disappear on close or process crash.
         let root = stable_coordination_root().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -1811,59 +1832,24 @@ fn try_acquire_kernel_coordination_namespace(
             ));
         }
 
-        let gate_path = root.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "trusted macOS workspace coordination admission gate is unavailable",
-            )
-        })?;
-        let gate = options.open(gate_path)?;
-        let gate_metadata = gate.metadata()?;
-        if !gate_metadata.is_dir()
-            || gate_metadata.uid() != 0
-            || gate_metadata.mode() & 0o022 != 0
-            || gate_metadata.nlink() == 0
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "trusted macOS workspace coordination admission gate changed",
-            ));
-        }
-
-        match fs2::FileExt::try_lock_exclusive(&gate) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
-            Err(error) => return Err(error),
-        }
-
-        let digest = Sha256::digest(namespace_key.as_bytes());
-        let mut offset_bytes = [0_u8; 8];
-        offset_bytes.copy_from_slice(&digest[..8]);
-        let offset = (u64::from_be_bytes(offset_bytes) & i64::MAX as u64).max(1) as libc::off_t;
-        let record_lock = |lock_type| libc::flock {
-            l_start: offset,
-            l_len: 1,
-            l_pid: 0,
-            l_type: lock_type,
-            l_whence: libc::SEEK_SET as libc::c_short,
-        };
-        let mut probe = record_lock(libc::F_WRLCK as libc::c_short);
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_GETLK, &raw mut probe) } < 0 {
+        let offset = macos_coordination_offset(namespace_key);
+        let mut reservation =
+            macos_coordination_record_lock(offset, libc::F_RDLCK as libc::c_short);
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &raw mut reservation) } < 0 {
             let error = std::io::Error::last_os_error();
-            let _ = fs2::FileExt::unlock(&gate);
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
             return Err(error);
+        }
+
+        let mut probe = macos_coordination_record_lock(offset, libc::F_WRLCK as libc::c_short);
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_GETLK, &raw mut probe) } < 0 {
+            return Err(std::io::Error::last_os_error());
         }
         if probe.l_type != libc::F_UNLCK as libc::c_short {
-            let _ = fs2::FileExt::unlock(&gate);
             return Ok(None);
         }
-        let mut lock = record_lock(libc::F_RDLCK as libc::c_short);
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &raw mut lock) } < 0 {
-            let error = std::io::Error::last_os_error();
-            let _ = fs2::FileExt::unlock(&gate);
-            return Err(error);
-        }
-        fs2::FileExt::unlock(&gate)?;
         Ok(Some(CrossProcessKernelLock {
             _coordination_root: file,
         }))
@@ -1875,6 +1861,26 @@ fn try_acquire_kernel_coordination_namespace(
             std::io::ErrorKind::Unsupported,
             "kernel workspace coordination namespace is unavailable",
         ))
+    }
+}
+
+fn kernel_coordination_retry_delay() -> Duration {
+    #[cfg(target_os = "macos")]
+    {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // This only breaks lock-step contender retries; no authority or
+        // cryptographic decision depends on the mixed value being unpredictable.
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut mixed =
+            sequence ^ u64::from(std::process::id()).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        mixed ^= mixed >> 31;
+        Duration::from_micros(1_000 + mixed % 9_000)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Duration::from_millis(5)
     }
 }
 
@@ -1911,7 +1917,7 @@ async fn acquire_cross_process_lock_async(
             Err(_) => return None,
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let delay = tokio::time::sleep(remaining.min(Duration::from_millis(5)));
+        let delay = tokio::time::sleep(remaining.min(kernel_coordination_retry_delay()));
         tokio::pin!(delay);
         if let Some(cancel_token) = cancel_token {
             tokio::select! {
@@ -1978,7 +1984,7 @@ fn acquire_cross_process_lock_sync(
             Ok(None) => {}
             Err(_) => return None,
         }
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(kernel_coordination_retry_delay());
     };
     let file = open_coordination_lock(&specification.witness_path)?;
     loop {
@@ -4610,6 +4616,83 @@ mod tests {
                 fs::write(marker, "kernel namespace held").expect("child marker");
                 std::thread::sleep(Duration::from_secs(30));
             }
+            #[cfg(target_os = "macos")]
+            "macos-parent-flock-holder" => {
+                use std::os::unix::fs::OpenOptionsExt;
+
+                let gate = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY)
+                    .open("/private")
+                    .expect("open parent directory flock target");
+                fs2::FileExt::try_lock_exclusive(&gate)
+                    .expect("hold external parent directory flock");
+                fs::write(marker, "parent flock held").expect("child marker");
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            #[cfg(target_os = "macos")]
+            "macos-raw-record-lock-holder" => {
+                use std::os::fd::AsRawFd;
+                use std::os::unix::fs::OpenOptionsExt;
+
+                let (specifications, _) = workspace_coordination_lock_specs(
+                    Path::new(&root),
+                    CoordinationLockKind::Observation,
+                )
+                .expect("coordination specifications");
+                let coordination_root =
+                    stable_coordination_root().expect("trusted coordination root");
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY)
+                    .open(coordination_root)
+                    .expect("open coordination root");
+                for specification in specifications {
+                    let mut lock = macos_coordination_record_lock(
+                        macos_coordination_offset(&specification.kernel_namespace_key),
+                        libc::F_RDLCK as libc::c_short,
+                    );
+                    assert_eq!(
+                        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &raw mut lock,) },
+                        0,
+                        "raw external record lock"
+                    );
+                }
+                fs::write(marker, "raw record locks held").expect("child marker");
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            #[cfg(target_os = "macos")]
+            "macos-simultaneous-contender" => {
+                let marker = PathBuf::from(marker);
+                let control = marker.parent().expect("contender control directory");
+                let start = control.join("start");
+                let active = control.join("active");
+                let overlap = control.join("overlap");
+                fs::write(&marker, "ready").expect("contender ready marker");
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !start.exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(start.exists(), "contender start signal timed out");
+
+                let lease = acquire_workspace_observation_lease_sync(
+                    Path::new(&root),
+                    Duration::from_secs(5),
+                )
+                .expect("simultaneous contender eventually acquires lease");
+                let owns_sentinel = fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&active)
+                    .is_ok();
+                if !owns_sentinel {
+                    fs::write(&overlap, "overlap observed").expect("overlap marker");
+                }
+                assert!(owns_sentinel, "two workspace generations overlapped");
+                std::thread::sleep(Duration::from_millis(100));
+                fs::remove_file(active).expect("release active-generation sentinel");
+                drop(lease);
+            }
             other => panic!("unknown helper mode: {other}"),
         }
     }
@@ -6485,6 +6568,134 @@ mod tests {
         .expect("independent workspace generation");
         assert!(first.integrity_valid());
         assert!(second.integrity_valid());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_parent_directory_flock_does_not_block_workspace_admission() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let marker = workspace.path().join("parent-flock-ready");
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("workspace_observation::tests::cross_process_workspace_observation_lease_helper")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CROSS_PROCESS_LEASE_HELPER_ENV, workspace.path())
+            .env(CROSS_PROCESS_LEASE_MARKER_ENV, &marker)
+            .env(CROSS_PROCESS_LEASE_MODE_ENV, "macos-parent-flock-holder")
+            .spawn()
+            .expect("spawn external parent-flock holder");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "parent-flock holder did not become ready");
+
+        let lease =
+            acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_secs(1));
+        child.kill().expect("stop parent-flock holder");
+        let _ = child.wait().expect("reap parent-flock holder");
+        assert!(
+            lease.is_some(),
+            "an unrelated flock on /private must not block every workspace namespace"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_raw_record_lock_is_workspace_scoped_and_released_on_crash() {
+        let workspace = tempfile::tempdir().expect("contended workspace");
+        let independent = tempfile::tempdir().expect("independent workspace");
+        let marker = workspace.path().join("raw-record-lock-ready");
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("workspace_observation::tests::cross_process_workspace_observation_lease_helper")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CROSS_PROCESS_LEASE_HELPER_ENV, workspace.path())
+            .env(CROSS_PROCESS_LEASE_MARKER_ENV, &marker)
+            .env(CROSS_PROCESS_LEASE_MODE_ENV, "macos-raw-record-lock-holder")
+            .spawn()
+            .expect("spawn raw record-lock holder");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            marker.exists(),
+            "raw record-lock holder did not become ready"
+        );
+
+        assert!(
+            acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_millis(50),)
+                .is_none(),
+            "an externally held namespace byte must reject a second generation"
+        );
+        let independent_lease =
+            acquire_workspace_observation_lease_sync(independent.path(), Duration::from_secs(1));
+        child.kill().expect("crash raw record-lock holder");
+        let _ = child.wait().expect("reap raw record-lock holder");
+        assert!(
+            independent_lease.is_some(),
+            "a record lock must contend only its derived workspace byte"
+        );
+        assert!(
+            acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_secs(1),)
+                .is_some(),
+            "the raw record lock must disappear when its holder crashes"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_simultaneous_contenders_never_overlap_and_make_progress() {
+        let temp = tempfile::tempdir().expect("test root");
+        let workspace = temp.path().join("workspace");
+        let control = temp.path().join("control");
+        fs::create_dir(&workspace).expect("workspace");
+        fs::create_dir(&control).expect("control directory");
+        let first_marker = control.join("first-ready");
+        let second_marker = control.join("second-ready");
+        let spawn_contender = |marker: &Path| {
+            Command::new(std::env::current_exe().expect("current test executable"))
+                .arg(
+                    "workspace_observation::tests::cross_process_workspace_observation_lease_helper",
+                )
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(CROSS_PROCESS_LEASE_HELPER_ENV, &workspace)
+                .env(CROSS_PROCESS_LEASE_MARKER_ENV, marker)
+                .env(
+                    CROSS_PROCESS_LEASE_MODE_ENV,
+                    "macos-simultaneous-contender",
+                )
+                .spawn()
+                .expect("spawn simultaneous contender")
+        };
+        let mut first = spawn_contender(&first_marker);
+        let mut second = spawn_contender(&second_marker);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (!first_marker.exists() || !second_marker.exists()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            first_marker.exists() && second_marker.exists(),
+            "both contenders must reach the start barrier"
+        );
+        fs::write(control.join("start"), "go").expect("release contenders");
+
+        let first_status = first.wait().expect("wait for first contender");
+        let second_status = second.wait().expect("wait for second contender");
+        assert!(
+            first_status.success(),
+            "first contender failed: {first_status}"
+        );
+        assert!(
+            second_status.success(),
+            "second contender failed: {second_status}"
+        );
+        assert!(
+            !control.join("overlap").exists(),
+            "two workspace generations obtained authority simultaneously"
+        );
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
