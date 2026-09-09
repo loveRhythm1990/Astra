@@ -4933,16 +4933,23 @@ pub(crate) async fn run_tui_session(
     tracer.phase("cached_auth");
     let mut state = initialize_session_state(profile, initial_model, cli_context);
     tracer.phase("state_init");
-    let startup = complete_session_startup(
-        &mut state,
-        &mut tracer,
-        api,
-        profile,
-        resume_session_id,
-        no_instructions,
-        cli_context,
-    )
-    .await?;
+    let startup = tokio::select! {
+        biased;
+        _ = startup_terminal.interrupted() => {
+            // Restore immediately, before session cleanup or error output.
+            drop(startup_terminal);
+            return Err("Session startup interrupted (Ctrl-C)".to_string());
+        }
+        result = complete_session_startup(
+            &mut state,
+            &mut tracer,
+            api,
+            profile,
+            resume_session_id,
+            no_instructions,
+            cli_context,
+        ) => result?,
+    };
     let SessionStartupArtifacts {
         pipeline_modules,
         mut edge_heartbeat_task,
@@ -4988,7 +4995,10 @@ pub(crate) async fn run_tui_session(
     let session_shutdown_token = tokio_util::sync::CancellationToken::new();
     let shutdown_monitor_token = session_shutdown_token.clone();
     let mut shutdown_monitor = tokio::spawn(async move {
-        let signal = await_shutdown_signal(shutdown_signal_rx).await;
+        let signal = tokio::select! {
+            signal = await_shutdown_signal(shutdown_signal_rx) => signal,
+            _ = startup_terminal.interrupted() => crate::cli::session::session_guard::ShutdownSignal::Sigint,
+        };
         shutdown_monitor_token.cancel();
         signal
     });

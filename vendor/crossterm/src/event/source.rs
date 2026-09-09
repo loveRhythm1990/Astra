@@ -21,6 +21,10 @@ pub(crate) trait EventSource: Sync + Send {
     /// Returns `Ok(None)` if there's no event available and timeout expires.
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>>;
 
+    /// Limit ambiguous Esc lookahead to an active startup query.
+    #[cfg(unix)]
+    fn set_startup_query(&mut self, _active: bool) {}
+
     /// Returns a `Waker` allowing to wake/force the `try_read` method to return `Ok(None)`.
     #[cfg(feature = "event-stream")]
     fn waker(&self) -> Waker;

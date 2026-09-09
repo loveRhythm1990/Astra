@@ -100,6 +100,10 @@ fn read_complete(fd: &FileDesc, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 impl EventSource for UnixInternalEventSource {
+    fn set_startup_query(&mut self, active: bool) {
+        self.parser.set_startup_query(active);
+    }
+
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
         let timeout = PollTimeout::new(timeout);
 
@@ -147,7 +151,13 @@ impl EventSource for UnixInternalEventSource {
             };
             if fds[0].revents & POLLIN != 0 {
                 loop {
-                    let read_count = read_complete(&self.tty, &mut self.tty_buffer)?;
+                    let read_count = match super::read_ready(&self.tty, &mut self.tty_buffer) {
+                        Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                        Ok(count) => count,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) => return Err(error),
+                    };
                     if read_count > 0 {
                         self.parser.advance(
                             &self.tty_buffer[..read_count],

@@ -151,7 +151,9 @@ static INTERNAL_EVENT_READER: Mutex<Option<InternalEventReader>> = parking_lot::
 #[cfg(unix)]
 mod startup_query;
 #[cfg(unix)]
-pub use startup_query::{query_startup_attributes, StartupAttributes};
+pub use startup_query::{
+    cached_primary_device_attributes, query_startup_attributes, StartupAttributes,
+};
 
 pub(crate) fn lock_internal_event_reader() -> MappedMutexGuard<'static, InternalEventReader> {
     MutexGuard::map(INTERNAL_EVENT_READER.lock(), |reader| {

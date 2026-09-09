@@ -33,6 +33,13 @@ impl Default for InternalEventReader {
 }
 
 impl InternalEventReader {
+    #[cfg(unix)]
+    pub(crate) fn set_startup_query(&mut self, active: bool) {
+        if let Some(source) = self.source.as_mut() {
+            source.set_startup_query(active);
+        }
+    }
+
     /// Returns a `Waker` allowing to wake/force the `poll` method to return `Ok(false)`.
     #[cfg(feature = "event-stream")]
     pub(crate) fn waker(&self) -> Waker {
@@ -65,6 +72,10 @@ impl InternalEventReader {
             let maybe_event = match event_source.try_read(poll_timeout.leftover()) {
                 Ok(None) => None,
                 Ok(Some(event)) => {
+                    #[cfg(unix)]
+                    if let InternalEvent::PrimaryDeviceAttributes(params) = &event {
+                        super::startup_query::record_device_attributes(params);
+                    }
                     if filter.eval(&event) {
                         Some(event)
                     } else {

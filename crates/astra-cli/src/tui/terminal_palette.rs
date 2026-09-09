@@ -77,7 +77,15 @@ pub(crate) fn default_bg() -> Option<(u8, u8, u8)> {
 /// Called by interactive startup before the banner or theme is rendered.
 /// Getters never perform terminal I/O, and late replies cannot change the theme.
 pub(crate) fn initialize_default_colors(queried: TerminalColors) {
-    DEFAULT_COLORS.get_or_init(|| resolve_env_colors(queried));
+    let colors_set = DEFAULT_COLORS.set(resolve_env_colors(queried)).is_ok();
+    let initialized = colors_set && !super::theme::is_initialized();
+    if !initialized {
+        tracing::warn!("terminal colors were initialized before the startup query completed");
+    }
+    debug_assert!(
+        initialized,
+        "terminal colors must be initialized before theme access"
+    );
 }
 
 pub(crate) fn has_background_override() -> bool {

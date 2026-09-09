@@ -541,6 +541,11 @@ pub(crate) fn color_to_rgb(c: Color) -> (u8, u8, u8) {
 }
 
 static THEME: OnceLock<Theme> = OnceLock::new();
+static STDERR_THEME: OnceLock<Theme> = OnceLock::new();
+
+pub(crate) fn is_initialized() -> bool {
+    THEME.get().is_some() || STDERR_THEME.get().is_some()
+}
 
 /// Process-wide theme, chosen once at first access. Tests that need a
 /// specific theme should call [`set_for_tests`] *before* any `current()`.
@@ -551,7 +556,6 @@ pub(crate) fn current() -> &'static Theme {
 /// Line-oriented CLI output uses stderr, which may have different capabilities
 /// from redirected stdout. Both streams share the same profiles and color hints.
 pub(crate) fn current_stderr() -> &'static Theme {
-    static STDERR_THEME: OnceLock<Theme> = OnceLock::new();
     STDERR_THEME.get_or_init(|| theme_for_stream(supports_color::Stream::Stderr))
 }
 

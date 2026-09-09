@@ -14,6 +14,25 @@ const CHILD: &str = "tui::terminal_startup::pty_tests::probe_child";
 const RESULT: &str = "ASTRA_PROBE_RESULT=";
 const INPUT: &str = "a你\x1b[200~pasted\n你好\x1b]11;rgb:ff/ff/ff\x07\x1b[201~";
 
+fn terminal_modes_restored(
+    before: &nix::sys::termios::Termios,
+    after: &nix::sys::termios::Termios,
+) -> bool {
+    let before = libc::termios::from(before.clone());
+    let after = libc::termios::from(after.clone());
+    #[cfg(target_os = "macos")]
+    let (before, after) = {
+        // Darwin sets PENDIN when canonical input is restored, even for a
+        // plain tcsetattr raw/restore pair. It is kernel pending-input state,
+        // not a mode we configured. Compare all other flags, cc and speeds.
+        let (mut before, mut after) = (before, after);
+        before.c_lflag &= !libc::PENDIN;
+        after.c_lflag &= !libc::PENDIN;
+        (before, after)
+    };
+    before == after
+}
+
 /// Run the real startup guard, theme getter, terminal guard and EventStream
 /// without initializing a session, accessing credentials or contacting a model.
 #[test]
@@ -26,8 +45,29 @@ fn probe_child() {
         println!("NO_QUERY");
         return;
     }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _entered = runtime.enter();
     let before = nix::sys::termios::tcgetattr(std::io::stdin()).unwrap();
     let started = Instant::now();
+    if case == "early_palette" || case == "early_theme" {
+        if case == "early_palette" {
+            let _ = crate::tui::terminal_palette::default_bg();
+        } else {
+            let _ = crate::tui::theme::current();
+        }
+        let result = std::panic::catch_unwind(StartupTerminal::begin);
+        assert!(
+            result.is_err(),
+            "early initialization must not silently discard query results"
+        );
+        let after = nix::sys::termios::tcgetattr(std::io::stdin()).unwrap();
+        println!("STARTUP_READY");
+        println!(
+            "{RESULT}{}",
+            serde_json::json!({"restored": terminal_modes_restored(&before, &after)})
+        );
+        return;
+    }
     let mut startup = StartupTerminal::begin().unwrap();
     let elapsed_ms = started.elapsed().as_millis();
     let startup_mode = nix::sys::termios::tcgetattr(std::io::stdin()).unwrap();
@@ -40,12 +80,19 @@ fn probe_child() {
     let fg = crate::tui::terminal_palette::default_fg();
     let theme = *crate::tui::theme::current();
     println!("STARTUP_READY");
-    if case == "abort" {
+    if matches!(case.as_str(), "sigint" | "sigint_query") {
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(500), startup.interrupted())
+                .await
+                .expect("startup SIGINT was not delivered");
+        });
+    }
+    if matches!(case.as_str(), "abort" | "sigint" | "sigint_query") {
         drop(startup);
         let after = nix::sys::termios::tcgetattr(std::io::stdin()).unwrap();
         println!(
             "{RESULT}{}",
-            serde_json::json!({ "restored": before == after })
+            serde_json::json!({ "restored": terminal_modes_restored(&before, &after) })
         );
         return;
     }
@@ -53,22 +100,68 @@ fn probe_child() {
         // Replies arrive during ordinary startup output, before TUI ownership.
         std::thread::sleep(Duration::from_millis(100));
     }
+    let sixel_before = astra_tools::display_sixel::cached_sixel_support();
     startup.prepare_tui().unwrap();
     let guard = crate::tui::terminal::TerminalGuard::init().unwrap();
     startup.handoff();
-    let runtime = tokio::runtime::Runtime::new().unwrap();
+    if case == "late_da1" {
+        assert!(sixel_before.is_none());
+        let image = tempfile::NamedTempFile::new().unwrap();
+        let result = astra_tools::display_sixel::display_sixel(image.path().to_str().unwrap());
+        assert!(result.output.contains("has not been confirmed"));
+        assert!(astra_tools::display_sixel::cached_sixel_support().is_none());
+    }
+    println!("INPUT_READY");
+    if case == "sigint_handoff" {
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(500), startup.interrupted())
+                .await
+                .expect("SIGINT listener was lost at handoff");
+        });
+        drop(guard);
+        let after = nix::sys::termios::tcgetattr(std::io::stdin()).unwrap();
+        println!(
+            "{RESULT}{}",
+            serde_json::json!({"restored": terminal_modes_restored(&before, &after)})
+        );
+        return;
+    }
+    if case == "poll_escape" {
+        assert!(crossterm::event::poll(Duration::from_millis(200)).unwrap());
+        assert_eq!(
+            crossterm::event::read().unwrap(),
+            crossterm::event::Event::Key(crossterm::event::KeyCode::Esc.into())
+        );
+        drop(guard);
+        let after = nix::sys::termios::tcgetattr(std::io::stdin()).unwrap();
+        println!(
+            "{RESULT}{}",
+            serde_json::json!({"restored": terminal_modes_restored(&before, &after)})
+        );
+        return;
+    }
     let events = runtime.block_on(async {
         use tokio_stream::StreamExt;
         let (_tx, rx) = tokio::sync::broadcast::channel(16);
         let mut stream = crate::tui::event::TuiEventStream::new(rx);
         let mut events = Vec::new();
-        while events.len() < 3 {
-            let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        while events.len() < expected_events(&case).len() {
+            let budget = if matches!(
+                case.as_str(),
+                "escape" | "escape_then_f" | "arrow" | "alt" | "query_escape"
+            ) {
+                Duration::from_millis(200)
+            } else {
+                Duration::from_secs(2)
+            };
+            let event = tokio::time::timeout(budget, stream.next())
                 .await
                 .expect("input was not preserved")
                 .expect("input stream ended");
             match event {
-                crate::tui::event::TuiEvent::Key(key) => events.push(format!("key:{:?}", key.code)),
+                crate::tui::event::TuiEvent::Key(key) => {
+                    events.push(format!("key:{:?}:{:?}", key.code, key.modifiers))
+                }
                 crate::tui::event::TuiEvent::Paste(text) => events.push(format!("paste:{text}")),
                 _ => {}
             }
@@ -88,14 +181,53 @@ fn probe_child() {
         "{RESULT}{}",
         serde_json::json!({
             "elapsed_ms": elapsed_ms,
+            "sixel_before": sixel_before,
+            "sixel_after": astra_tools::display_sixel::cached_sixel_support(),
             "bg": bg,
             "fg": fg,
             "light": theme.is_light,
             "plain": theme.accent == ratatui::style::Color::Reset,
             "events": events,
-            "restored": before == after,
+            "restored": terminal_modes_restored(&before, &after),
         })
     );
+}
+
+fn expected_events(case: &str) -> Vec<String> {
+    match case {
+        "escape" | "query_escape" | "truncated_escape" => {
+            vec!["key:Esc:KeyModifiers(0x0)".to_string()]
+        }
+        "escape_then_f" => vec![
+            "key:Esc:KeyModifiers(0x0)".to_string(),
+            "key:Char('f'):KeyModifiers(0x0)".to_string(),
+        ],
+        "arrow" => vec!["key:Up:KeyModifiers(0x0)".to_string()],
+        "alt" => vec!["key:Char('f'):KeyModifiers(ALT)".to_string()],
+        _ => vec![
+            "key:Char('a'):KeyModifiers(0x0)".to_string(),
+            "key:Char('你'):KeyModifiers(0x0)".to_string(),
+            "paste:pasted\n你好\x1b]11;rgb:ff/ff/ff\x07".to_string(),
+        ],
+    }
+}
+
+fn special_input(case: &str) -> bool {
+    matches!(
+        case,
+        "escape"
+            | "poll_escape"
+            | "escape_then_f"
+            | "arrow"
+            | "alt"
+            | "query_escape"
+            | "oversized"
+            | "truncated_escape"
+            | "late_da1"
+            | "sigint"
+            | "sigint_query"
+            | "sigint_handoff"
+    )
 }
 
 fn run_case(case: &str) -> (Value, Vec<u8>) {
@@ -132,7 +264,7 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
         "dark" | "malformed" => {
             command.env("COLORFGBG", "0;15");
         }
-        "explicit" => {
+        "explicit" | "early_theme" => {
             command.env("ASTRA_TUI_THEME", "dark");
         }
         "no_color" => {
@@ -183,12 +315,20 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
         }
         if !replied && output.windows(3).any(|bytes| bytes == b"\x1b[c") {
             replied = true;
-            if !matches!(case, "late" | "unsupported") {
+            if !matches!(case, "late" | "unsupported") && !special_input(case) {
                 master.write_all(INPUT.as_bytes()).unwrap();
                 sent_input = true;
             }
+            if case == "query_escape" {
+                master.write_all(b"\x1b").unwrap();
+                sent_input = true;
+            }
+            if case == "sigint_query" {
+                master.write_all(b"\x03").unwrap();
+                sent_input = true;
+            }
             let response = match case {
-                "light" | "fragmented" => {
+                "light" | "fragmented" | "delayed_da1" => {
                     "\x1b]10;rgb:0000/0000/0000\x1b\\\x1b]11;rgb:ffff/ffff/ffff\x07"
                 }
                 "dark" => "\x1b]11;rgb:0000/0000/0000\x1b\\\x1b]10;rgb:eeee/eeee/eeee\x07",
@@ -204,11 +344,25 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
             } else {
                 master.write_all(response.as_bytes()).unwrap();
             }
-            if case != "unsupported" {
-                master.write_all(b"\x1b[?62;4;6c").unwrap();
+            if !matches!(
+                case,
+                "unsupported" | "query_escape" | "sigint_query" | "late_da1"
+            ) {
+                if case == "delayed_da1" {
+                    std::thread::sleep(Duration::from_millis(220));
+                }
+                let da1 = if case == "no_sixel" {
+                    b"\x1b[?1;2c".as_slice()
+                } else {
+                    b"\x1b[?62;4;6c"
+                };
+                master.write_all(da1).unwrap();
             }
         }
-        if !sent_input && output.windows(13).any(|bytes| bytes == b"STARTUP_READY") {
+        if !sent_input
+            && !special_input(case)
+            && output.windows(13).any(|bytes| bytes == b"STARTUP_READY")
+        {
             if case == "late" {
                 master
                     .write_all(b"\x1b]10;rgb:00/00/00\x07\x1b]11;rgb:ff/ff/ff\x1b\\")
@@ -216,6 +370,40 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
             }
             master.write_all(INPUT.as_bytes()).unwrap();
             sent_input = true;
+        }
+        if case == "sigint" && !sent_input && output.windows(13).any(|b| b == b"STARTUP_READY") {
+            master.write_all(b"\x03").unwrap();
+            sent_input = true;
+        }
+        if special_input(case) && !sent_input && output.windows(11).any(|b| b == b"INPUT_READY") {
+            sent_input = true;
+            match case {
+                "escape" | "poll_escape" => master.write_all(b"\x1b").unwrap(),
+                "escape_then_f" => {
+                    master.write_all(b"\x1b").unwrap();
+                    std::thread::sleep(Duration::from_millis(20));
+                    master.write_all(b"f").unwrap();
+                }
+                "arrow" => master.write_all(b"\x1b[A").unwrap(),
+                "alt" => master.write_all(b"\x1bf").unwrap(),
+                // SAFETY: this is the live test child we just spawned.
+                "sigint_handoff" => unsafe {
+                    libc::kill(child.id() as i32, libc::SIGINT);
+                },
+                "truncated_escape" => master.write_all(b"\x1b]11;\x1b").unwrap(),
+                "oversized" => {
+                    master.write_all(b"\x1b]11;").unwrap();
+                    master.write_all(&[b'x'; 300]).unwrap();
+                    std::thread::sleep(Duration::from_millis(550));
+                    master.write_all(b"xyz\x07").unwrap();
+                    master.write_all(INPUT.as_bytes()).unwrap();
+                }
+                "late_da1" => {
+                    master.write_all(b"\x1b[?62;4;6c").unwrap();
+                    master.write_all(INPUT.as_bytes()).unwrap();
+                }
+                _ => unreachable!(),
+            }
         }
         if !cursor_replied && output.windows(4).any(|bytes| bytes == b"\x1b[6n") {
             master.write_all(b"\x1b[8;1R").unwrap();
@@ -239,16 +427,21 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
         .unwrap_or_else(|| panic!("no result for {case}: {text}"));
     let value: Value = serde_json::from_str(result).unwrap();
     assert_eq!(value["restored"], true, "{case}");
-    if case == "abort" {
+    if matches!(
+        case,
+        "abort"
+            | "sigint"
+            | "sigint_query"
+            | "sigint_handoff"
+            | "poll_escape"
+            | "early_palette"
+            | "early_theme"
+    ) {
         return (value, output);
     }
     assert_eq!(
         value["events"],
-        serde_json::json!([
-            "key:Char('a')",
-            "key:Char('你')",
-            "paste:pasted\n你好\x1b]11;rgb:ff/ff/ff\x07"
-        ]),
+        serde_json::json!(expected_events(case)),
         "{case}"
     );
     (value, output)
@@ -318,4 +511,64 @@ fn redirected_io_does_not_emit_terminal_queries() {
 #[test]
 fn pty_aborted_startup_restores_terminal_modes() {
     run_case("abort");
+}
+
+#[test]
+fn pty_escape_poll_stream_and_key_sequences() {
+    for case in [
+        "poll_escape",
+        "escape",
+        "escape_then_f",
+        "arrow",
+        "alt",
+        "query_escape",
+    ] {
+        run_case(case);
+    }
+}
+
+#[test]
+fn pty_response_recovery_preserves_input() {
+    for case in ["oversized", "truncated_escape"] {
+        run_case(case);
+    }
+}
+
+#[test]
+fn pty_sigint_restores_terminal_and_survives_handoff() {
+    for case in ["sigint", "sigint_query", "sigint_handoff"] {
+        run_case(case);
+    }
+}
+
+#[test]
+fn pty_late_da1_is_unknown_until_reply() {
+    let (value, output) = run_case("late_da1");
+    assert_eq!(
+        output
+            .windows(3)
+            .filter(|bytes| *bytes == b"\x1b[c")
+            .count(),
+        1,
+        "unknown Sixel support must not start a competing query"
+    );
+    assert!(value["sixel_before"].is_null());
+    assert_eq!(value["sixel_after"], true);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn pty_early_palette_or_theme_access_is_detected_and_restores_terminal() {
+    for case in ["early_palette", "early_theme"] {
+        run_case(case);
+    }
+}
+
+#[test]
+fn pty_sixel_preserves_slow_response_budget_and_negative_evidence() {
+    let (value, _) = run_case("delayed_da1");
+    assert_eq!(value["sixel_before"], true);
+    assert!(value["elapsed_ms"].as_u64().unwrap() >= 200);
+    let (value, _) = run_case("no_sixel");
+    assert_eq!(value["sixel_before"], false);
 }

@@ -16,23 +16,45 @@ pub(super) struct Parser {
     internal_events: VecDeque<InternalEvent>,
     deadline: Option<Instant>,
     oversized: bool,
+    startup_query: bool,
     last_escape: bool,
 }
 
 impl Parser {
+    pub(super) fn set_startup_query(&mut self, active: bool) {
+        self.startup_query = active;
+        if !active && self.buffer == b"\x1b" {
+            self.escape_key();
+        } else if !active && self.buffer.starts_with(b"\x1b]") && self.buffer.len() < 5 {
+            self.replay_alt_bracket();
+        }
+    }
+
+    fn escape_key(&mut self) {
+        self.clear();
+        self.internal_events
+            .push_back(InternalEvent::Event(Event::Key(KeyCode::Esc.into())));
+    }
+
     pub(super) fn advance(&mut self, input: &[u8], more: bool) {
         self.expire(Instant::now());
         for (index, &byte) in input.iter().enumerate() {
             if self.oversized {
                 if byte == 7 || (self.last_escape && byte == b'\\') {
                     self.clear();
-                } else {
-                    self.last_escape = byte == 27;
+                } else if self.last_escape {
+                    // A new escape sequence cancels quarantine. A bare Esc
+                    // also recovers after bounded ST lookahead (see expire).
+                    self.clear();
+                    self.advance(&[27, byte], index + 1 < input.len() || more);
+                } else if byte == 27 {
+                    self.last_escape = true;
+                    self.deadline = Some(Instant::now() + ESCAPE_TIMEOUT);
                 }
                 continue;
             }
             self.buffer.push(byte);
-            if self.buffer == b"\x1b" {
+            if self.buffer == b"\x1b" && self.startup_query {
                 // A response can be split immediately after ESC. Give the
                 // following byte a short window before emitting an Esc key.
                 self.deadline = Some(Instant::now() + ESCAPE_TIMEOUT);
@@ -43,6 +65,7 @@ impl Parser {
                     if b"\x1b]10;".starts_with(&self.buffer)
                         || b"\x1b]11;".starts_with(&self.buffer)
                     {
+                        self.deadline.get_or_insert(Instant::now() + ESCAPE_TIMEOUT);
                         continue;
                     }
                     self.replay_alt_bracket();
@@ -56,18 +79,27 @@ impl Parser {
                     self.deadline = Some(Instant::now() + RESPONSE_TIMEOUT);
                 }
                 let length = self.buffer.len();
-                if length > 6 && self.buffer[length - 2] == 27 && byte != b'\\' {
+                if length >= 6 && self.buffer[length - 2] == 27 && byte != b'\\' {
                     // A new escape sequence cancels a truncated OSC response;
                     // preserve the following key or bracketed paste sequence.
                     self.clear();
-                    self.advance(&[27, byte], true);
+                    self.advance(&[27, byte], index + 1 < input.len() || more);
                     continue;
                 }
+                if byte == 27 {
+                    self.deadline = Some(Instant::now() + ESCAPE_TIMEOUT);
+                }
                 if length > MAX_OSC_BYTES {
+                    let terminated = byte == 7 || (self.buffer[length - 2] == 27 && byte == b'\\');
                     self.buffer.clear();
                     self.oversized = true;
+                    // Do not let the old response timeout release the tail as
+                    // keys. BEL, ST or a new Esc sequence ends quarantine.
+                    self.deadline = None;
                     self.last_escape = byte == 27;
-                    if byte == 7 {
+                    if byte == 27 {
+                        self.deadline = Some(Instant::now() + ESCAPE_TIMEOUT);
+                    } else if terminated {
                         self.clear();
                     }
                     continue;
@@ -109,15 +141,18 @@ impl Parser {
         if !self.deadline.is_some_and(|deadline| now >= deadline) {
             return;
         }
-        if self.buffer == b"\x1b" {
-            self.internal_events
-                .push_back(InternalEvent::Event(Event::Key(KeyCode::Esc.into())));
-            self.clear();
+        if self.buffer == b"\x1b"
+            || (self.oversized && self.last_escape)
+            || (self.buffer.starts_with(b"\x1b]") && self.buffer.ends_with(b"\x1b"))
+        {
+            self.escape_key();
         } else if self.buffer.starts_with(b"\x1b]") && self.buffer.len() < 5 {
             self.replay_alt_bracket();
         } else {
-            // A recognized but unterminated response is not keyboard input.
+            // Quarantine an unterminated response's tail, even after timeout.
+            // Memory stays bounded; BEL/ST or Esc recovers missing terminators.
             self.clear();
+            self.oversized = true;
         }
     }
 
@@ -160,6 +195,7 @@ mod tests {
         ] {
             for split in 1..response.len() {
                 let mut parser = Parser::default();
+                parser.set_startup_query(true);
                 parser.advance(b"a", false);
                 parser.advance(&response[..split], false);
                 parser.advance(&response[split..], false);
@@ -228,11 +264,77 @@ mod tests {
     }
 
     #[test]
-    fn unfinished_response_expires_without_swallowing_later_input() {
+    fn unfinished_response_quarantines_tail_until_escape_recovery() {
         let mut parser = Parser::default();
         parser.advance(b"\x1b]11;rgb:ff/ff", false);
         parser.expire(Instant::now() + RESPONSE_TIMEOUT);
+        parser.advance(b"tail", false);
+        assert!(parser.next().is_none());
+        parser.advance(b"\x1b", false);
+        parser.expire(Instant::now() + ESCAPE_TIMEOUT);
+        assert_eq!(
+            parser.next(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))
+        );
         parser.advance(b"z", false);
         assert_eq!(parser.next(), Some(key('z')));
+    }
+    #[test]
+    fn normal_escape_is_immediate_and_separate_from_next_character() {
+        let mut parser = Parser::default();
+        parser.advance(b"\x1b", false);
+        assert_eq!(
+            parser.next(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))
+        );
+        parser.advance(b"f", false);
+        assert_eq!(parser.next(), Some(key('f')));
+        parser.advance(b"\x1bf", false);
+        assert_eq!(
+            parser.next(),
+            Some(InternalEvent::Event(Event::Key(KeyEvent::new(
+                KeyCode::Char('f'),
+                KeyModifiers::ALT,
+            ))))
+        );
+    }
+
+    #[test]
+    fn ending_query_releases_pending_escape() {
+        let mut parser = Parser::default();
+        parser.set_startup_query(true);
+        parser.advance(b"\x1b", false);
+        assert!(parser.next().is_none());
+        parser.set_startup_query(false);
+        assert_eq!(
+            parser.next(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))
+        );
+    }
+
+    #[test]
+    fn oversized_tail_remains_quarantined_after_old_deadline() {
+        for terminator in [b"\x07".as_slice(), b"\x1b\\"] {
+            let mut parser = Parser::default();
+            parser.advance(b"\x1b]11;", false);
+            parser.advance(&[b'x'; 300], false);
+            parser.expire(Instant::now() + RESPONSE_TIMEOUT);
+            parser.advance(b"xyz", false);
+            assert!(parser.next().is_none());
+            parser.advance(terminator, false);
+            parser.advance(b"a", false);
+            assert_eq!(parser.next(), Some(key('a')));
+        }
+    }
+
+    #[test]
+    fn lone_escape_after_minimal_osc_is_preserved() {
+        let mut parser = Parser::default();
+        parser.advance(b"\x1b]11;\x1b", false);
+        parser.expire(Instant::now() + ESCAPE_TIMEOUT);
+        assert_eq!(
+            parser.next(),
+            Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))
+        );
     }
 }

@@ -18,12 +18,14 @@ use nix::sys::termios::{LocalFlags, OutputFlags, SetArg, tcgetattr, tcsetattr};
 use super::terminal_palette::{self, TerminalColors};
 use super::theme::ThemeProfile;
 
-pub(crate) const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(150);
+pub(crate) const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
 
 #[derive(Default)]
 pub(crate) struct StartupTerminal {
     #[cfg(unix)]
     owns_raw_mode: bool,
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
     #[cfg(unix)]
     raw_output_flags: Option<OutputFlags>,
     #[cfg(unix)]
@@ -46,10 +48,18 @@ impl StartupTerminal {
         }
         #[cfg(unix)]
         {
+            // Register before raw mode. The owner polls this listener during
+            // asynchronous startup, then transfers it to the shutdown monitor.
+            // Tokio handlers persist, so never drop the listener at handoff.
+            let interrupt =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+            // can_run_tui requires a tty on stdin; crossterm's tty_fd() selects
+            // this same fd. Crossterm remains the owner of the saved raw mode.
             let original_mode = tcgetattr(io::stdin())?;
             enable_raw_mode()?;
             let mut guard = Self {
                 owns_raw_mode: true,
+                interrupt: Some(interrupt),
                 raw_output_flags: None,
                 raw_local_flags: None,
             };
@@ -61,6 +71,7 @@ impl StartupTerminal {
             guard.raw_output_flags = Some(mode.output_flags);
             guard.raw_local_flags = Some(mode.local_flags);
             mode.output_flags = original_mode.output_flags;
+            mode.local_flags |= original_mode.local_flags & LocalFlags::ISIG;
             tcsetattr(io::stdin(), SetArg::TCSANOW, &mode)?;
 
             let profile = std::env::var("ASTRA_TUI_THEME").ok();
@@ -70,7 +81,7 @@ impl StartupTerminal {
                 terminal_palette::has_background_override(),
             );
             let mut queried = TerminalColors::default();
-            let mut sixel = false;
+            let mut sixel = None;
             match query_startup_attributes(colors, QUERY_TIMEOUT) {
                 Ok(response) => {
                     use terminal_palette::{OscColorSlot, parse_osc_color_response};
@@ -82,16 +93,14 @@ impl StartupTerminal {
                     });
                     sixel = response
                         .device_attributes
-                        .is_some_and(|params| params.iter().skip(1).any(|&param| param == 4));
+                        .map(|params| params.iter().skip(1).any(|&param| param == 4));
                 }
                 Err(error) => tracing::debug!(%error, "terminal startup query unavailable"),
             }
             terminal_palette::initialize_default_colors(queried);
-            astra_tools::display_sixel::set_sixel_supported(sixel);
-            // Session initialization can await network I/O. Keep its existing
-            // Ctrl-C/job-control signal behavior until keyboard handling starts.
-            mode.local_flags |= original_mode.local_flags & LocalFlags::ISIG;
-            tcsetattr(io::stdin(), SetArg::TCSANOW, &mode)?;
+            if let Some(supported) = sixel {
+                astra_tools::display_sixel::set_sixel_supported(supported);
+            }
             Ok(guard)
         }
         #[cfg(not(unix))]
@@ -99,6 +108,18 @@ impl StartupTerminal {
             terminal_palette::initialize_default_colors(TerminalColors::default());
             Ok(Self::default())
         }
+    }
+
+    /// Polled during startup and by the TUI shutdown monitor after handoff.
+    /// Keeping one listener alive avoids leaving Tokio's persistent SIGINT
+    /// handler installed with no consumer.
+    pub(crate) async fn interrupted(&mut self) {
+        #[cfg(unix)]
+        if let Some(interrupt) = self.interrupt.as_mut() {
+            let _ = interrupt.recv().await;
+            return;
+        }
+        std::future::pending::<()>().await;
     }
 
     /// Restore raw output before ratatui takes ownership; input stays raw.

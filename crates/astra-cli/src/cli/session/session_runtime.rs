@@ -1838,7 +1838,7 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     }
 
     eprintln!();
-    let welcome = banner_welcome_text(&pname, p, logged_in);
+    let welcome = banner_welcome_text(p, logged_in);
     let model_hint = if model_display == "auto" {
         format!(
             "{} {}",
@@ -1901,19 +1901,20 @@ fn style_banner_text(
     }
 }
 
-fn banner_welcome_text(
-    profile_name: &str,
-    profile: Option<&astra_credentials::Profile>,
-    logged_in: bool,
-) -> String {
+fn banner_welcome_text(profile: Option<&astra_credentials::Profile>, logged_in: bool) -> String {
     if !logged_in {
         return "Welcome to astra".to_string();
     }
     let user = profile
         .and_then(|profile| profile.username.as_deref())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or(profile_name);
-    format!("Welcome back, {user}")
+        .map(str::trim)
+        // Memoria login stores the provider placeholder as the username.
+        // Neither that placeholder nor a local profile name identifies the user.
+        .filter(|name| !name.is_empty() && *name != "memoria");
+    match user {
+        Some(user) => format!("Welcome back, {user}"),
+        None => "Welcome back".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -3554,27 +3555,50 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            banner_welcome_text("default", Some(&profile), true),
+            banner_welcome_text(Some(&profile), true),
             "Welcome back, xupeng"
         );
     }
 
     #[test]
-    fn banner_welcome_falls_back_to_profile_name() {
+    fn banner_welcome_omits_missing_or_placeholder_username() {
+        for username in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("memoria"),
+            Some(" memoria "),
+        ] {
+            let profile = Profile {
+                username: username.map(str::to_string),
+                ..Default::default()
+            };
+            assert_eq!(banner_welcome_text(Some(&profile), true), "Welcome back");
+        }
+        assert_eq!(banner_welcome_text(None, true), "Welcome back");
+    }
+
+    #[test]
+    fn banner_welcome_trims_username() {
         let profile = Profile {
-            access_token: Some("token".to_string()),
+            username: Some("  小明  ".to_string()),
             ..Default::default()
         };
         assert_eq!(
-            banner_welcome_text("test", Some(&profile), true),
-            "Welcome back, test"
+            banner_welcome_text(Some(&profile), true),
+            "Welcome back, 小明"
         );
     }
 
     #[test]
     fn banner_welcome_handles_logged_out_state() {
+        assert_eq!(banner_welcome_text(None, false), "Welcome to astra");
+        let profile = Profile {
+            username: Some("xupeng".to_string()),
+            ..Default::default()
+        };
         assert_eq!(
-            banner_welcome_text("default", None, false),
+            banner_welcome_text(Some(&profile), false),
             "Welcome to astra"
         );
     }

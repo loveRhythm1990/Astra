@@ -64,6 +64,10 @@ impl UnixInternalEventSource {
 }
 
 impl EventSource for UnixInternalEventSource {
+    fn set_startup_query(&mut self, active: bool) {
+        self.parser.set_startup_query(active);
+    }
+
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
         if let Some(event) = self.parser.next() {
             return Ok(Some(event));
@@ -101,8 +105,11 @@ impl EventSource for UnixInternalEventSource {
                 match token {
                     TTY_TOKEN => {
                         loop {
-                            match self.tty_fd.read(&mut self.tty_buffer) {
+                            match super::read_ready(&self.tty_fd, &mut self.tty_buffer) {
                                 Ok(read_count) => {
+                                    if read_count == 0 {
+                                        return Err(io::ErrorKind::UnexpectedEof.into());
+                                    }
                                     if read_count > 0 {
                                         self.parser.advance(
                                             &self.tty_buffer[..read_count],
@@ -118,6 +125,8 @@ impl EventSource for UnixInternalEventSource {
                                     // once more data is available to read.
                                     else if e.kind() == io::ErrorKind::Interrupted {
                                         continue;
+                                    } else {
+                                        return Err(e);
                                     }
                                 }
                             };

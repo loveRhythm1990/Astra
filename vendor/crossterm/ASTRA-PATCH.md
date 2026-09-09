@@ -5,25 +5,30 @@ The package records upstream commit 36d95b26a26e64b0f8c12edfe11f410a6d56a812.
 This directory is a local dependency patch, not a new upstream release.
 The application must not depend on a modified Cargo registry cache.
 
-## Review status: not ready to ship
+## Review fixes
 
-This prototype and the color/readability changes for PR #729 are developed
-together on `investigate/issue-728-light-terminal`. Consolidating the branches
-does not resolve the known input and terminal-restoration regressions; passing
-the existing tests is not a release criterion. Before shipping, cover and fix:
+This dependency patch and the color/readability changes for PR #729 are developed
+together on `investigate/issue-728-light-terminal`.
 
-- SIGINT during asynchronous startup must restore termios before exit.
-- A standalone Esc must be delivered without waiting for another byte; the
-  current blocking read loop can bypass both the parser and poll deadlines.
-- Startup OSC framing must not change normal-session Esc/Alt semantics.
-- Oversized/truncated replies must not leak their tails as keys or swallow
-  subsequent Esc keys; recovery must also handle a missing terminator.
-- Early palette/theme access must not silently discard the queried colors.
-- A missing DA1 response must stay distinct from confirmed lack of Sixel
-  support, without falling back to a competing `/dev/tty` reader during TUI use.
+- SIGINT is registered before raw mode. Astra polls it during asynchronous
+  startup and transfers the same listener to its TUI shutdown monitor. Terminal
+  restoration happens in ordinary Rust cleanup, never under a signal handler.
+- Drain reads check readiness even when stdin is blocking, so a partial response
+  cannot bypass the parser/poll deadline. EOF and read errors are propagated.
+- Esc lookahead is enabled only while query_startup_attributes owns the reader.
+  Completing or failing the query disables lookahead and releases a pending Esc.
+- Oversized and timed-out recognized responses quarantine their tails until BEL,
+  ST, or a new Esc sequence. No unbounded buffer or expired tail becomes keys.
+  A lone Esc recovers a missing terminator after up to 40 ms of ST lookahead.
+- Astra detects palette or theme initialization before the query: it warns and
+  debug-asserts instead of silently discarding colors.
+- The shared query retains a 300 ms budget. Missing DA1 stays unknown; the reader
+  caches late DA1 for Astra's event adapter. An active TUI never falls back to a
+  second /dev/tty reader.
 
-Add PTY coverage for those paths, including bare Esc, separate Esc then character,
-arrow and Alt sequences, SIGINT, delayed DA1, and oversized response timeouts.
+PTY regression coverage includes bare Esc through poll and EventStream, separate
+Esc then character, arrows/Alt, startup and post-handoff SIGINT, late DA1,
+oversized timeouts, missing terminators, and early palette/theme initialization.
 The FIFO/error-preservation fixes below can be proposed upstream independently.
 
 To inspect or re-export the patch against the published 0.29.0 sources, normalize
@@ -36,8 +41,12 @@ The extension adds query_startup_attributes to the existing Unix input reader:
 OSC 10/11 and DA1 use one deadline and leave keyboard/paste events in FIFO order.
 Late color replies stay internal instead of becoming keystrokes. The two Unix
 backends share the existing keyboard parser and a bounded OSC framing layer.
-An ambiguous standalone Esc/Alt+] waits up to 40 ms; an unfinished recognized
-OSC response expires after 500 ms and is limited to 256 bytes. Bracketed paste
+During a startup query an ambiguous standalone Esc/Alt+] waits up to 40 ms.
+Outside that query, a standalone Esc is delivered immediately, matching upstream;
+a late reply split immediately after its first Esc is consequently ambiguous
+with keyboard input and cannot be reconstructed. Once an OSC prefix is recognized,
+its framing remains internal across reads. An unfinished recognized response
+enters quarantine after 500 ms; response storage is limited to 256 bytes. Bracketed paste
 contents are never interpreted as query responses. Querying is startup-only;
 callers own terminal modes and must not run an EventStream concurrently.
 
@@ -45,8 +54,11 @@ Also fixes filtered-read FIFO order and preserving skipped events on input error
 No public Event variants or Windows input behavior are changed.
 
 Changed upstream files:
-- Cargo.toml: local patch MSRV is 1.70 (Astra pins a newer toolchain).
+- Cargo.toml: local patch MSRV is 1.70; events uses filedescriptor for readiness
+  checks without changing stdin's shared O_NONBLOCK flags.
 - src/terminal/sys/unix.rs: remove redundant parentheses flagged by the pinned toolchain.
+- src/event/sys/unix/waker/mio.rs, src/terminal.rs: fix an upstream lint-name
+  typo and redundant formatting borrow for the pinned toolchain.
 - src/event.rs: internal responses and startup query export.
 - src/event/filter.rs: DA1 parameters.
 - src/event/read.rs: filtered FIFO and error preservation, regression test.
@@ -61,3 +73,13 @@ with cargo test --manifest-path vendor/crossterm/Cargo.toml --lib --features eve
 Shipping this prototype requires maintaining this fork until a released upstream
 API provides the required query and input-preservation behavior. Do not silently
 replace it with a library that reads /dev/tty independently of crossterm.
+
+## Astra regression commands
+
+```sh
+cargo test -p astra-cli --lib tui::terminal_startup -- --test-threads=2
+cargo test -p astra-cli --lib --features crossterm/use-dev-tty tui::terminal_startup -- --test-threads=2
+```
+
+These PTY tests use fake terminal replies and no network or credentials. Run both
+backends when changing reader readiness, framing, deadlines, or query handoff.
