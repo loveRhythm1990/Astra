@@ -6799,6 +6799,7 @@ async fn ensure_core_schema_while_leased(
             api_key_encrypted TEXT NOT NULL,
             base_url VARCHAR(500) NOT NULL,
             context_window INT NOT NULL,
+            thinking_probe_json JSON NULL,
             is_default SMALLINT NOT NULL DEFAULT 0,
             is_active SMALLINT NOT NULL DEFAULT 1,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),

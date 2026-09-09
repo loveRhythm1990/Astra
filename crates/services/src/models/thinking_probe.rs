@@ -136,6 +136,11 @@ pub(super) async fn probe_chat_protocol(
         true,
         (protocol == ThinkingProtocol::ReasoningEffort).then_some("low"),
     );
+    if protocol == ThinkingProtocol::EnableThinking {
+        // Some DashScope deployments require streaming when thinking is on.
+        // Use it for both legs so the observation protocol is identical.
+        enabled["stream"] = serde_json::json!(true);
+    }
     match send_openai_probe(
         client,
         url,
@@ -176,9 +181,266 @@ pub(super) async fn probe_chat_protocol(
     }
 }
 
+pub(super) fn transport_error(error: reqwest::Error) -> String {
+    // Never format the original error: it may contain a private URL or key.
+    let category = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection/DNS/TLS"
+    } else if error.is_body() || error.is_decode() {
+        "response body"
+    } else {
+        "request transport"
+    };
+    format!("Thinking probe {category} failure")
+}
+
+pub(super) fn validate_output(json: &Value) -> Result<(), String> {
+    let content = json
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str);
+    let finish = json.pointer("/choices/0/finish_reason");
+    let acceptable_finish = match finish {
+        None | Some(Value::Null) => true,
+        Some(Value::String(reason)) => matches!(reason.as_str(), "stop" | "length"),
+        _ => false,
+    };
+    // Missing finish metadata is common on compatible gateways. Truncated but
+    // nonempty output can show reasoning; empty/refused/error output cannot
+    // establish either positive capability or successful suppression.
+    if json.get("error").is_some()
+        || json
+            .pointer("/choices/0/message/refusal")
+            .is_some_and(|v| !v.is_null())
+        || !acceptable_finish
+        || content.is_none_or(|s| s.trim().is_empty())
+    {
+        return Err("Thinking probe returned incomplete or malformed output".into());
+    }
+    Ok(())
+}
+
+/// Bounded probe-only SSE normalization, not a runtime inference parser.
+/// Operates after capped response collection, so network chunk/UTF-8 boundaries
+/// cannot split a JSON event. Reject malformed frames rather than infer absence.
+pub(super) fn parse_response(bytes: &[u8], streaming: bool) -> Result<Value, String> {
+    let invalid = || "Thinking probe returned malformed response".to_string();
+    if !streaming {
+        return serde_json::from_slice(bytes).map_err(|_| invalid());
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid())?;
+    let mut data = Vec::new();
+    let mut events = Vec::new();
+    let mut done = false;
+    for line in text.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if data.is_empty() {
+                continue;
+            }
+            let payload = data.join("\n");
+            data.clear();
+            if done {
+                return Err(invalid());
+            }
+            if payload.trim() == "[DONE]" {
+                done = true;
+                continue;
+            }
+            events.push(serde_json::from_str::<Value>(&payload).map_err(|_| invalid())?);
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.strip_prefix(' ').unwrap_or(value));
+        }
+    }
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut finish = Value::Null;
+    let mut usage = Value::Null;
+    for event in events {
+        if event.get("error").is_some() {
+            return Err(invalid());
+        }
+        if let Some(value) = event.get("usage") {
+            usage = value.clone();
+        }
+        let choices = event
+            .get("choices")
+            .and_then(Value::as_array)
+            .ok_or_else(invalid)?;
+        for choice in choices {
+            if choice
+                .get("index")
+                .and_then(Value::as_u64)
+                .is_some_and(|i| i != 0)
+            {
+                continue;
+            }
+            let delta = choice
+                .get("delta")
+                .and_then(Value::as_object)
+                .ok_or_else(invalid)?;
+            if delta.get("refusal").is_some_and(|v| !v.is_null()) {
+                return Err(invalid());
+            }
+            for (key, target) in [
+                ("content", &mut content),
+                ("reasoning_content", &mut reasoning),
+            ] {
+                match delta.get(key) {
+                    Some(Value::String(value)) => target.push_str(value),
+                    None | Some(Value::Null) => {}
+                    _ => return Err(invalid()),
+                }
+            }
+            if let Some(value) = choice.get("finish_reason").filter(|v| !v.is_null()) {
+                finish = value.clone();
+            }
+        }
+    }
+    if !done && finish.is_null() {
+        return Err(invalid());
+    }
+    Ok(
+        serde_json::json!({"choices":[{"finish_reason":finish,"message":{"content":content,"reasoning_content":reasoning}}],"usage":usage}),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_finish_metadata_does_not_reject_valid_gateway_output() {
+        for finish in [
+            Value::Null,
+            serde_json::json!("stop"),
+            serde_json::json!("length"),
+        ] {
+            let response = serde_json::json!({"choices":[{"finish_reason":finish,"message":{"content":"391"}}]});
+            assert!(validate_output(&response).is_ok());
+        }
+        assert!(
+            validate_output(&serde_json::json!({"choices":[{"message":{"content":"391"}}]}))
+                .is_ok()
+        );
+        for response in [
+            serde_json::json!({"choices":[{"message":{"content":""}}]}),
+            serde_json::json!({"choices":[{"finish_reason":"content_filter","message":{"content":"blocked"}}]}),
+            serde_json::json!({"choices":[{"message":{"content":"391","refusal":"no"}}]}),
+            serde_json::json!({"error":"private upstream text"}),
+        ] {
+            assert!(validate_output(&response).is_err());
+        }
+    }
+
+    #[test]
+    fn streaming_probe_handles_multiline_utf8_usage_and_rejects_incomplete_frames() {
+        let wire = concat!(
+            ": keepalive\r\n\r\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"计算\"},\"finish_reason\":null}]}\r\n\r\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"391\"},\n",
+            "data: \"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"completion_tokens_details\":{\"reasoning_tokens\":3}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let json = parse_response(wire.as_bytes(), true).unwrap();
+        validate_output(&json).unwrap();
+        assert_eq!(json["choices"][0]["message"]["reasoning_content"], "计算");
+        assert_eq!(json["choices"][0]["message"]["content"], "391");
+        for wire in [
+            "data: {broken}\n\n",
+            "data: {\"error\":\"secret\"}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"391\"}}]}\n\n",
+        ] {
+            assert!(parse_response(wire.as_bytes(), true).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_classifies_connect_failure_without_disclosing_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/private-key"))
+            .send()
+            .await
+            .unwrap_err();
+        let safe = transport_error(error);
+        assert!(safe.contains("connection/DNS/TLS"));
+        assert!(!safe.contains("private-key"));
+        assert!(!safe.contains(&addr.to_string()));
+    }
+
+    #[tokio::test]
+    async fn probe_bounds_body_and_distinguishes_positive_from_negative_truncation() {
+        use axum::{Json, Router, routing::post};
+        let app = Router::new().route("/chat/completions", post(|Json(body): Json<Value>| async move {
+            let model = body["model"].as_str().unwrap();
+            if model == "oversized" { return "x".repeat(1024 * 1024 + 1); }
+            let mut message = serde_json::json!({"content":"391"});
+            if model == "reasoning-length" { message["reasoning_content"] = serde_json::json!("multiply"); }
+            serde_json::json!({"choices":[{"message":message,"finish_reason":if model == "missing-finish" {Value::Null} else {serde_json::json!("length")}}]}).to_string()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for (model, expected) in [
+            ("oversized", None),
+            ("negative-length", None),
+            ("reasoning-length", Some(true)),
+            ("missing-finish", Some(false)),
+        ] {
+            let result = send_openai_probe(
+                &client,
+                &url,
+                "fixture-secret",
+                &serde_json::json!({"model":model}),
+                false,
+            )
+            .await;
+            match expected {
+                Some(value) => assert_eq!(result.unwrap(), value),
+                None => assert!(result.is_err()),
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stalled_probe_body_honors_request_deadline() {
+        use axum::{Router, body::Body, routing::post};
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                Body::from_stream(futures_util::stream::pending::<
+                    Result<String, std::io::Error>,
+                >())
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_openai_probe_with_timeout(
+                &client,
+                &url,
+                "fixture-secret",
+                &serde_json::json!({}),
+                false,
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("request body must honor its configured deadline");
+        assert!(result.unwrap_err().contains("timeout"));
+        server.abort();
+    }
 
     #[tokio::test]
     async fn strict_toggle_probe_uses_shared_protocol_and_rejects_ignored_controls() {
@@ -356,6 +618,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "live-provider-tests")]
     #[ignore = "requires a real paid provider credential in ASTRA_TEST_SUMMARY_CONFIG_FILE"]
     async fn live_thinking_protocol_probe() {
         let path = std::env::var("ASTRA_TEST_SUMMARY_CONFIG_FILE").expect("provider config path");

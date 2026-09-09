@@ -1,7 +1,40 @@
 # Model access and inference
 
 > Status: target design contract.
-> Last updated: 2026-09-09.
+> Last updated: 2026-09-10.
+
+## Implemented scope: generation-policy stages 1 and 2
+
+The full route/admission design below is a target, not a claim that every type
+and invariant is implemented by these stages.
+
+- Implemented: conservative Server summary temperature resolution, endpoint-bound
+  canonical defaults, propagation of fixed temperature and thinking protocol to
+  main/auxiliary execution, configuration-bound persisted thinking observations,
+  and a bounded introspection budget. Unknown/custom endpoints (regardless of
+  their provider label), custom completion URLs and Bedrock gateways use the
+  provider default unless an explicit temperature is configured.
+- Implemented: numeric override validation at summary resolution and the main
+  streaming/nonstreaming entrypoints. The main call's explicit temperature still
+  takes precedence over a route override unless fixed_temperature is declared.
+- Not implemented: removing temperature from the generic override map at model
+  admission, making it runtime-owned in all routes, or replacing all request
+  types with the target ResolvedGenerationPolicy below. Overrides are still
+  merged and reconciled by the existing payload builder. Admission-time rejection
+  and one universal generation-policy owner remain target work.
+- Stage 2 adds typed maintained endpoint/model thinking contracts and administrator
+  declarations. Stage-1-only statements about adding no new provider matchers do
+  not describe the complete stage-2 adapter set. User Runner purpose authorization
+  is unchanged; these changes do not enable Runner Work admission.
+
+Thinking checks use a 30-second total budget, including client setup and both
+legs, with at most 15 seconds per HTTP request and a 1 MiB response limit.
+The separate connectivity check can add its own time; 30 seconds is not an
+end-to-end model-check API deadline. EnableThinking probes use streamed SSE in
+both legs to cover streaming-only deployments. Missing finish metadata is
+accepted with valid output; truncation cannot prove absence of reasoning.
+Connection/DNS/TLS, timeout, body and HTTP failures remain distinguishable
+without exposing upstream response bodies or credentials.
 
 Model access and inference defines how Astra presents model capability as a product, binds cloud accounts, resolves an eligible model to a trusted execution path, and records inference usage consistently across Web, CLI, Server, and Edge.
 
@@ -1084,10 +1117,28 @@ from end-to-end TTFT. Every primary and auxiliary attempt records:
 
 ### Compatibility and rollout
 
+- Historical administrator `quirks.fixed_temperature` values were previously
+  persisted without affecting inference. They now become active for primary and
+  auxiliary requests, take precedence over a call-level temperature, and reject
+  conflicting route overrides. This can change sampling or cause a local
+  configuration error after upgrade; it is not a behavior-neutral migration.
+  Before rollout, audit configured values without printing credentials:
+
+  ```sql
+  SELECT model_id, model_name, JSON_EXTRACT(quirks, '$.fixed_temperature') AS fixed_temperature
+  FROM infra_llm_models
+  WHERE JSON_EXTRACT(quirks, '$.fixed_temperature') IS NOT NULL;
+  ```
+
+  Review non-null values and their compatibility with every enabled thinking
+  mode. Change unintended values through the existing administrator model API;
+  schema migration must not silently delete or rewrite them.
 - Existing Cloud BYOK rows remain readable and require no backfill.
 - Existing canonical provider behavior remains unchanged unless its adapter no
   longer has a tested zero-temperature contract.
-- Unknown and custom OpenAI-compatible endpoints become less prescriptive;
+- All routes without a maintained endpoint-bound zero-temperature contract or
+  explicit temperature become less prescriptive, not just routes literally
+  labelled `openai-compatible` (e.g. DashScope, OpenRouter and custom gateways);
   omission lets the endpoint apply its own valid default.
 - A numeric `request_body_overrides.temperature` is an intentional typed
   declaration after admission. Today bounded introspection silently replaces

@@ -4192,6 +4192,30 @@ async fn probe_thinking_behavior_with_protocol(
     base_url: Option<&str>,
     protocol_override: Option<ThinkingProtocol>,
 ) -> ThinkingProbeResult {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        probe_thinking_behavior_with_protocol_inner(
+            provider,
+            model_name,
+            api_key,
+            base_url,
+            protocol_override,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| ThinkingProbeResult {
+        capability: ThinkingCapability::None,
+        error: Some("Thinking probe total budget exhausted".into()),
+    })
+}
+
+async fn probe_thinking_behavior_with_protocol_inner(
+    provider: &str,
+    model_name: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+    protocol_override: Option<ThinkingProtocol>,
+) -> ThinkingProbeResult {
     if provider == "mock" {
         return ThinkingProbeResult {
             capability: ThinkingCapability::None,
@@ -4391,36 +4415,54 @@ async fn send_openai_probe(
     body: &serde_json::Value,
     observe_usage_reasoning: bool,
 ) -> Result<bool, String> {
-    let resp = client
+    send_openai_probe_with_timeout(
+        client,
+        url,
+        api_key,
+        body,
+        observe_usage_reasoning,
+        Duration::from_secs(15),
+    )
+    .await
+}
+
+async fn send_openai_probe_with_timeout(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+    observe_usage_reasoning: bool,
+    request_timeout: Duration,
+) -> Result<bool, String> {
+    let mut resp = client
         .post(url)
         .header("authorization", format!("Bearer {api_key}"))
         .header("content-type", "application/json")
-        .timeout(Duration::from_secs(30))
+        .timeout(request_timeout)
         .json(body)
         .send()
         .await
-        .map_err(|_| "Thinking probe transport failed".to_string())?;
+        .map_err(thinking_probe::transport_error)?;
 
     if resp.status().as_u16() >= 400 {
         let status = resp.status().as_u16();
         return Err(format!("Thinking probe HTTP {status}"));
     }
 
-    let text = resp.text().await.unwrap_or_default();
-    let json: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("Probe parse error: {e}"))?;
-
-    if json
-        .pointer("/choices/0/finish_reason")
-        .and_then(Value::as_str)
-        != Some("stop")
-        || json
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .is_none_or(|s| s.trim().is_empty())
+    // Bound both buffered JSON and SSE responses, including malicious gateways.
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(thinking_probe::transport_error)?
     {
-        return Err("Thinking probe returned incomplete or malformed output".into());
+        if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
+            return Err("Thinking probe response exceeded size limit".into());
+        }
+        bytes.extend_from_slice(&chunk);
     }
+    let json = thinking_probe::parse_response(&bytes, body["stream"] == true)?;
+    thinking_probe::validate_output(&json)?;
 
     let content = json
         .get("choices")
@@ -4447,7 +4489,16 @@ async fn send_openai_probe(
             .pointer("/usage/completion_tokens_details/reasoning_tokens")
             .and_then(Value::as_u64)
             .is_some_and(|tokens| tokens > 0);
-    Ok(has_think_tags || has_reasoning_content || usage_reasoning)
+    let observed = has_think_tags || has_reasoning_content || usage_reasoning;
+    if !observed
+        && json
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            == Some("length")
+    {
+        return Err("Truncated thinking probe cannot establish absence of reasoning".into());
+    }
+    Ok(observed)
 }
 
 // ── Noop implementation ──────────────────────────────────────────────────────
@@ -7643,6 +7694,10 @@ mod tests {
 
         let handler = move |axum::Json(body): axum::Json<serde_json::Value>| async move {
             let enable = body.get("enable_thinking").and_then(|v| v.as_bool());
+            assert_eq!(
+                body["stream"], true,
+                "DashScope thinking probes must support streaming-only deployments"
+            );
             let has_reasoning = match (supports_thinking, enable) {
                 (false, _) => false,
                 (true, Some(false)) => false,
@@ -7653,7 +7708,12 @@ mod tests {
             if has_reasoning {
                 msg["reasoning_content"] = serde_json::json!("thinking...");
             }
-            axum::Json(serde_json::json!({"choices": [{"message": msg, "finish_reason": "stop"}]}))
+            let event =
+                serde_json::json!({"choices": [{"index":0,"delta": msg, "finish_reason": "stop"}]});
+            (
+                [("content-type", "text/event-stream")],
+                format!("data: {event}\n\ndata: [DONE]\n\n"),
+            )
         };
         let app = Router::new().route("/chat/completions", post(handler));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -7673,6 +7733,7 @@ mod tests {
 
         let handler = |axum::Json(body): axum::Json<serde_json::Value>| async move {
             let enable = body.get("enable_thinking").and_then(|v| v.as_bool());
+            assert_eq!(body["stream"], true);
             let has_reasoning = match enable {
                 Some(false) => false, // Suppression works
                 _ => true,            // Default or explicit true → thinks
@@ -7681,7 +7742,12 @@ mod tests {
             if has_reasoning {
                 msg["reasoning_content"] = serde_json::json!("thinking...");
             }
-            axum::Json(serde_json::json!({"choices": [{"message": msg, "finish_reason": "stop"}]}))
+            let event =
+                serde_json::json!({"choices": [{"index":0,"delta": msg, "finish_reason": "stop"}]});
+            (
+                [("content-type", "text/event-stream")],
+                format!("data: {event}\n\ndata: [DONE]\n\n"),
+            )
         };
         let app = Router::new().route("/chat/completions", post(handler));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

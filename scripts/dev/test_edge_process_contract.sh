@@ -27,6 +27,10 @@ cp /bin/sleep "${fixture_root}/target/debug/astra-edge"
 # macOS may reject a relocated platform binary with SIGKILL. Ad-hoc sign
 # only the disposable fixture; do not change /bin/sleep or host security policy.
 if [ "$(uname -s)" = "Darwin" ]; then
+    if ! command -v codesign >/dev/null 2>&1; then
+        echo "macOS edge-process fixture requires codesign (Command Line Tools)" >&2
+        exit 1
+    fi
     codesign --force --sign - "${fixture_root}/target/debug/astra-edge"
 fi
 "${fixture_root}/target/debug/astra-edge" 30 &

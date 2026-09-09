@@ -37,11 +37,23 @@ impl ThinkingProtocol {
         let Some(object) = body.as_object_mut() else {
             return;
         };
-        for key in ["thinking", "enable_thinking", "reasoning_effort"] {
+        for key in [
+            "thinking",
+            "enable_thinking",
+            "reasoning_effort",
+            "reasoning",
+        ] {
             object.remove(key);
         }
+        if let Some(config) = object
+            .get_mut("output_config")
+            .and_then(Value::as_object_mut)
+        {
+            config.remove("effort");
+            config.remove("reasoning_effort");
+        }
         match self {
-            Self::Unknown => {}
+            Self::Unknown => unreachable!("unknown protocols preserve the body above"),
             Self::EnableThinking => {
                 body["enable_thinking"] = json!(enabled);
             }
@@ -62,6 +74,33 @@ impl ThinkingProtocol {
             Self::ReasoningEffort => {}
         }
     }
+}
+
+/// Transitional zero-temperature defaults apply only to maintained native
+/// endpoint contracts, never a provider label attached to an arbitrary gateway.
+/// Other deployments (including Bedrock gateways) need an explicit capability.
+pub fn canonical_zero_temperature(provider: &str, base_url: &str) -> bool {
+    let expected = match provider {
+        "openai" => "api.openai.com",
+        "anthropic" => "api.anthropic.com",
+        "deepseek" => "api.deepseek.com",
+        _ => return false,
+    };
+    // Only OpenAI has an implicit endpoint in the summary transport.
+    if base_url.is_empty() {
+        return provider == "openai";
+    }
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str() == Some(expected)
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && matches!(url.path().trim_end_matches('/'), "" | "/v1")
 }
 
 /// Maintained adapter defaults, never substring matching arbitrary URLs.
@@ -153,6 +192,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zero_temperature_requires_native_endpoint_authority() {
+        assert!(canonical_zero_temperature(
+            "openai",
+            "https://api.openai.com/v1"
+        ));
+        for url in [
+            "https://api.openai.com.evil.test/v1",
+            "http://api.openai.com/v1",
+            "https://api.openai.com:8443/v1",
+            "https://api.openai.com/proxy",
+            "https://api.openai.com/v1?gateway=1",
+            "https://user@api.openai.com/v1",
+            "https://api.moonshot.cn/v1",
+        ] {
+            assert!(!canonical_zero_temperature("openai", url), "{url}");
+        }
+    }
+
+    #[test]
     fn toggle_preserves_explicit_sampling_in_both_modes() {
         for enabled in [false, true] {
             let mut body = json!({"temperature":0.7,"top_p":0.9,"presence_penalty":0.1,"frequency_penalty":0.2});
@@ -236,8 +294,12 @@ mod tests {
             ThinkingProtocol::Moonshot,
             ThinkingProtocol::ReasoningEffort,
         ] {
-            let mut body = json!({"thinking": {}, "enable_thinking": true, "reasoning_effort": "max", "temperature": 0});
+            let mut body = json!({"thinking": {}, "enable_thinking": true, "reasoning_effort": "max", "reasoning": {"effort":"high"}, "output_config":{"effort":"high", "reasoning_effort":"high", "format":"json"}, "temperature": 0});
             protocol.apply(&mut body, false, None);
+            assert!(body.get("reasoning").is_none());
+            assert!(body["output_config"].get("effort").is_none());
+            assert!(body["output_config"].get("reasoning_effort").is_none());
+            assert_eq!(body["output_config"]["format"], "json");
             assert!(body.get("reasoning_effort").is_none());
             assert_eq!(
                 body.get("enable_thinking").is_some(),

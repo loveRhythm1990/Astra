@@ -19,8 +19,12 @@ use std::sync::Arc;
 #[tokio::test]
 #[ignore = "requires isolated MatrixOne DB and loopback DeepSeek fixture override"]
 async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
-    let settings = astra_core::MatrixOneSettings::from_env();
+    let settings = common::require_db_it_env();
     isolated_database::require_isolated_database(&settings.database);
+    assert!(
+        isolated_database::is_schema_rehearsal_database(&settings.database),
+        "schema rehearsal requires an astra_test_probe_* disposable database"
+    );
     assert_eq!(
         std::env::var("ASTRA_ALLOW_INSECURE_DEFAULTS").as_deref(),
         Ok("1")

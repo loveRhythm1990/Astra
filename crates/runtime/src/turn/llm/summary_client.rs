@@ -216,6 +216,16 @@ impl RuntimeSummaryClient {
     /// control. Use only admitted capability facts or Astra's maintained
     /// canonical-provider transition contract; never infer from a model name.
     fn thinking_for(purpose: InferencePurpose, route: &OwnedLlmExecutionRoute) -> ThinkingConfig {
+        let protocol = route.thinking_protocol.unwrap_or_else(|| {
+            astra_core::model_wire::thinking::canonical_thinking_protocol(
+                &route.provider,
+                &route.base_url,
+                route
+                    .wire_model_name
+                    .as_deref()
+                    .unwrap_or(&route.model_name),
+            )
+        });
         match (purpose, route.thinking_capability) {
             // A persisted EffortOnly value may predate the provider's typed
             // suppression capability. The admitted endpoint protocol is the
@@ -225,27 +235,12 @@ impl RuntimeSummaryClient {
             (
                 InferencePurpose::Introspection,
                 Some(astra_services::models::ThinkingCapability::EffortOnly),
-            ) if route
-                .thinking_protocol
-                .unwrap_or_else(|| {
-                    astra_core::model_wire::thinking::canonical_thinking_protocol(
-                        &route.provider,
-                        &route.base_url,
-                        route
-                            .wire_model_name
-                            .as_deref()
-                            .unwrap_or(&route.model_name),
-                    )
-                })
-                .can_disable() =>
-            {
-                ThinkingConfig::Off
-            }
+            ) if protocol.can_disable() => ThinkingConfig::Off,
             (
                 InferencePurpose::Introspection,
                 Some(astra_services::models::ThinkingCapability::EffortOnly),
-            ) if route.thinking_protocol
-                == Some(astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort) =>
+            ) if protocol
+                == astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort =>
             {
                 ThinkingConfig::Adaptive {
                     effort: ThinkingEffort::Low,
@@ -304,10 +299,12 @@ impl RuntimeSummaryClient {
                     SummaryTemperatureEmission::ProviderDefault,
                     SummaryGenerationPolicyProvenance::CanonicalProviderContract,
                 )
-            } else if matches!(
-                route.provider.as_str(),
-                "openai" | "anthropic" | "deepseek" | "bedrock"
-            ) {
+            } else if route.completions_url_override.is_none()
+                && astra_core::model_wire::thinking::canonical_zero_temperature(
+                    &route.provider,
+                    &route.base_url,
+                )
+            {
                 (
                     SummaryTemperatureEmission::Explicit(0.0),
                     SummaryGenerationPolicyProvenance::CanonicalProviderContract,
@@ -757,6 +754,15 @@ mod tests {
                 effort: ThinkingEffort::Low,
             }
         );
+        effort_only.thinking_protocol = None;
+        effort_only.base_url = "https://api.openai.com/v1".into();
+        assert_eq!(
+            RuntimeSummaryClient::thinking_for(InferencePurpose::Introspection, &effort_only),
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Low
+            },
+            "canonical fallback must be shared by both EffortOnly branches"
+        );
 
         for capability in [
             None,
@@ -793,9 +799,14 @@ mod tests {
     #[test]
     fn bounded_introspection_resolves_temperature_from_admitted_capabilities() {
         let canonical = route_with_capability(None);
-        for provider in ["openai", "anthropic", "deepseek", "bedrock"] {
+        for (provider, base_url) in [
+            ("openai", "https://api.openai.com/v1"),
+            ("anthropic", "https://api.anthropic.com/v1"),
+            ("deepseek", "https://api.deepseek.com"),
+        ] {
             let mut route = canonical.clone();
             route.provider = provider.to_string();
+            route.base_url = base_url.into();
             let policy = RuntimeSummaryClient::resolve_generation_policy(
                 InferencePurpose::Introspection,
                 &route,
@@ -884,6 +895,51 @@ mod tests {
                 SummaryTemperatureEmission::InheritRouteDefault
             );
         }
+    }
+
+    #[test]
+    fn provider_labels_and_completion_overrides_do_not_prove_zero_temperature() {
+        for provider in [
+            "openai",
+            "anthropic",
+            "deepseek",
+            "bedrock",
+            "dashscope",
+            "moonshot",
+            "openrouter",
+        ] {
+            for url in [
+                "https://api.moonshot.cn/v1",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "https://gateway.example/v1",
+            ] {
+                let mut route = route_with_capability(None);
+                route.provider = provider.into();
+                route.base_url = url.into();
+                assert_eq!(
+                    RuntimeSummaryClient::resolve_generation_policy(
+                        InferencePurpose::Introspection,
+                        &route
+                    )
+                    .unwrap()
+                    .temperature,
+                    SummaryTemperatureEmission::ProviderDefault,
+                    "{provider} {url}"
+                );
+            }
+        }
+        let mut route = route_with_capability(None);
+        route.base_url = "https://api.openai.com/v1".into();
+        route.completions_url_override = Some("https://gateway.example/chat/completions".into());
+        assert_eq!(
+            RuntimeSummaryClient::resolve_generation_policy(
+                InferencePurpose::Introspection,
+                &route
+            )
+            .unwrap()
+            .temperature,
+            SummaryTemperatureEmission::ProviderDefault
+        );
     }
 
     #[test]
@@ -1013,6 +1069,11 @@ mod tests {
                             .expect("strict provider rejection");
                     }
                     let decision = r#"{"work_lifecycle":"not_required","execution_topology":"primary","acceptance_unit_relationship":"single_outcome","acceptance_units":[{"objective":"Answer the question","expected_result":"One direct answer"}]}"#;
+                    if body["stream"] == true {
+                        let event = serde_json::json!({"choices":[{"index":0,"delta":{"content":decision},"finish_reason":null}]});
+                        return Response::builder().status(200).header("content-type", "text/event-stream")
+                            .body(Body::from(format!("data: {event}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"))).unwrap();
+                    }
                     let response = serde_json::json!({
                         "id": "kimi-like-summary",
                         "choices": [{
@@ -1038,33 +1099,59 @@ mod tests {
         // keeping the test server on loopback. The production
         // `openai-compatible` identifier intentionally activates public-HTTPS
         // SSRF enforcement and cannot target this local fixture.
-        execution.provider = "mock-openai-compatible".to_string();
-        let client = RuntimeSummaryClient::new_direct_for_test(summary_route(&execution), 1_024);
-        let messages = vec![serde_json::json!({
-            "role": "user",
-            "content": "Decide whether this turn needs durable Work"
-        })];
+        for provider in ["mock-openai-compatible", "openai"] {
+            execution.provider = provider.to_string();
+            for streaming in [false, true] {
+                let client = if streaming {
+                    let ledger = DurableInferenceLedger::required_with_persistence(
+                        None,
+                        Some(&execution),
+                        "summary-user",
+                        Some(Arc::new(RecoverFirstAdmissionPersistence::default())),
+                    )
+                    .unwrap()
+                    .with_run_authority(summary_authority());
+                    RuntimeSummaryClient::new_with_attempt_allocator(
+                        summary_route(&execution),
+                        1_024,
+                        ledger,
+                        summary_scope(),
+                        DurableSummaryAttemptAllocator::default(),
+                    )
+                } else {
+                    RuntimeSummaryClient::new_direct_for_test(summary_route(&execution), 1_024)
+                };
+                let messages = vec![serde_json::json!({
+                    "role": "user",
+                    "content": "Decide whether this turn needs durable Work"
+                })];
 
-        let summary = client
-            .summarize(InferencePurpose::Introspection, &messages)
-            .await
-            .expect("provider-default request must succeed");
-        astra_services::parse_work_admission_response(&summary.text)
-            .expect("the separate final content must remain a valid Work decision");
+                let summary = client
+                    .summarize(InferencePurpose::Introspection, &messages)
+                    .await
+                    .expect("provider-default request must succeed");
+                astra_services::parse_work_admission_response(&summary.text)
+                    .expect("the separate final content must remain a valid Work decision");
 
-        assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
-        let body = captured_body
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .expect("captured strict-provider request");
-        assert!(
-            body.get("temperature").is_none(),
-            "generic compatibility must not invent a sampling capability"
-        );
-        assert!(
-            body.get("thinking").is_none(),
-            "stage 1 leaves an unclassified endpoint's thinking mode at its provider default"
+                let body = captured_body
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+                    .expect("captured strict-provider request");
+                assert!(
+                    body.get("temperature").is_none(),
+                    "generic compatibility must not invent a sampling capability"
+                );
+                assert!(
+                    body.get("thinking").is_none(),
+                    "stage 1 leaves an unclassified endpoint's thinking mode at its provider default"
+                );
+            }
+        }
+        assert_eq!(
+            provider_requests.load(Ordering::SeqCst),
+            4,
+            "one request per provider and transport, no retry/fallback"
         );
     }
 
@@ -1296,6 +1383,7 @@ mod tests {
     /// Explicit paid-provider check. The file contains URL, key and model as
     /// its last three nonempty lines; none of its contents are logged.
     #[tokio::test]
+    #[cfg(feature = "live-provider-tests")]
     #[ignore = "requires ASTRA_TEST_SUMMARY_CONFIG_FILE and a real provider credential"]
     async fn live_work_admission_provider_contract() {
         let path = std::env::var("ASTRA_TEST_SUMMARY_CONFIG_FILE")

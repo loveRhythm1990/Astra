@@ -3504,7 +3504,7 @@ fn apply_admitted_openai_protocol(
     // The legacy OpenAI effort serializer removes temperature for Adaptive.
     // A binary toggle is not that contract: restore explicit sampling only,
     // never manufacture a default or infer a mode-specific allowed value.
-    if protocol == astra_core::model_wire::thinking::ThinkingProtocol::Moonshot
+    if protocol.can_disable()
         && let Some(value) = temperature
             .map(|value| json!(value))
             .or_else(|| overrides.and_then(|o| o.get("temperature")).cloned())
@@ -4701,14 +4701,15 @@ async fn call_llm_and_collect_with_total_budget(
         has_fallback,
         thinking,
     } = call;
+    let configured_temperature = astra_core::model_wire::thinking::configured_temperature(
+        route.request_body_overrides,
+        route.fixed_temperature,
+    )
+    .map_err(|message| {
+        astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
+    })?;
     let temperature = if route.fixed_temperature.is_some() {
-        astra_core::model_wire::thinking::configured_temperature(
-            route.request_body_overrides,
-            route.fixed_temperature,
-        )
-        .map_err(|message| {
-            astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
-        })?
+        configured_temperature
     } else {
         temperature
     };
@@ -7010,14 +7011,15 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         has_fallback: _,
         thinking,
     } = call;
+    let configured_temperature = astra_core::model_wire::thinking::configured_temperature(
+        route.request_body_overrides,
+        route.fixed_temperature,
+    )
+    .map_err(|message| {
+        astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
+    })?;
     let temperature = if route.fixed_temperature.is_some() {
-        astra_core::model_wire::thinking::configured_temperature(
-            route.request_body_overrides,
-            route.fixed_temperature,
-        )
-        .map_err(|message| {
-            astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
-        })?
+        configured_temperature
     } else {
         temperature
     };
@@ -7729,6 +7731,27 @@ mod tests {
                     None,
                 ),
                 (ThinkingProtocol::Unknown, ThinkingConfig::Off, Some(0.7)),
+                (
+                    ThinkingProtocol::EnableThinking,
+                    ThinkingConfig::Adaptive {
+                        effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                    },
+                    Some(0.7),
+                ),
+                (
+                    ThinkingProtocol::ThinkingObject,
+                    ThinkingConfig::Adaptive {
+                        effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                    },
+                    Some(0.7),
+                ),
+                (
+                    ThinkingProtocol::ReasoningEffort,
+                    ThinkingConfig::Adaptive {
+                        effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                    },
+                    Some(0.7),
+                ),
             ] {
                 let mut overrides = json!({"top_p":0.9,"presence_penalty":0.1});
                 if protocol == ThinkingProtocol::Unknown && thinking.is_enabled() {
@@ -7793,12 +7816,74 @@ mod tests {
                 }
                 if thinking.is_enabled() && protocol == ThinkingProtocol::Unknown {
                     assert_eq!(body["reasoning_effort"], "medium");
+                } else if protocol == ThinkingProtocol::ReasoningEffort {
+                    assert!(
+                        body.get("temperature").is_none(),
+                        "native effort restrictions remain authoritative"
+                    );
                 } else {
                     assert_eq!(body["temperature"], 0.7);
                 }
+                if protocol == ThinkingProtocol::EnableThinking {
+                    assert_eq!(body["enable_thinking"], true);
+                    assert!(body.get("reasoning_effort").is_none());
+                }
             }
         }
-        assert_eq!(captured.lock().unwrap().len(), 8);
+        assert_eq!(captured.lock().unwrap().len(), 14);
+        // Validate generic overrides even without fixed_temperature, in both
+        // public transports, before any request can reach the provider.
+        for streaming in [false, true] {
+            for invalid in [json!(-0.1), json!("NaN"), Value::Null] {
+                let route = OwnedLlmExecutionRoute {
+                    model_name: "fixture".into(),
+                    wire_model_name: None,
+                    api_key: "fixture".into(),
+                    base_url: base.clone(),
+                    provider: "openai".into(),
+                    thinking_capability: None,
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    header_overrides: HashMap::new(),
+                    request_body_overrides: json!({"temperature":invalid}).as_object().cloned(),
+                    completions_url_override: None,
+                    request_timeout: None,
+                };
+                let call = LlmCall {
+                    purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                    messages: &[],
+                    tools: &[],
+                    cache_capability: None,
+                    route: route.borrowed(),
+                    max_output_tokens: Some(128),
+                    temperature: None,
+                    has_fallback: false,
+                    thinking: &ThinkingConfig::Off,
+                };
+                let result = if streaming {
+                    call_llm_and_collect_with_stream_callback_and_no_tool_choice(
+                        call,
+                        LlmCancel::None,
+                        None,
+                        None,
+                    )
+                    .await
+                } else {
+                    call_llm_nonstream(
+                        global_llm_client(),
+                        call,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+                };
+                assert!(result.unwrap_err().message.contains("finite non-negative"));
+            }
+        }
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            14,
+            "invalid overrides must not reach provider I/O"
+        );
         server.abort();
     }
 
