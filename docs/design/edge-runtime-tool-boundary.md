@@ -87,6 +87,27 @@ Side-effecting tools require stronger checks than read-only tools.
 | External mutation | explicit API authority and approval policy. |
 | Credential access | deny by default unless dedicated secret provider authorizes scoped access. |
 
+### Workspace observation coordination
+
+Local shell and typed workspace writers must serialize each executor-owned
+pre/execute/post observation window across Astra processes without placing the
+coordination authority inside the tool-writable workspace.
+
+- Linux uses a root-owned sticky temporary root, a kernel-owned abstract Unix
+  socket name for each workspace generation, a per-UID integrity witness, and
+  inotify-backed sticky tamper evidence.
+- macOS uses the root-owned sticky `/private/tmp` root, a deterministic OFD
+  record-lock byte on that protected directory inode for each workspace
+  generation, a per-UID integrity witness, and kqueue vnode-backed sticky
+  tamper evidence. A short lock on the protected parent serializes record-lock
+  admission without serializing independent workspace generations.
+- Kernel ownership must end automatically when the holder process exits.
+  Replacing or unlinking a witness or workspace binding must not admit a second
+  generation, and any observed tamper revokes receipt authority permanently
+  for the active lease.
+- Platforms without an equivalent trusted namespace and tamper watch fail
+  closed before launching a local command.
+
 ## Result boundary
 
 Tool output crossing runtime boundaries must be enveloped:
