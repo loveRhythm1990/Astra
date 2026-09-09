@@ -385,24 +385,46 @@ esac
         self.assertIn("source_ref=" + revisions["base"], result.stdout)
 
     def test_idc_registry_credentials_are_required_before_build(self):
-        script = workflow_run_script(
-            ".github/workflows/build_push_to_idc.yml",
-            "Require IDC registry credentials",
-        )
-        for missing in ("IDC_REGISTRY_USERNAME", "IDC_REGISTRY_PASSWORD"):
-            with self.subTest(missing=missing):
-                env = {
-                    **os.environ,
-                    "IDC_REGISTRY_USERNAME": "release-user",
-                    "IDC_REGISTRY_PASSWORD": "release-password",
-                    missing: "",
-                }
-                result = subprocess.run(
-                    ["bash", "-c", script], env=env, capture_output=True, text=True
-                )
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("Missing required IDC credential: " + missing, result.stdout)
-                self.assertNotIn("release-password", result.stdout + result.stderr)
+        for workflow in ("build_push_to_idc.yml", "idc-container-candidates.yml"):
+            script = workflow_run_script(
+                f".github/workflows/{workflow}", "Require IDC registry credentials"
+            )
+            for missing in (None, "IDC_REGISTRY_USERNAME", "IDC_REGISTRY_PASSWORD"):
+                with self.subTest(workflow=workflow, missing=missing):
+                    env = {
+                        **os.environ,
+                        "IDC_REGISTRY_USERNAME": "release-user",
+                        "IDC_REGISTRY_PASSWORD": "release-password",
+                    }
+                    if missing:
+                        env[missing] = ""
+                    result = subprocess.run(
+                        ["bash", "-c", script], env=env, capture_output=True, text=True
+                    )
+                    if missing:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("Missing required IDC credential: " + missing, result.stdout)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("release-password", result.stdout + result.stderr)
+
+    def test_idc_environment_secrets_are_mapped_across_workflow_call(self):
+        caller = (ROOT / ".github/workflows/build_push_to_idc.yml").read_text()
+        reusable = (ROOT / ".github/workflows/idc-container-candidates.yml").read_text()
+        call = caller.split("\n  candidates:\n", 1)[1].split("\n  stage:\n", 1)[0]
+        declaration = reusable.split("\nenv:\n", 1)[0]
+        names = {"IDC_REGISTRY_USERNAME", "IDC_REGISTRY_PASSWORD"}
+        mapped = set(re.findall(r"^      (IDC_REGISTRY_\w+):", call, re.MULTILINE))
+        self.assertEqual(mapped, names)
+        self.assertNotIn("secrets: inherit", call)
+        for name in names:
+            # A name must be mapped as well as declared for GitHub to inject an
+            # Environment-only secret. A declaration alone still resolves empty.
+            self.assertIn(f"{name}: ${{{{ secrets.{name} }}}}", call)
+            self.assertIn(f"      {name}:\n        required: false", declaration)
+        for job in ("build", "smoke"):
+            block = reusable.split(f"\n  {job}:\n", 1)[1].split("\n  smoke:\n", 1)[0]
+            self.assertIn("    environment: idc-publication\n", block)
 
     def test_idc_rejects_non_main_controller(self):
         result, _ = self.run_idc_settings(GITHUB_REF="refs/heads/moi-dev")
@@ -469,29 +491,29 @@ esac
                                  "-p", "astra-edge", "--bin", "astra-edge"]
                     self.assertEqual(result.stdout.splitlines(), expected)
 
-    def test_release_tag_creation_requires_current_head(self):
+    def test_release_tag_creation_requires_default_branch_ancestry(self):
         script = ROOT / "scripts/reconcile-release-tag.sh"
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
+            remote = fixture / "remote"
+            checkout = fixture / "checkout"
+
+            def git(*args, cwd=remote):
+                return subprocess.run(
+                    ["git", *args], cwd=cwd, check=True,
+                    capture_output=True, text=True,
+                ).stdout.strip()
+
+            remote.mkdir()
+            git("init", "--initial-branch=main")
+            git("config", "user.name", "Release Test")
+            git("config", "user.email", "release-test@example.invalid")
+            git("-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "source")
+            source_sha = git("rev-parse", "HEAD")
+            git("clone", str(remote), str(checkout), cwd=fixture)
             fake_bin = fixture / "bin"
             fake_bin.mkdir()
             calls = fixture / "calls"
-            (fake_bin / "git").write_text(
-                """#!/bin/sh
-set -eu
-printf '%s\\n' "git $*" >> "${ASTRA_TEST_CALLS}"
-case "$*" in
-  "ls-remote origin refs/tags/"*) exit 0 ;;
-  "ls-remote origin refs/heads/main")
-    printf '%s\\trefs/heads/main\\n' "${ASTRA_TEST_DEFAULT_SHA}"
-    ;;
-  "fetch --no-tags origin refs/heads/main:refs/remotes/origin/main") exit 0 ;;
-  "merge-base --is-ancestor verified-source-sha new-main-sha") exit 0 ;;
-  *) exit 2 ;;
-esac
-""",
-                encoding="utf-8",
-            )
             (fake_bin / "gh").write_text(
                 """#!/bin/sh
 set -eu
@@ -503,54 +525,83 @@ case "$*" in
   "api --method POST repos/matrixorigin/Astra/git/refs "*) exit 0 ;;
   "api repos/matrixorigin/Astra/git/tags/owned-tag-object")
     printf '{"object":{"sha":"%s"},"message":"Astra v0.2.2\\\\n\\\\nRelease-Run: https://github.com/matrixorigin/Astra/actions/runs/123"}\\n' \
-      'verified-source-sha'
+      "${SOURCE_SHA}"
     ;;
   *) exit 2 ;;
 esac
 """,
                 encoding="utf-8",
             )
-            (fake_bin / "git").chmod(0o755)
             (fake_bin / "gh").chmod(0o755)
             env = {
                 **os.environ,
                 "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
                 "ASTRA_TEST_CALLS": str(calls),
-                "ASTRA_TEST_DEFAULT_SHA": "verified-source-sha",
-                "SOURCE_SHA": "verified-source-sha",
+                "SOURCE_SHA": source_sha,
                 "GITHUB_SERVER_URL": "https://github.com",
             }
-            result = subprocess.run(
-                [
-                    str(script),
-                    "create",
-                    "matrixorigin/Astra",
-                    "v0.2.2",
-                    "verified-source-sha",
-                    "123",
-                    "main",
-                    "",
-                ],
-                env=env,
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, "owned-tag-object\n")
-            recorded_calls = calls.read_text(encoding="utf-8")
-            self.assertIn("gh api --method POST repos/matrixorigin/Astra/git/tags", recorded_calls)
-            self.assertIn("gh api --method POST repos/matrixorigin/Astra/git/refs", recorded_calls)
 
-            calls.write_text("")
-            stale = subprocess.run(
-                [str(script), "create", "matrixorigin/Astra", "v0.2.2",
-                 "verified-source-sha", "123", "main", ""],
-                env={**env, "ASTRA_TEST_DEFAULT_SHA": "new-main-sha"},
-                capture_output=True, text=True,
-            )
-            self.assertNotEqual(stale.returncode, 0)
-            self.assertIn("Start a new normal release run", stale.stderr)
-            self.assertNotIn("gh ", calls.read_text())
+            def create(selected_source=source_sha):
+                calls.write_text("")
+                return subprocess.run(
+                    [str(script), "create", "matrixorigin/Astra", "v0.2.2",
+                     selected_source, "123", "main", ""],
+                    cwd=checkout, env=env, capture_output=True, text=True,
+                )
+
+            for advanced in (False, True):
+                with self.subTest(advanced=advanced):
+                    if advanced:
+                        git("-c", "commit.gpgsign=false", "commit", "--allow-empty",
+                            "-m", "main advances while candidates build")
+                    result = create()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "owned-tag-object\n")
+                    recorded = calls.read_text()
+                    self.assertIn(f"-f object={source_sha}", recorded)
+                    self.assertIn("gh api --method POST repos/matrixorigin/Astra/git/refs", recorded)
+
+            with self.subTest(source="missing"):
+                result = create("0" * 40)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("is not present as a commit", result.stderr)
+                self.assertEqual(calls.read_text(), "")
+
+            with self.subTest(source="ahead of main"):
+                git("checkout", "--detach", "FETCH_HEAD", cwd=checkout)
+                git("-c", "user.name=Release Test", "-c",
+                    "user.email=release-test@example.invalid", "-c",
+                    "commit.gpgsign=false", "commit", "--allow-empty",
+                    "-m", "unmerged source", cwd=checkout)
+                result = create(git("rev-parse", "HEAD", cwd=checkout))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("is no longer reachable from main", result.stderr)
+                self.assertEqual(calls.read_text(), "")
+
+            with self.subTest(history="shallow"):
+                shallow_file = checkout / ".git" / "shallow"
+                shallow_file.write_text(source_sha + "\n")
+                try:
+                    result = create()
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("requires a complete checkout", result.stderr)
+                    self.assertEqual(calls.read_text(), "")
+                finally:
+                    shallow_file.unlink()
+
+            git("checkout", "--orphan", "replacement")
+            git("-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "unrelated history")
+            git("branch", "-f", "main", "HEAD")
+            result = create()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("is no longer reachable from main", result.stderr)
+            self.assertEqual(calls.read_text(), "")
+
+            git("branch", "-D", "main")
+            result = create()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Could not fetch", result.stderr)
+            self.assertEqual(calls.read_text(), "")
 
     def test_release_tag_creation_is_idempotent_for_the_same_run(self):
         script = ROOT / "scripts/reconcile-release-tag.sh"
