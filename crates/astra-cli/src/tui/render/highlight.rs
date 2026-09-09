@@ -71,12 +71,12 @@ struct Palette {
 fn palette(theme: &Theme) -> Palette {
     // Reuse the selected UI profile, including plain and ANSI fallbacks.
     Palette {
-        keyword: theme.md_heading,
-        type_name: theme.md_code,
+        keyword: theme.gutter,
+        type_name: theme.accent,
         string: theme.success,
         comment: theme.dim,
         number: theme.warn,
-        punctuation: theme.dim,
+        punctuation: theme.fg,
     }
 }
 
@@ -487,15 +487,18 @@ mod tests {
             Theme::dark_ansi(),
             Theme::light_256(),
             Theme::dark_256(),
+            Theme::terminal_default(),
             Theme::plain(),
         ] {
             let line = highlight_line(
-                "let name = \"text\"; // note",
+                "let name: String = \"text\"; // note",
                 Language::Rust,
                 palette(&theme),
             );
             let keyword = line.spans.iter().find(|s| s.content == "let").unwrap();
-            assert_eq!(keyword.style.fg, Some(theme.md_heading));
+            let type_name = line.spans.iter().find(|s| s.content == "String").unwrap();
+            let punctuation = line.spans.iter().find(|s| s.content == ";").unwrap();
+            let comment = line.spans.iter().find(|s| s.content == "// note").unwrap();
             let string = line
                 .spans
                 .iter()
@@ -508,6 +511,9 @@ mod tests {
                         .iter()
                         .all(|s| s.style.fg.is_none() || s.style.fg == Some(Color::Reset))
                 );
+            } else {
+                assert_ne!(keyword.style.fg, type_name.style.fg, "{theme:?}");
+                assert_ne!(punctuation.style.fg, comment.style.fg, "{theme:?}");
             }
         }
     }

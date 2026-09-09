@@ -407,11 +407,15 @@ impl Theme {
     /// Select a preset from known terminal colours and capabilities. Without
     /// background information, inherit terminal colours instead of guessing dark.
     pub fn auto() -> Self {
-        use super::terminal_palette::{StdoutColorLevel, default_bg, stdout_color_level};
-        let level = if supports_truecolor() {
+        Self::auto_for_stream(supports_color::Stream::Stdout)
+    }
+
+    fn auto_for_stream(stream: supports_color::Stream) -> Self {
+        use super::terminal_palette::{StdoutColorLevel, color_level, default_bg};
+        let level = if supports_truecolor(stream) {
             StdoutColorLevel::TrueColor
         } else {
-            stdout_color_level()
+            color_level(stream)
         };
         Self::auto_for(default_bg(), level)
     }
@@ -505,8 +509,8 @@ impl Theme {
     }
 }
 
-fn supports_truecolor() -> bool {
-    if super::terminal_palette::stdout_color_level()
+fn supports_truecolor(stream: supports_color::Stream) -> bool {
+    if super::terminal_palette::color_level(stream)
         == super::terminal_palette::StdoutColorLevel::TrueColor
     {
         return true;
@@ -541,17 +545,29 @@ static THEME: OnceLock<Theme> = OnceLock::new();
 /// Process-wide theme, chosen once at first access. Tests that need a
 /// specific theme should call [`set_for_tests`] *before* any `current()`.
 pub(crate) fn current() -> &'static Theme {
-    THEME.get_or_init(|| {
-        if std::env::var_os("NO_COLOR").is_some() {
-            return Theme::plain();
-        }
-        let profile = std::env::var("ASTRA_TUI_THEME")
-            .ok()
-            .as_deref()
-            .and_then(ThemeProfile::parse)
-            .unwrap_or(ThemeProfile::Auto);
-        Theme::for_profile(profile)
-    })
+    THEME.get_or_init(|| theme_for_stream(supports_color::Stream::Stdout))
+}
+
+/// Line-oriented CLI output uses stderr, which may have different capabilities
+/// from redirected stdout. Both streams share the same profiles and color hints.
+pub(crate) fn current_stderr() -> &'static Theme {
+    static STDERR_THEME: OnceLock<Theme> = OnceLock::new();
+    STDERR_THEME.get_or_init(|| theme_for_stream(supports_color::Stream::Stderr))
+}
+
+fn theme_for_stream(stream: supports_color::Stream) -> Theme {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return Theme::plain();
+    }
+    let profile = std::env::var("ASTRA_TUI_THEME")
+        .ok()
+        .as_deref()
+        .and_then(ThemeProfile::parse)
+        .unwrap_or(ThemeProfile::Auto);
+    match profile {
+        ThemeProfile::Auto => Theme::auto_for_stream(stream),
+        _ => Theme::for_profile(profile),
+    }
 }
 
 #[cfg(test)]
@@ -827,10 +843,18 @@ mod tests {
                     assert_ne!(style.bg, Some(Color::Reset));
                 }
             }
-            let code =
-                crate::tui::render::highlight::highlight_code_to_lines("let x = 42;", "rust");
+            let code = crate::tui::render::highlight::highlight_code_to_lines(
+                "let x: String = 42;",
+                "rust",
+            );
             let keyword = code[0].spans.iter().find(|s| s.content == "let").unwrap();
-            assert_eq!(keyword.style.fg, Some(theme.md_heading));
+            let type_name = code[0]
+                .spans
+                .iter()
+                .find(|s| s.content == "String")
+                .unwrap();
+            assert_eq!(keyword.style.fg, Some(theme.gutter));
+            assert_eq!(type_name.style.fg, Some(theme.accent));
             return;
         }
         let test = format!(
@@ -859,9 +883,7 @@ mod tests {
                 .env_remove("ASTRA_TERMINAL_BG")
                 .env_remove("ASTRA_TERMINAL_FG");
             if let Some(bg) = bg {
-                child
-                    .env("ASTRA_TERMINAL_BG", bg)
-                    .env("ASTRA_TERMINAL_FG", "#808080");
+                child.env("ASTRA_TERMINAL_BG", bg);
             }
             if no_color {
                 child.env("NO_COLOR", "1");
@@ -873,6 +895,53 @@ mod tests {
                 "{output:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_theme_uses_its_own_terminal_capabilities() {
+        const CASE: &str = "ASTRA_TEST_STDERR_THEME";
+        if std::env::var_os(CASE).is_some() {
+            use std::io::IsTerminal;
+            assert!(!std::io::stdout().is_terminal());
+            assert!(std::io::stderr().is_terminal());
+            let stdout = current();
+            let stderr = super::current_stderr();
+            println!("stdout={stdout:?}, stderr={stderr:?}");
+            assert!(stdout.is_light && stderr.is_light);
+            assert!(!matches!(stdout.accent, Color::Indexed(_)));
+            assert!(matches!(stderr.accent, Color::Indexed(_)));
+            return;
+        }
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let test = format!(
+            "{}::stderr_theme_uses_its_own_terminal_capabilities",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env(CASE, "1")
+            .env("TERM", "xterm-256color")
+            .env("ASTRA_TUI_THEME", "auto")
+            .env("ASTRA_TERMINAL_BG", "#ffffff")
+            .env_remove("ASTRA_TERMINAL_FG")
+            .env_remove("COLORFGBG")
+            .env_remove("COLORTERM")
+            .env_remove("TERM_PROGRAM")
+            .env_remove("NO_COLOR")
+            .env_remove("FORCE_COLOR")
+            .env_remove("CLICOLOR_FORCE")
+            .env_remove("CLICOLOR")
+            .env_remove("CI")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::fs::File::from(pty.slave))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stderr capability test failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 
     #[test]

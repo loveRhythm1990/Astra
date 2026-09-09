@@ -94,7 +94,7 @@ mod wrapping;
 
 // Shared terminal palette for CLI output rendered outside the TUI.
 pub(crate) use custom_terminal::to_crossterm_color;
-pub(crate) use theme::current as current_theme;
+pub(crate) use theme::current_stderr as current_stderr_theme;
 
 pub(crate) use event_loop::{can_run_tui, run_tui_session as run_tui};
 
