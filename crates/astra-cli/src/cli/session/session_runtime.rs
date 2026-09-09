@@ -3469,6 +3469,66 @@ mod tests {
     }
 
     #[test]
+    fn banner_keeps_colour_without_background_hints() {
+        const CASE: &str = "ASTRA_TEST_BANNER_COLOURS";
+        if std::env::var_os(CASE).is_none() {
+            let test = format!(
+                "{}::banner_keeps_colour_without_background_hints",
+                module_path!().split_once("::").unwrap().1
+            );
+            for profile in ["auto", "light", "dark", "plain", "no-color"] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args(["--exact", &test, "--nocapture"])
+                    .env(CASE, profile)
+                    .env(
+                        "ASTRA_TUI_THEME",
+                        if profile == "no-color" {
+                            "auto"
+                        } else {
+                            profile
+                        },
+                    )
+                    .env_remove("NO_COLOR")
+                    .env_remove("COLORFGBG")
+                    .env_remove("ASTRA_TERMINAL_FG")
+                    .env_remove("ASTRA_TERMINAL_BG");
+                if profile == "no-color" {
+                    child.env("NO_COLOR", "1");
+                }
+                let output = child.output().unwrap();
+                assert!(output.status.success(), "{profile}: {output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                    "{output:?}"
+                );
+            }
+            return;
+        }
+        let profile = std::env::var(CASE).unwrap();
+        let uncoloured = matches!(profile.as_str(), "plain" | "no-color");
+        let mut colours = Vec::new();
+        for role in [
+            BannerTextStyle::BrandBold,
+            BannerTextStyle::AccentBold,
+            BannerTextStyle::WarningBold,
+        ] {
+            let output = style_banner_text("Astra", role, true);
+            let mut parser = vt100::Parser::new(2, 20, 0);
+            parser.process(output.as_bytes());
+            assert_eq!(parser.screen().contents(), "Astra");
+            let cell = parser.screen().cell(0, 0).unwrap();
+            assert_eq!(cell.bgcolor(), vt100::Color::Default);
+            assert_eq!(cell.fgcolor() == vt100::Color::Default, uncoloured);
+            colours.push(cell.fgcolor());
+        }
+        if !uncoloured {
+            assert_ne!(colours[0], colours[1]);
+            assert_ne!(colours[1], colours[2]);
+        }
+    }
+
+    #[test]
     fn banner_body_preserves_terminal_foreground() {
         let output = style_banner_text("Tips", BannerTextStyle::Bold, true);
         let mut parser = vt100::Parser::new(2, 20, 0);

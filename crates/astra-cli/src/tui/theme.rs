@@ -119,7 +119,7 @@ impl Theme {
             is_light: false,
             fg: Color::Reset,
             dim: Color::DarkGray,
-            accent: Color::Rgb(108, 169, 255),
+            accent: Color::Rgb(0, 215, 215),
             // A low-saturation slate surface keeps the composer and selected
             // rows legible without turning the TUI into a stack of cards.
             selected_bg: Color::Rgb(31, 42, 55),
@@ -167,7 +167,7 @@ impl Theme {
             is_light: true,
             fg: Color::Reset,
             dim: Color::Rgb(90, 102, 115),
-            accent: Color::Rgb(39, 98, 149),
+            accent: Color::Rgb(0, 107, 117),
             selected_bg: Color::Rgb(226, 235, 243),
             selected_fg: Color::Rgb(23, 34, 45),
             gutter: Color::Rgb(126, 55, 190),
@@ -259,7 +259,7 @@ impl Theme {
     pub fn dark_ansi() -> Self {
         let mut theme = Self::dark();
         theme.dim = Color::DarkGray;
-        theme.accent = Color::LightBlue;
+        theme.accent = Color::Cyan;
         theme.selected_bg = Color::DarkGray;
         theme.selected_fg = Color::White;
         theme.gutter = Color::LightMagenta;
@@ -324,6 +324,37 @@ impl Theme {
         theme.stall_warn = Color::Yellow;
         theme.stall_error = Color::Red;
         theme
+    }
+
+    /// Background-independent colour: use the user's ANSI accents, but leave
+    /// ordinary text and all surfaces on the terminal's default colours.
+    /// An unknown background is not a request to disable colour.
+    pub fn terminal_default() -> Self {
+        Self {
+            dim: Color::DarkGray,
+            path_dim: Color::DarkGray,
+            gutter_frozen: Color::DarkGray,
+            diff_context: Color::DarkGray,
+            accent: Color::Cyan,
+            gutter: Color::Magenta,
+            success: Color::Green,
+            warn: Color::Yellow,
+            error: Color::Red,
+            quote: Color::Green,
+            link: Color::Cyan,
+            command: Color::Cyan,
+            md_heading: Color::Cyan,
+            md_code: Color::Magenta,
+            md_link: Color::Cyan,
+            md_blockquote: Color::Green,
+            md_list_marker: Color::Cyan,
+            diff_add_fg: Color::Green,
+            diff_del_fg: Color::Red,
+            diff_hunk: Color::Cyan,
+            stall_warn: Color::Yellow,
+            stall_error: Color::Red,
+            ..Self::plain()
+        }
     }
 
     /// Honor the `NO_COLOR` convention. The structure, labels, emphasis and
@@ -391,7 +422,7 @@ impl Theme {
     ) -> Self {
         use super::terminal_palette::StdoutColorLevel;
         let Some(background) = background else {
-            return Self::plain();
+            return Self::terminal_default();
         };
         let light = super::color::is_light(background);
         match (light, level) {
@@ -614,7 +645,7 @@ mod tests {
         let (er, eg, eb) = color_to_rgb(theme.error);
 
         assert!(
-            ab > ar && ab > ag,
+            ab > ar && ag > ar,
             "accent should read as a cool focus color: {theme:?}"
         );
         assert!(
@@ -729,8 +760,24 @@ mod tests {
             StdoutColorLevel::Unknown,
         ] {
             let theme = Theme::auto_for(None, level);
-            assert_eq!(theme, Theme::plain());
-            assert_eq!(theme.accent_dim(), Color::Reset);
+            assert_eq!(theme.fg, Color::Reset);
+            assert_eq!(theme.selected_bg, Color::Reset);
+            assert_eq!(theme.selected_fg, Color::Reset);
+            assert_eq!(theme.diff_add_bg, Color::Reset);
+            assert_eq!(theme.diff_del_bg, Color::Reset);
+            for color in [
+                theme.accent,
+                theme.gutter,
+                theme.warn,
+                theme.success,
+                theme.error,
+            ] {
+                assert_ne!(color, Color::Reset);
+                assert!(!matches!(color, Color::Rgb(..)));
+            }
+            assert_ne!(theme.accent, theme.gutter);
+            assert_ne!(theme.accent, theme.warn);
+            assert_eq!(theme.accent_dim(), theme.accent);
         }
     }
 
@@ -762,6 +809,7 @@ mod tests {
             let theme = current();
             match expected.as_str() {
                 "plain" => assert_eq!(*theme, Theme::plain()),
+                "terminal" => assert_eq!(*theme, Theme::terminal_default()),
                 "light" => assert!(theme.is_light),
                 "dark" => assert!(!theme.is_light && theme.accent != Color::Reset),
                 _ => panic!("unexpected test case"),
@@ -771,7 +819,7 @@ mod tests {
                 crate::tui::style::composer_surface_style(),
                 crate::tui::style::queue_panel_style(),
             ] {
-                if expected == "plain" {
+                if matches!(expected.as_str(), "plain" | "terminal") {
                     assert!(style.bg.is_none() || style.bg == Some(Color::Reset));
                     assert!(style.fg.is_none() || style.fg == Some(Color::Reset));
                 } else {
@@ -790,7 +838,7 @@ mod tests {
             module_path!().split_once("::").unwrap().1
         );
         for (profile, bg, no_color, expected) in [
-            ("auto", None, false, "plain"),
+            ("auto", None, false, "terminal"),
             ("auto", Some("#ffffff"), false, "light"),
             ("auto", Some("#11161c"), false, "dark"),
             ("light", None, false, "light"),

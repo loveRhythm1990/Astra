@@ -35,7 +35,7 @@ fn surface_style(
     terminal_bg: Option<(u8, u8, u8)>,
     tint: SurfaceTint,
 ) -> Style {
-    // Plain/unknown themes must stay uncoloured even when environment hints
+    // Plain/unknown-background surfaces must stay transparent even when hints
     // are present. Explicit theme selection wins over conflicting hints.
     if theme.selected_bg == Color::Reset {
         return Style::default();
@@ -148,12 +148,11 @@ mod contrast_tests {
 
     #[test]
     fn plain_surfaces_ignore_background_hints() {
-        for background in [None, Some((255, 255, 255)), Some((17, 22, 28))] {
-            for tint in [user_message_rgb, composer_surface_rgb, queue_panel_rgb] {
-                assert_eq!(
-                    surface_style(&Theme::plain(), background, tint),
-                    Style::default()
-                );
+        for theme in [Theme::plain(), Theme::terminal_default()] {
+            for background in [None, Some((255, 255, 255)), Some((17, 22, 28))] {
+                for tint in [user_message_rgb, composer_surface_rgb, queue_panel_rgb] {
+                    assert_eq!(surface_style(&theme, background, tint), Style::default());
+                }
             }
         }
     }
