@@ -220,9 +220,13 @@ jobs:
           cargo clippy --locked --manifest-path Cargo.toml -p astra-tools
           --all-targets -- -D warnings
       - name: Test macOS workspace coordination invariants
+        # Several invariants launch re-exec lock contenders while fingerprint
+        # probes deliberately have a short wall-clock deadline. Keep the module
+        # serial on shared CI hosts; the contender test supplies explicit
+        # cross-process concurrency without starving unrelated probes.
         run: >-
           cargo test --locked --manifest-path Cargo.toml -p astra-tools
-          workspace_observation::tests::
+          workspace_observation::tests:: -- --test-threads=1
       - name: Test macOS CLI Bash execution
         run: >-
           cargo test --locked --manifest-path Cargo.toml -p astra-cli
