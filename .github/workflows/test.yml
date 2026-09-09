@@ -219,6 +219,18 @@ jobs:
         run: >-
           cargo clippy --locked --manifest-path Cargo.toml -p astra-tools
           --all-targets -- -D warnings
+      - name: Initialize system Git for bounded observation probes
+        timeout-minutes: 1
+        # Checkout uses Homebrew Git, but the hardened observer selects
+        # /usr/bin/git with a cleared environment. Initialize that executable
+        # before its first use under the production two-second probe deadline.
+        # Keep the timing visible so runner startup failures are diagnosable.
+        run: |
+          time /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent LANG=C LC_ALL=C \
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+            GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 \
+            /usr/bin/git -C "$GITHUB_WORKSPACE" -c core.fsmonitor=false \
+            -c core.untrackedCache=false rev-parse --show-toplevel
       - name: Test macOS workspace coordination invariants
         # Several invariants launch re-exec lock contenders while fingerprint
         # probes deliberately have a short wall-clock deadline. Keep the module
