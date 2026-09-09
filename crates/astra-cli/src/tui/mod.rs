@@ -83,6 +83,7 @@ mod task_list;
 mod task_status;
 mod terminal;
 mod terminal_palette;
+mod terminal_startup;
 mod theme;
 
 mod timeline;

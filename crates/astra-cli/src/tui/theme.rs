@@ -99,7 +99,7 @@ pub(crate) enum ThemeProfile {
 }
 
 impl ThemeProfile {
-    fn parse(value: &str) -> Option<Self> {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "auto" => Some(Self::Auto),
             "dark" => Some(Self::Dark),

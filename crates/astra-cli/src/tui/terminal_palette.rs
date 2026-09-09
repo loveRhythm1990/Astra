@@ -63,11 +63,28 @@ pub(crate) struct TerminalColors {
 }
 
 pub(crate) fn default_fg() -> Option<(u8, u8, u8)> {
-    DEFAULT_COLORS.get_or_init(env_default_colors).fg
+    DEFAULT_COLORS
+        .get_or_init(|| resolve_env_colors(TerminalColors::default()))
+        .fg
 }
 
 pub(crate) fn default_bg() -> Option<(u8, u8, u8)> {
-    DEFAULT_COLORS.get_or_init(env_default_colors).bg
+    DEFAULT_COLORS
+        .get_or_init(|| resolve_env_colors(TerminalColors::default()))
+        .bg
+}
+
+/// Called by interactive startup before the banner or theme is rendered.
+/// Getters never perform terminal I/O, and late replies cannot change the theme.
+pub(crate) fn initialize_default_colors(queried: TerminalColors) {
+    DEFAULT_COLORS.get_or_init(|| resolve_env_colors(queried));
+}
+
+pub(crate) fn has_background_override() -> bool {
+    std::env::var("ASTRA_TERMINAL_BG")
+        .ok()
+        .and_then(|value| parse_color_spec(value.trim()))
+        .is_some()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,21 +198,28 @@ fn parse_x_color_component(part: &str) -> Option<u8> {
     Some(((value as u32 * 255 + max / 2) / max) as u8)
 }
 
-fn env_default_colors() -> TerminalColors {
+fn resolve_env_colors(queried: TerminalColors) -> TerminalColors {
     let fg = std::env::var("ASTRA_TERMINAL_FG").ok();
     let bg = std::env::var("ASTRA_TERMINAL_BG").ok();
     let hint = std::env::var("COLORFGBG").ok();
-    resolve_colors(fg.as_deref(), bg.as_deref(), hint.as_deref())
+    resolve_colors(fg.as_deref(), bg.as_deref(), queried, hint.as_deref())
 }
 
-fn resolve_colors(fg: Option<&str>, bg: Option<&str>, hint: Option<&str>) -> TerminalColors {
+fn resolve_colors(
+    fg: Option<&str>,
+    bg: Option<&str>,
+    queried: TerminalColors,
+    hint: Option<&str>,
+) -> TerminalColors {
     let hint = hint.and_then(|value| parse_colorfgbg(value.trim()));
     TerminalColors {
         fg: fg
             .and_then(|value| parse_color_spec(value.trim()))
+            .or(queried.fg)
             .or(hint.map(|colors| colors.fg)),
         bg: bg
             .and_then(|value| parse_color_spec(value.trim()))
+            .or(queried.bg)
             .or(hint.map(|colors| colors.bg)),
     }
 }
@@ -316,26 +340,70 @@ mod tests {
     }
 
     #[test]
+    fn manual_colors_override_queries_and_queries_override_environment_hints() {
+        let queried = super::TerminalColors {
+            fg: Some((1, 2, 3)),
+            bg: Some((255, 255, 255)),
+        };
+        let resolved = super::resolve_colors(Some("#102030"), None, queried, Some("15;0"));
+        assert_eq!(resolved.fg, Some((16, 32, 48)));
+        assert_eq!(resolved.bg, Some((255, 255, 255)));
+        let resolved = super::resolve_colors(None, Some("#000000"), queried, Some("0;15"));
+        assert_eq!(resolved.fg, Some((1, 2, 3)));
+        assert_eq!(resolved.bg, Some((0, 0, 0)));
+    }
+
+    #[test]
+    fn a_background_response_or_override_is_sufficient_without_a_foreground() {
+        let queried = super::TerminalColors {
+            fg: None,
+            bg: Some((255, 255, 255)),
+        };
+        assert_eq!(super::resolve_colors(None, None, queried, None), queried);
+        assert_eq!(
+            super::resolve_colors(
+                None,
+                Some("#ffffff"),
+                super::TerminalColors::default(),
+                None
+            ),
+            queried,
+        );
+    }
+
+    #[test]
+    fn unavailable_or_malformed_response_falls_back_per_channel() {
+        let queried = super::TerminalColors::default();
+        assert_eq!(super::resolve_colors(None, None, queried, None), queried);
+        let colors = super::resolve_colors(Some("bad"), Some("bad"), queried, Some("0;15"));
+        assert_eq!(colors.fg, Some((0, 0, 0)));
+        assert_eq!(colors.bg, Some((255, 255, 255)));
+        assert_eq!(parse_colorfgbg("0;default;15"), parse_colorfgbg("0;15"));
+    }
+
+    #[test]
     fn manual_colors_override_environment_hints_per_channel() {
-        let resolved = super::resolve_colors(Some("#102030"), None, Some("15;0"));
+        let queried = super::TerminalColors::default();
+        let resolved = super::resolve_colors(Some("#102030"), None, queried, Some("15;0"));
         assert_eq!(resolved.fg, Some((16, 32, 48)));
         assert_eq!(resolved.bg, Some((0, 0, 0)));
-        let resolved = super::resolve_colors(None, Some("#000000"), Some("0;15"));
+        let resolved = super::resolve_colors(None, Some("#000000"), queried, Some("0;15"));
         assert_eq!(resolved.fg, Some((0, 0, 0)));
         assert_eq!(resolved.bg, Some((0, 0, 0)));
     }
 
     #[test]
     fn manual_colors_work_independently_without_environment_hints() {
+        let queried = super::TerminalColors::default();
         assert_eq!(
-            super::resolve_colors(None, Some("#ffffff"), None),
+            super::resolve_colors(None, Some("#ffffff"), queried, None),
             super::TerminalColors {
                 fg: None,
                 bg: Some((255, 255, 255))
             },
         );
         assert_eq!(
-            super::resolve_colors(Some("#102030"), None, None),
+            super::resolve_colors(Some("#102030"), None, queried, None),
             super::TerminalColors {
                 fg: Some((16, 32, 48)),
                 bg: None
@@ -345,11 +413,9 @@ mod tests {
 
     #[test]
     fn malformed_overrides_fall_back_to_environment_hints() {
-        assert_eq!(
-            super::resolve_colors(None, None, None),
-            super::TerminalColors::default()
-        );
-        let colors = super::resolve_colors(Some("bad"), Some("bad"), Some("0;15"));
+        let queried = super::TerminalColors::default();
+        assert_eq!(super::resolve_colors(None, None, queried, None), queried);
+        let colors = super::resolve_colors(Some("bad"), Some("bad"), queried, Some("0;15"));
         assert_eq!(colors.fg, Some((0, 0, 0)));
         assert_eq!(colors.bg, Some((255, 255, 255)));
         assert_eq!(parse_colorfgbg("0;default;15"), parse_colorfgbg("0;15"));
