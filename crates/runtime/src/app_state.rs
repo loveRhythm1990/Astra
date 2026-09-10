@@ -1411,6 +1411,14 @@ mod tests {
                 let mut buf = vec![0u8; 4096];
                 let n = socket.read(&mut buf).await.unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(
+                    req.to_ascii_lowercase().contains("x-user-id: user-3\r\n"),
+                    "authenticated owner must be projected to Memoria scope: {req}"
+                );
+                assert!(
+                    !req.contains("\"user_id\""),
+                    "transport identity must not leak into the Memoria domain body: {req}"
+                );
                 let method = req
                     .lines()
                     .next()
@@ -1436,7 +1444,11 @@ mod tests {
             .forward(
                 reqwest::Method::PUT,
                 "/v1/memories/test-id/correct",
-                serde_json::json!({"new_content": "x", "reason": "y"}),
+                serde_json::json!({
+                    "new_content": "x",
+                    "reason": "y",
+                    "user_id": "user-3"
+                }),
             )
             .await
             .expect("forward success");
