@@ -1524,6 +1524,13 @@ impl MemoriaSettings {
         self.master_key.as_ref().is_some_and(|k| !k.is_empty())
     }
 
+    /// Select the trusted self-hosted credential authority. A configured
+    /// website means end-user scoped credentials own consent even if an
+    /// operator also configured a master key for administrative duties.
+    pub fn uses_self_hosted_master_key(&self) -> bool {
+        self.web_url.is_none() && self.is_configured()
+    }
+
     /// `Authorization: Bearer <key>` header value, or `None` if unconfigured.
     pub fn bearer_token(&self) -> Option<String> {
         self.master_key
@@ -1665,6 +1672,25 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn memoria_user_authority_distinguishes_self_hosted_from_scoped_login() {
+        let mut settings = MemoriaSettings {
+            base_url: "http://memoria.local".into(),
+            master_key: Some("configured".into()),
+            issuer: None,
+            web_url: None,
+            legacy_issuer: None,
+        };
+        assert!(settings.uses_self_hosted_master_key());
+
+        settings.web_url = Some("https://accounts.example.test".into());
+        assert!(!settings.uses_self_hosted_master_key());
+
+        settings.web_url = None;
+        settings.master_key = None;
+        assert!(!settings.uses_self_hosted_master_key());
+    }
 
     #[test]
     fn explicit_env_config_source_is_exact_and_fail_closed() {

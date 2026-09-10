@@ -213,6 +213,10 @@ pub struct AppState {
     /// resolve a per-user credential instead of falling back to the
     /// server-wide forwarder merely because one is configured.
     pub(crate) memoria_forwarder_is_override: bool,
+    /// Trusted self-hosted deployments explicitly use the configured master
+    /// key for authenticated Astra users. Hosted/BYOK deployments leave this
+    /// false and resolve per-user scoped credentials.
+    pub(crate) memoria_user_access_uses_master_key: bool,
     memoria_health_cache: Arc<std::sync::RwLock<CachedMemoriaHealth>>,
     memoria_health_refresh: Arc<tokio::sync::Mutex<()>>,
     pub shared_pool: Option<SharedPool>,
@@ -333,6 +337,7 @@ impl AppState {
             memoria_master_key: default_memoria.master_key,
             memoria_forwarder: Arc::new(NoopMemoriaForwarder),
             memoria_forwarder_is_override: false,
+            memoria_user_access_uses_master_key: false,
             memoria_health_cache: Arc::new(std::sync::RwLock::new(CachedMemoriaHealth::new(
                 MemoriaHealth::Disabled,
             ))),
@@ -426,6 +431,7 @@ impl AppState {
             Arc::new(ReqwestMemoriaForwarder::new(base_url.clone(), key))
         };
         self.memoria_forwarder_is_override = false;
+        self.memoria_user_access_uses_master_key = false;
         *astra_core::sync_poison::recover_rwlock_write(&self.memoria_health_cache) =
             CachedMemoriaHealth::new(
                 if master_key.as_deref().is_some_and(|key| !key.is_empty()) {
@@ -436,6 +442,15 @@ impl AppState {
             );
         self.memoria_base_url = base_url;
         self.memoria_master_key = master_key;
+        self
+    }
+
+    pub fn with_self_hosted_memoria_user_access(mut self, enabled: bool) -> Self {
+        self.memoria_user_access_uses_master_key = enabled
+            && self
+                .memoria_master_key
+                .as_deref()
+                .is_some_and(|key| !key.is_empty());
         self
     }
 
@@ -996,14 +1011,19 @@ impl ReqwestMemoriaForwarder {
         method: reqwest::Method,
         endpoint: &str,
         body: &serde_json::Value,
-    ) -> reqwest::RequestBuilder {
+    ) -> Result<reqwest::RequestBuilder, String> {
         let url = format!("{}{}", self.base_url, endpoint);
         let mut payload = body.clone();
-        let authenticated_user_id = payload
+        let object = payload
             .as_object_mut()
-            .and_then(|object| object.remove("user_id"))
+            .ok_or_else(|| "Memoria master-key request requires a JSON object body".to_string())?;
+        let authenticated_user_id = object
+            .remove("user_id")
             .and_then(|value| value.as_str().map(str::trim).map(str::to_string))
-            .filter(|user_id| !user_id.is_empty());
+            .filter(|user_id| !user_id.is_empty())
+            .ok_or_else(|| {
+                "Memoria master-key request requires an authenticated owner".to_string()
+            })?;
         let request = self
             .client
             .request(method.clone(), url)
@@ -1022,10 +1042,7 @@ impl ReqwestMemoriaForwarder {
         // storage scope from X-User-Id, not from arbitrary request fields.
         // Project the authenticated principal into the transport header, and
         // keep that transport-only identity out of endpoint domain payloads.
-        match authenticated_user_id {
-            Some(user_id) => request.header("X-User-Id", user_id),
-            _ => request,
-        }
+        Ok(request.header("X-User-Id", authenticated_user_id))
     }
 
     async fn bounded_error_body(mut response: reqwest::Response, limit: usize) -> String {
@@ -1050,7 +1067,7 @@ impl MemoriaForwarder for ReqwestMemoriaForwarder {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let resp = self
-            .request_builder(method, endpoint, &body)
+            .request_builder(method, endpoint, &body)?
             .send()
             .await
             .map_err(|e| format!("Memoria request failed: {e}"))?;
@@ -1277,8 +1294,13 @@ mod tests {
             .request_builder(
                 reqwest::Method::PUT,
                 "/v1/memories/test-id/correct",
-                &serde_json::json!({"new_content": "x", "reason": "y"}),
+                &serde_json::json!({
+                    "new_content": "x",
+                    "reason": "y",
+                    "user_id": "user-3"
+                }),
             )
+            .expect("authenticated owner")
             .build()
             .expect("request builder");
 
@@ -1294,6 +1316,21 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer test-key")
         );
+        assert_eq!(
+            request
+                .headers()
+                .get("X-User-Id")
+                .and_then(|value| value.to_str().ok()),
+            Some("user-3")
+        );
+        let payload: serde_json::Value = serde_json::from_slice(
+            request
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .expect("JSON request body"),
+        )
+        .unwrap();
+        assert!(payload.get("user_id").is_none());
     }
 
     #[test]
@@ -1316,6 +1353,7 @@ mod tests {
                     "user_id": "user-3"
                 }),
             )
+            .expect("authenticated owner")
             .build()
             .expect("request builder");
 
@@ -1336,6 +1374,30 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("user-3")
         );
+    }
+
+    #[test]
+    fn memoria_forwarder_rejects_missing_or_non_object_owner_scope() {
+        let forwarder = ReqwestMemoriaForwarder::new_with_timeouts(
+            "http://memoria.test".to_string(),
+            "test-key".to_string(),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+
+        let missing = forwarder.request_builder(
+            reqwest::Method::POST,
+            "/v1/memories",
+            &serde_json::json!({"content": "unscoped"}),
+        );
+        assert!(missing.unwrap_err().contains("authenticated owner"));
+
+        let non_object = forwarder.request_builder(
+            reqwest::Method::POST,
+            "/v1/memories",
+            &serde_json::json!([]),
+        );
+        assert!(non_object.unwrap_err().contains("JSON object"));
     }
 
     #[tokio::test]

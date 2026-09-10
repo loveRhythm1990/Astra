@@ -132,7 +132,7 @@ astra login
 ASTRA_EDGE_WORKSPACE_DIR=/path/to/repo make stack-up-server-edge
 ```
 
-With the default self-hosted configuration, `astra login` prompts for the local Astra username and password. A hosted browser login is enabled only when that Server is deliberately configured with a matching Memoria issuer/API and `MEMORIA_WEB_URL`; a hosted website key cannot authenticate against this stack's unrelated local Memoria instance.
+With the default self-hosted configuration, `astra login` prompts for the local Astra username and password. The configured `MEMORIA_MASTER_KEY` is used through an owner-bound transport for explicit memory tools, automatic recall/extraction, and memory API requests. A hosted browser login is enabled only when that Server is deliberately configured with a matching Memoria issuer/API and `MEMORIA_WEB_URL`; that mode uses per-user scoped credentials and never falls back to the master key. A hosted website key cannot authenticate against this stack's unrelated local Memoria instance.
 
 `stack-up-server-edge` starts the same compose stack and then launches a local
 host `astra-edge` process connected to `/edge/ws`. The edge process reads the

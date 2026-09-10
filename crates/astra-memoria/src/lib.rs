@@ -13,6 +13,18 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Per-operation HTTP authority resolved by the composition-owned memory port.
+///
+/// The credential is intentionally short-lived at the call site: user-scoped
+/// implementations resolve it again for every operation so revocation and
+/// consent changes take effect without rebuilding the agent runtime.
+#[derive(Clone)]
+pub struct MemoriaToolTransport {
+    pub base_url: String,
+    pub credential: String,
+    pub owner_user_id: String,
+}
+
 /// Canonical owner + session boundary for session-scoped memory operations.
 ///
 /// `user_id` and `session_id` are distinct identities. A transport may derive
@@ -237,6 +249,16 @@ pub trait MemoriaPort: Send + Sync {
     /// credentials.
     fn bind_owner(&self, _user_id: &str) -> Result<Arc<dyn MemoriaPort>, String> {
         Err("Memoria transport does not support authenticated owner rebinding".to_string())
+    }
+
+    /// Resolve the authority used by a prompt-facing memory tool operation.
+    /// Runtime-only ports may leave this unsupported; concrete HTTP and
+    /// user-scoped ports return an owner-bound transport.
+    async fn resolve_tool_transport(
+        &self,
+        _write: bool,
+    ) -> Result<Option<MemoriaToolTransport>, String> {
+        Ok(None)
     }
 
     async fn retrieve_for_prompt(

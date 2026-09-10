@@ -10,7 +10,9 @@ External principals are identified by issuer/provider and subject, never subject
 
 ## One composition boundary
 
-The auth service captures validated Memoria settings during application composition and supplies one credential resolver to login, refresh, proxy routes and memory runtime consumers. A pool setter never selects a memory transport. Explicit fixture/admin transport overrides cannot redirect the user-scoped credential.
+The auth service captures validated Memoria settings during application composition. When `MEMORIA_WEB_URL` is configured, it supplies one credential resolver to login, refresh, proxy routes and memory runtime consumers. A pool setter never selects a memory transport, and explicit fixture/admin transport overrides cannot redirect the user-scoped credential.
+
+When `MEMORIA_WEB_URL` is unset and a `MEMORIA_MASTER_KEY` is explicitly configured, composition selects the trusted self-hosted authority instead. Password-authenticated Astra users are bound to the master-key transport by their canonical Astra `user_id`. This mode is not an error fallback and must not be activated for hosted/browser-login deployments.
 
 The provider verifies the scoped-key API contract through `/auth/whoami`: active non-master personal key, exact owner, nonempty key ID, API version 1, scopes capability and memory-filter capability. HTTP redirects are not followed. Identity, model-provider and Memoria secrets must not be logged.
 

@@ -153,8 +153,8 @@ pub fn claude_code_session_memory_path(cwd: &str, session_id: &str) -> PathBuf {
 }
 
 pub use astra_memoria::{
-    MemoriaMemory, MemoriaPort, MemoryScope, ReflectCandidate, ReflectSummary,
-    parse_reflect_candidates, validate_strict_memories,
+    MemoriaMemory, MemoriaPort, MemoriaToolTransport, MemoryScope, ReflectCandidate,
+    ReflectSummary, parse_reflect_candidates, validate_strict_memories,
 };
 
 fn cross_session_abstract(prefix: &str, evidence: &str) -> String {
@@ -263,6 +263,12 @@ impl HttpMemoriaPort {
     pub fn from_env() -> Option<Self> {
         let mem = astra_core::MemoriaSettings::from_env();
         Some(Self::new_master(mem.base_url, mem.master_key?))
+    }
+
+    /// Build an owner-neutral self-hosted transport from explicit deployment
+    /// settings. The returned port still requires `bind_owner` before use.
+    pub fn self_hosted(base_url: String, master_key: String) -> Self {
+        Self::new_master(base_url, master_key)
     }
 
     fn request(
@@ -407,6 +413,23 @@ impl MemoriaPort for UserScopedMemoriaPort {
         let mut bound = self.clone();
         bound.owner_user_id = Some(user_id.to_string());
         Ok(std::sync::Arc::new(bound))
+    }
+
+    async fn resolve_tool_transport(
+        &self,
+        write: bool,
+    ) -> Result<Option<MemoriaToolTransport>, String> {
+        let credential = self
+            .resolver
+            .resolve(self.owner_user_id()?)
+            .await?
+            .ok_or("memory access is not enabled")?;
+        enforce_memory_access(credential.access.as_str(), write)?;
+        Ok(Some(MemoriaToolTransport {
+            base_url: self.resolver.provider.base_url.clone(),
+            credential: credential.key,
+            owner_user_id: credential.owner,
+        }))
     }
 
     async fn retrieve_for_prompt(
@@ -601,6 +624,22 @@ impl MemoriaPort for HttpMemoriaPort {
         Ok(std::sync::Arc::new(
             self.clone().with_owner_user_id(scope.user_id),
         ))
+    }
+
+    async fn resolve_tool_transport(
+        &self,
+        _write: bool,
+    ) -> Result<Option<MemoriaToolTransport>, String> {
+        let owner_user_id = self
+            .owner_user_id
+            .as_deref()
+            .ok_or("Memoria tool transport requires an authenticated owner binding")?;
+        let scope = astra_memoria::MemoryScope::new(owner_user_id, "tool-transport")?;
+        Ok(Some(MemoriaToolTransport {
+            base_url: self.base_url.clone(),
+            credential: self.api_key.clone(),
+            owner_user_id: scope.user_id,
+        }))
     }
 
     async fn retrieve_for_prompt(
@@ -1484,6 +1523,19 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn self_hosted_tool_transport_requires_and_preserves_owner_binding() {
+        let template =
+            HttpMemoriaPort::self_hosted("http://memoria.local".into(), "master-key".into());
+        assert!(template.resolve_tool_transport(false).await.is_err());
+
+        let bound = template.bind_owner("astra-owner").unwrap();
+        let transport = bound.resolve_tool_transport(true).await.unwrap().unwrap();
+        assert_eq!(transport.base_url, "http://memoria.local");
+        assert_eq!(transport.owner_user_id, "astra-owner");
+        assert_eq!(transport.credential, "master-key");
+    }
 
     #[test]
     fn user_memory_access_is_enforced_before_transport_resolution() {

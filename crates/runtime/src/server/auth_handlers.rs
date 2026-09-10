@@ -260,7 +260,8 @@ async fn memory_proxy_call_for_user(
         ),
         None => None,
     };
-    let body = apply_memory_proxy_identity(body, user_id, endpoint);
+    let body = apply_memory_proxy_identity(body, user_id, endpoint)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
     let strict_recall_limit = strict_recall_scope
         .as_ref()
         .map(|_| strict_session_recall_limit(&body));
@@ -387,7 +388,7 @@ async fn memoria_owner_id_for_user(
     state: &AppState,
     user_id: &str,
 ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-    if state.memoria_forwarder_is_override {
+    if state.memoria_forwarder_is_override || state.memoria_user_access_uses_master_key {
         return Ok(user_id.to_string());
     }
     let Some(resolver) = state.auth_service.memoria_credentials() else {
@@ -412,10 +413,9 @@ async fn forward_memoria_for_user(
     endpoint: &str,
     mut body: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    // Explicit composition overrides are used by bounded in-process fixtures
-    // and custom deployments. They are never inferred from a configured
-    // server master key, so normal production requests remain BYOK-only.
-    if state.memoria_forwarder_is_override {
+    // Explicit fixture overrides and trusted self-hosted composition use the
+    // owner-bound master-key forwarder. Hosted composition remains BYOK-only.
+    if state.memoria_forwarder_is_override || state.memoria_user_access_uses_master_key {
         return state
             .memoria_forwarder
             .forward(method, endpoint, body)
@@ -628,16 +628,17 @@ fn apply_memory_proxy_identity(
     mut body: serde_json::Value,
     user_id: &str,
     endpoint: &str,
-) -> serde_json::Value {
-    if let Some(obj) = body.as_object_mut() {
-        // Authentication owns `user_id`; the durable session id remains a
-        // separate, caller-selected identity that was authorized against the
-        // session store before this function runs.
-        obj.insert(
-            "user_id".to_string(),
-            serde_json::Value::String(user_id.to_string()),
-        );
-    }
+) -> Result<serde_json::Value, &'static str> {
+    let obj = body
+        .as_object_mut()
+        .ok_or("memory request body must be a JSON object")?;
+    // Authentication owns `user_id`; the durable session id remains a
+    // separate, caller-selected identity that was authorized against the
+    // session store before this function runs.
+    obj.insert(
+        "user_id".to_string(),
+        serde_json::Value::String(user_id.to_string()),
+    );
 
     // An exact-ID purge and a session purge are mutually exclusive selectors.
     // Keep the authenticated user identity: the HTTP forwarder projects it to
@@ -648,7 +649,7 @@ fn apply_memory_proxy_identity(
         obj.remove("session_id");
     }
 
-    body
+    Ok(body)
 }
 
 fn apply_memoria_management_identity(
@@ -1107,7 +1108,7 @@ mod tests {
             "session_id": "spoofed-session"
         });
 
-        let out = apply_memory_proxy_identity(body, "real-user", "/v1/memories");
+        let out = apply_memory_proxy_identity(body, "real-user", "/v1/memories").unwrap();
 
         assert_eq!(out["user_id"].as_str(), Some("real-user"));
         assert_eq!(out["session_id"].as_str(), Some("spoofed-session"));
@@ -1121,11 +1122,19 @@ mod tests {
             "session_id": "spoofed-session"
         });
 
-        let out = apply_memory_proxy_identity(body, "real-user", "/v1/memories/purge");
+        let out = apply_memory_proxy_identity(body, "real-user", "/v1/memories/purge").unwrap();
 
         assert_eq!(out["user_id"], "real-user");
         assert!(out.get("session_id").is_none());
         assert_eq!(out["memory_ids"], json!(["m1"]));
+    }
+
+    #[test]
+    fn apply_memory_proxy_identity_rejects_non_object_body() {
+        assert_eq!(
+            apply_memory_proxy_identity(json!([]), "real-user", "/v1/memories").unwrap_err(),
+            "memory request body must be a JSON object"
+        );
     }
 
     #[test]
