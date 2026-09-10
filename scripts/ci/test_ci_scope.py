@@ -112,6 +112,15 @@ class CiScopeTests(unittest.TestCase):
                 for name in ("sdk", "web", "harness", "script_contracts"):
                     self.assertFalse(scopes[name], name)
 
+    def test_docker_inputs_select_existing_rust_layout_contracts(self) -> None:
+        for path in ("Dockerfile", ".dockerignore"):
+            with self.subTest(path=path):
+                scopes = classify([path])
+                self.assertTrue(scopes["rust"])
+                self.assertTrue(scopes["test_core"])
+                self.assertFalse(scopes["sdk"])
+                self.assertFalse(scopes["web"])
+
     def test_ci_classifier_change_falls_back_to_every_scope(self) -> None:
         self.assertTrue(all(classify(["scripts/ci/ci_scope.py"]).values()))
 

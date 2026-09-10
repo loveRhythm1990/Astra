@@ -188,8 +188,9 @@ def classify(paths: list[str]) -> dict[str, bool]:
             )
             continue
         if path in {"Dockerfile", ".dockerignore"}:
-            # make lint verifies its Rust version remains aligned with the toolchain.
-            _enable(result, "rust")
+            # Lint checks the pinned toolchain; core's repo_layout_contract
+            # checks Docker stages and workspace inputs as well.
+            _enable(result, "rust", "test_core")
             continue
         if path.startswith("crates/"):
             _rust_scope_for(path, result)
