@@ -13,6 +13,11 @@ use crate::tui::terminal_startup::StartupTerminal;
 const CHILD: &str = "tui::terminal_startup::pty_tests::probe_child";
 const RESULT: &str = "ASTRA_PROBE_RESULT=";
 const INPUT: &str = "a你\x1b[200~pasted\n你好\x1b]11;rgb:ff/ff/ff\x07\x1b[201~";
+// Long enough to prove that receiving colors does not finish the query before
+// DA1, while leaving ample headroom inside the real 300 ms product budget on
+// loaded hosted runners. This wall-clock PTY fixture does not claim to verify
+// behavior at the exact timeout boundary.
+const DELAYED_DA1_WAIT: Duration = Duration::from_millis(80);
 
 // Split after the opening ESC, inside the ST terminator, and inside the RGB
 // payload. Do not sleep once per byte: scheduler delays can accumulate beyond
@@ -401,7 +406,11 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
                 "unsupported" | "query_escape" | "sigint_query" | "late_da1"
             ) {
                 if case == "delayed_da1" {
-                    std::thread::sleep(Duration::from_millis(220));
+                    let due = Instant::now() + DELAYED_DA1_WAIT;
+                    let remaining = due.saturating_duration_since(Instant::now());
+                    if !remaining.is_zero() {
+                        std::thread::sleep(remaining);
+                    }
                 }
                 let da1 = if case == "no_sixel" {
                     b"\x1b[?1;2c".as_slice()
@@ -632,10 +641,15 @@ fn pty_early_palette_or_theme_access_is_detected_and_restores_terminal() {
 }
 
 #[test]
-fn pty_sixel_preserves_slow_response_budget_and_negative_evidence() {
+fn pty_sixel_waits_for_da1_and_records_negative_evidence() {
     let (value, _) = run_case("delayed_da1");
-    assert_eq!(value["sixel_before"], true);
-    assert!(value["elapsed_ms"].as_u64().unwrap() >= 200);
+    assert_eq!(value["sixel_before"], true, "delayed_da1: {value}");
+    let query_seen = value["pty_timing"]["query_seen_ms"].as_u64().unwrap();
+    let da1_written = value["pty_timing"]["da1_written_ms"].as_u64().unwrap();
+    assert!(
+        da1_written.saturating_sub(query_seen) >= DELAYED_DA1_WAIT.as_millis() as u64,
+        "DA1 was not observably delayed: {value}"
+    );
     let (value, _) = run_case("no_sixel");
-    assert_eq!(value["sixel_before"], false);
+    assert_eq!(value["sixel_before"], false, "no_sixel: {value}");
 }
