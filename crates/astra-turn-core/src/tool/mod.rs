@@ -5,6 +5,7 @@ pub mod categories;
 pub mod deferred_activation;
 pub mod health;
 pub mod policy;
+pub mod protocol_history;
 pub mod registry;
 pub mod result;
 pub mod runtime_binding;

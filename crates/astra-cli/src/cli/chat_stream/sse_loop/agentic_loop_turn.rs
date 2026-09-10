@@ -100,6 +100,33 @@ fn log_chat_turn_timing_phase(timing: bool, label: &str, mark: &mut Instant) {
     *mark = Instant::now();
 }
 
+struct ToolFreeSurfaceProjectionState<'a> {
+    intent: Option<&'a TurnIntent>,
+    session_turn: u32,
+    round_index: u32,
+    has_history: bool,
+    has_recent_tools: bool,
+    has_tool_results: bool,
+    plan_mode_active: bool,
+    messages: &'a [Value],
+}
+
+impl ToolFreeSurfaceProjectionState<'_> {
+    fn is_safe(&self) -> bool {
+        self.intent
+            .is_some_and(TurnIntent::permits_tool_free_surface)
+            && self.session_turn == 1
+            && self.round_index == 0
+            && !self.has_history
+            && !self.has_recent_tools
+            && !self.has_tool_results
+            && !self.plan_mode_active
+            && !astra_turn_core::tool_protocol_history::messages_contain_tool_protocol(
+                self.messages,
+            )
+    }
+}
+
 /// Updates the live stderr prep line (`Ns  Phase… ⠿`, braille animates at end) for normal chat.
 fn touch_prep_ui_phase(phase: &Option<ChatPrepPhaseLabel>, label: &str) {
     if let Some(a) = phase
@@ -892,17 +919,31 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     // to invoke skills by calling the tool, rather than having skills pre-injected by
     // the tool surface builder.
 
-    let typed_tool_surface_allowed = match ctx.turn_intent {
-        Some(intent) => intent.communicative_act.uses_tool_surface(),
-        None => true,
-    };
+    // Removing declarations is safe only before any conversation/tool state
+    // can depend on them. Besides protecting provider protocol invariants
+    // (Anthropic requires tools when history contains tool_use/tool_result),
+    // the first-turn restriction avoids invalidating a long prompt-cache
+    // prefix merely to save the current schema payload.
+    let omit_tool_surface = ToolFreeSurfaceProjectionState {
+        intent: ctx.turn_intent,
+        session_turn: ctx.session_turn,
+        round_index: ctx.round_index,
+        has_history: !ctx.history.is_empty(),
+        has_recent_tools: !ctx.recent_tools.is_empty(),
+        has_tool_results: !ctx.tool_results.is_empty(),
+        plan_mode_active: ctx.plan_mode_active,
+        messages: ctx.messages,
+    }
+    .is_safe();
+    let typed_tool_surface_allowed = !omit_tool_surface;
+    let surface_intent = omit_tool_surface.then_some(ctx.turn_intent).flatten();
     let (turn_schemas, surface_report, surface_latency_ms) = {
         let sel_start = Instant::now();
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Loading schemas…");
         let budget = ctx.registry.default_schema_budget();
         let (mut schemas, mut report) = ctx
             .registry
-            .build_turn_surface_with_report(ctx.turn_intent, budget);
+            .build_turn_surface_with_report(surface_intent, budget);
         if typed_tool_surface_allowed && !ctx.tool_results.is_empty() {
             retain_invoked_tool_schemas(
                 &mut schemas,
@@ -1908,11 +1949,12 @@ pub(crate) async fn fetch_chat_turn_sse(
 #[cfg(test)]
 mod tests {
     use super::{
-        PrepareChatTurnRequest, PrepareTurnTelemetry, attach_typed_edge_skill_catalog,
-        build_retained_history_turns, chat_turn_budget_pressure, inject_runtime_turn_overrides,
-        msg_content, prepare_chat_turn_payload, project_cross_session_memory_hits,
-        retained_history_messages, runtime_filter_turn_schemas_and_report,
-        server_loop_admission_payload, server_loop_admission_payload_with_execution_time_budget,
+        PrepareChatTurnRequest, PrepareTurnTelemetry, ToolFreeSurfaceProjectionState,
+        attach_typed_edge_skill_catalog, build_retained_history_turns, chat_turn_budget_pressure,
+        inject_runtime_turn_overrides, msg_content, prepare_chat_turn_payload,
+        project_cross_session_memory_hits, retained_history_messages,
+        runtime_filter_turn_schemas_and_report, server_loop_admission_payload,
+        server_loop_admission_payload_with_execution_time_budget,
         surface_report_from_visible_schemas, thinking_complexity_signals,
     };
     use astra_config::user_profile::{Scenario, TurnIntent, WorkspaceMutationIntent};
@@ -3490,8 +3532,10 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let all_schemas = astra_tools::schemas::all_tool_schemas();
         let registry = ToolRegistry::new(all_schemas.clone());
-        let social_intent =
-            TurnIntent::default().with_communicative_act(TurnCommunicativeAct::Social);
+        let social_intent = TurnIntent::default()
+            .with_communicative_act(TurnCommunicativeAct::Social)
+            .with_work_lifecycle(astra_config::user_profile::WorkLifecycleIntent::NotRequired)
+            .with_workspace_mutation(WorkspaceMutationIntent::ReadOnly);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         let empty_surface_message = "empty tool surface";
         let messages = vec![json!({"role": "user", "content": empty_surface_message})];
@@ -3822,6 +3866,54 @@ mod tests {
                 .and_then(Value::as_str)
                 .is_some_and(|text| text.contains("<deferred-tools>")),
             "tool_search visibility must be paired with a deferred manifest"
+        );
+    }
+
+    #[test]
+    fn tool_free_surface_projection_is_limited_to_a_pristine_first_turn() {
+        use astra_config::user_profile::{
+            TurnCommunicativeAct, WorkLifecycleIntent, WorkspaceMutationIntent,
+        };
+
+        let intent = TurnIntent::default()
+            .with_communicative_act(TurnCommunicativeAct::Social)
+            .with_work_lifecycle(WorkLifecycleIntent::NotRequired)
+            .with_workspace_mutation(WorkspaceMutationIntent::ReadOnly);
+        let ordinary = [json!({"role":"user","content":"hello"})];
+        let safe = |session_turn, round_index, messages: &[Value]| {
+            ToolFreeSurfaceProjectionState {
+                intent: Some(&intent),
+                session_turn,
+                round_index,
+                has_history: false,
+                has_recent_tools: false,
+                has_tool_results: false,
+                plan_mode_active: false,
+                messages,
+            }
+            .is_safe()
+        };
+
+        assert!(safe(1, 0, &ordinary));
+        assert!(!safe(2, 0, &ordinary));
+        assert!(!safe(1, 1, &ordinary));
+        assert!(!safe(
+            1,
+            0,
+            &[json!({"role":"assistant","tool_calls":[{"id":"call-1"}]})]
+        ));
+        assert!(
+            !ToolFreeSurfaceProjectionState {
+                intent: Some(&intent),
+                session_turn: 1,
+                round_index: 0,
+                has_history: true,
+                has_recent_tools: false,
+                has_tool_results: false,
+                plan_mode_active: false,
+                messages: &ordinary,
+            }
+            .is_safe()
         );
     }
 

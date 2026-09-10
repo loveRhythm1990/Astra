@@ -33,7 +33,8 @@
 //! intent. Runtime fallbacks must use structural facts, not keyword lists.
 
 use astra_config::user_profile::{
-    MutationCompletionScope, TurnIntent, WorkLifecycleIntent, WorkspaceMutationIntent,
+    MutationCompletionScope, TurnCommunicativeAct, TurnIntent, WorkLifecycleIntent,
+    WorkspaceMutationIntent,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -138,13 +139,13 @@ Work lifecycle — first matching rule wins:
 
 Count user-facing outcomes, not containers, agents, tools, or phases. Use `independent_outcomes` only when each unit owes its own payload/source and survives every peer failure, even if one response presents both. Separately named/numbered results stay independent despite a shared topic, deadline, response, or cross-reference. Stages, evidence, verification, formatting, and reporting of one accepted result are `single_outcome`; a change plus its test/report is one. Inputs valuable only through one comparison, decision, recommendation, or conclusion are one. Parallelism alone is `not_required`.
 
-Always include `workspace_mutation` from the requested end state, not preparatory inspection: information=`read_only`; state change=`must_mutate`; either=`may_mutate`. For `must_mutate`, set `mutation_completion_scope`: `workspace`=bound project, `external`=outside it, `mixed`=both, unclear=`unknown`. Managed state outside the project is `external`.
+Always include `communicative_act`: `task`=action, `question`=answer/analysis, `acknowledgement`/`social`=no work, `unknown`=ambiguous. Acknowledgement/social requires `not_required`, `read_only`, `primary`, `single_outcome`, and `acceptance_units=[]`; never use it for a request. Always include `workspace_mutation` from the requested end state, not preparatory inspection: information=`read_only`; state change=`must_mutate`; either=`may_mutate`. For `must_mutate`, set `mutation_completion_scope`: `workspace`=bound project, `external`=outside it, `mixed`=both, unclear=`unknown`. Managed state outside the project is `external`.
 
 Not required:
-{"work_lifecycle":"not_required","workspace_mutation":"read_only"|"may_mutate"|"must_mutate","mutation_completion_scope":"workspace"|"external"|"mixed"|"unknown","execution_topology":"primary"|"parallel_subruns","acceptance_unit_relationship":"single_outcome"|"independent_outcomes","acceptance_units":[{"objective":"<candidate outcome>","expected_result":"<payload plus source/verification>"}]}
+{"communicative_act":"<act>","work_lifecycle":"not_required","workspace_mutation":"read_only"|"may_mutate"|"must_mutate","mutation_completion_scope":"workspace"|"external"|"mixed"|"unknown","execution_topology":"primary"|"parallel_subruns","acceptance_unit_relationship":"single_outcome"|"independent_outcomes","acceptance_units":[{"objective":"<candidate outcome>","expected_result":"<payload plus source/verification>"}]}
 
 Required:
-{"work_lifecycle":"required","workspace_mutation":<same>,"mutation_completion_scope":<same>,"execution_topology":"primary"|"parallel_subruns","basis":"durable_continuation"|"explicit_lifecycle_control","goal":"<outcomes and mutations>","initial_tasks":[{"objective":"<outcome>","expected_result":"<payload plus source/verification>"}],"mutations":[<mutation>]}
+{"communicative_act":"task","work_lifecycle":"required","workspace_mutation":<same>,"mutation_completion_scope":<same>,"execution_topology":"primary"|"parallel_subruns","basis":"durable_continuation"|"explicit_lifecycle_control","goal":"<outcomes and mutations>","initial_tasks":[{"objective":"<outcome>","expected_result":"<payload plus source/verification>"}],"mutations":[<mutation>]}
 `activation`=`defer` only when explicit. Required topology defaults to `primary`; preserve parallel conflicts.
 
 At most 8 `initial_tasks`+`mutations`. Add has task; cancel has `target_initial_task`; replace with both. Cancel+add stay two mutations. Targets are 1-based; unnamed selects last. Never merge named outcomes. Counts/state are runtime-derived."#;
@@ -284,6 +285,7 @@ pub enum WorkAdmissionActivation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkAdmissionDecision {
     NotRequired {
+        communicative_act: TurnCommunicativeAct,
         workspace_mutation: WorkspaceMutationIntent,
         mutation_completion_scope: MutationCompletionScope,
         execution_topology: WorkExecutionTopology,
@@ -305,6 +307,7 @@ impl WorkAdmissionDecision {
     #[must_use]
     pub fn turn_intent(&self) -> TurnIntent {
         TurnIntent {
+            communicative_act: self.communicative_act(),
             work_lifecycle: match self {
                 Self::NotRequired { .. } => WorkLifecycleIntent::NotRequired,
                 Self::Required { .. } => WorkLifecycleIntent::Required,
@@ -312,6 +315,20 @@ impl WorkAdmissionDecision {
             workspace_mutation: self.workspace_mutation(),
             mutation_completion_scope: self.mutation_completion_scope(),
             ..TurnIntent::default()
+        }
+    }
+
+    /// Judge-owned communicative role used to project the provider tool
+    /// surface. Required Work is necessarily actionable; only a completed
+    /// NotRequired decision may remove tools for a social/acknowledgement
+    /// turn. Missing or malformed output remains `Unknown` and tool-capable.
+    #[must_use]
+    pub fn communicative_act(&self) -> TurnCommunicativeAct {
+        match self {
+            Self::NotRequired {
+                communicative_act, ..
+            } => *communicative_act,
+            Self::Required { .. } => TurnCommunicativeAct::Task,
         }
     }
 
@@ -563,6 +580,8 @@ pub fn parse_work_admission_response(
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct WorkAdmissionResponse {
+        #[serde(default)]
+        communicative_act: TurnCommunicativeAct,
         work_lifecycle: WorkLifecycleIntent,
         #[serde(default)]
         workspace_mutation: WorkspaceMutationIntent,
@@ -618,6 +637,42 @@ pub fn parse_work_admission_response(
     let malformed = || TurnIntentJudgeError::Malformed {
         raw: truncate(raw, 256),
     };
+
+    // A no-tool decision must be self-consistent before it is allowed to
+    // shrink the provider surface. Any ambiguity falls back through the
+    // caller's unavailable policy, which preserves the full tool set.
+    if matches!(
+        response.communicative_act,
+        TurnCommunicativeAct::Acknowledgement | TurnCommunicativeAct::Social
+    ) {
+        let acceptance_units_are_empty =
+            response.acceptance_units.as_ref().is_none_or(Vec::is_empty);
+        let acceptance_relationship_is_safe = response
+            .acceptance_unit_relationship
+            .is_none_or(|relationship| relationship == AcceptanceUnitRelationship::SingleOutcome);
+        if response.work_lifecycle != WorkLifecycleIntent::NotRequired
+            || response.workspace_mutation != WorkspaceMutationIntent::ReadOnly
+            || response.mutation_completion_scope != MutationCompletionScope::Unknown
+            || response.basis.is_some()
+            || response.goal.is_some()
+            || response.initial_tasks.is_some()
+            || !response.mutations.is_empty()
+            || response.activation.is_some()
+            || response.execution_topology != WorkExecutionTopology::Primary
+            || !response.required_capabilities.is_empty()
+            || !acceptance_units_are_empty
+            || !acceptance_relationship_is_safe
+        {
+            return Err(malformed());
+        }
+        return Ok(WorkAdmissionDecision::NotRequired {
+            communicative_act: response.communicative_act,
+            workspace_mutation: response.workspace_mutation,
+            mutation_completion_scope: response.mutation_completion_scope,
+            execution_topology: response.execution_topology,
+            required_capabilities: Vec::new(),
+        });
+    }
     match response.work_lifecycle {
         WorkLifecycleIntent::NotRequired
             if response.basis.is_none()
@@ -695,6 +750,7 @@ pub fn parse_work_admission_response(
                 });
             }
             Ok(WorkAdmissionDecision::NotRequired {
+                communicative_act: response.communicative_act,
                 workspace_mutation: response.workspace_mutation,
                 mutation_completion_scope: response.mutation_completion_scope,
                 execution_topology: topology,
@@ -1026,10 +1082,12 @@ mod tests {
         assert!(system.contains("preparatory inspection"));
         assert!(system.contains("mutation_completion_scope"));
         assert!(system.contains("Managed state outside the project"));
+        assert!(system.contains("communicative_act"));
+        assert!(system.contains("acceptance_units=[]"));
         assert!(!system.contains("initial_outcome_count"));
         assert!(!system.contains("final_outcome_count"));
         assert!(
-            system.len() < 3_000,
+            system.len() < 3_400,
             "Work admission must remain a small interactive request: {} bytes",
             system.len()
         );
@@ -1262,6 +1320,49 @@ mod tests {
                 "must reject non-contract response {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn work_admission_types_only_self_consistent_non_work_acts_as_tool_free() {
+        for (wire, expected) in [
+            ("social", TurnCommunicativeAct::Social),
+            ("acknowledgement", TurnCommunicativeAct::Acknowledgement),
+        ] {
+            let raw = format!(
+                r#"{{"communicative_act":"{wire}","work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"primary","acceptance_unit_relationship":"single_outcome","acceptance_units":[]}}"#
+            );
+            let decision = parse_work_admission_response(&raw)
+                .expect("a self-consistent non-work act must parse");
+            assert_eq!(decision.communicative_act(), expected);
+            assert_eq!(decision.turn_intent().communicative_act, expected);
+            assert!(!expected.uses_tool_surface());
+        }
+
+        for invalid in [
+            r#"{"communicative_act":"social","work_lifecycle":"required","workspace_mutation":"read_only","execution_topology":"primary","basis":"durable_continuation","goal":"Keep chatting","initial_tasks":[{"objective":"Reply","expected_result":"A reply"}]}"#,
+            r#"{"communicative_act":"social","work_lifecycle":"not_required","workspace_mutation":"must_mutate","mutation_completion_scope":"workspace","execution_topology":"primary","acceptance_unit_relationship":"single_outcome","acceptance_units":[]}"#,
+            r#"{"communicative_act":"acknowledgement","work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"parallel_subruns","acceptance_unit_relationship":"single_outcome","acceptance_units":[]}"#,
+            r#"{"communicative_act":"social","work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"primary","acceptance_unit_relationship":"single_outcome","acceptance_units":[{"objective":"Inspect code","expected_result":"A finding"}]}"#,
+        ] {
+            assert!(
+                matches!(
+                    parse_work_admission_response(invalid),
+                    Err(TurnIntentJudgeError::Malformed { .. })
+                ),
+                "an inconsistent no-tool classification must fail closed: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_work_admission_act_remains_unknown_and_tool_capable() {
+        let decision = parse_work_admission_response(
+            r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"primary","acceptance_unit_relationship":"single_outcome","acceptance_units":[{"objective":"Answer the question","expected_result":"One direct answer"}]}"#,
+        )
+        .expect("legacy response without a communicative act remains valid");
+
+        assert_eq!(decision.communicative_act(), TurnCommunicativeAct::Unknown);
+        assert!(decision.communicative_act().uses_tool_surface());
     }
 
     #[test]

@@ -199,9 +199,10 @@ impl ToolRegistry {
 
     /// Build the visible tool surface for a typed turn intent.
     ///
-    /// Explicitly social or acknowledgement-only turns are tool-free. Task,
-    /// question, unknown, and unavailable judge results keep the stable
-    /// always-load surface. Deferred tools still require explicit activation.
+    /// Self-consistent social or acknowledgement-only intents select a
+    /// tool-free base surface. Task, question, incomplete, unknown, and
+    /// unavailable judge results keep the stable always-load surface. Callers
+    /// remain responsible for history/round safety before passing the intent.
     pub fn build_turn_surface(&self, intent: Option<&TurnIntent>) -> Vec<Value> {
         let (schemas, _report) =
             self.build_turn_surface_with_report(intent, self.schema_budget_tokens);
@@ -214,7 +215,7 @@ impl ToolRegistry {
         intent: Option<&TurnIntent>,
         schema_budget: u32,
     ) -> (Vec<Value>, ToolSelectionReport) {
-        if intent.is_some_and(|intent| !intent.communicative_act.uses_tool_surface()) {
+        if intent.is_some_and(TurnIntent::permits_tool_free_surface) {
             return (
                 Vec::new(),
                 ToolSelectionReport {
@@ -650,6 +651,21 @@ mod tests {
             ToolRegistry::visible_names(&judged_unknown)
         );
         assert!(!unavailable.is_empty());
+    }
+
+    #[test]
+    fn only_self_consistent_non_work_intent_selects_an_empty_base_surface() {
+        use astra_config::user_profile::{WorkLifecycleIntent, WorkspaceMutationIntent};
+
+        let schemas: Vec<Value> = TOOL_CATALOG.iter().map(|t| sample_schema(t.name)).collect();
+        let registry = ToolRegistry::new(schemas);
+        let incomplete = TurnIntent::default().with_communicative_act(TurnCommunicativeAct::Social);
+        assert!(!registry.build_turn_surface(Some(&incomplete)).is_empty());
+
+        let consistent = incomplete
+            .with_work_lifecycle(WorkLifecycleIntent::NotRequired)
+            .with_workspace_mutation(WorkspaceMutationIntent::ReadOnly);
+        assert!(registry.build_turn_surface(Some(&consistent)).is_empty());
     }
 }
 

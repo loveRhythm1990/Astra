@@ -153,6 +153,7 @@ pub use tool::health::persistence as tool_health_persistence;
 pub use tool::policy as tool_policy;
 pub use tool::policy::hooks as tool_hooks;
 pub use tool::policy::preview as tool_preview;
+pub use tool::protocol_history as tool_protocol_history;
 pub use tool::registry::chain as tool_registry_chain;
 pub use tool::registry::meta as tool_registry_meta;
 pub use tool::registry::plugin as tool_registry_plugin;

@@ -1079,22 +1079,35 @@ and must consume this same resolver before Work admission is enabled.
 
 ### Auxiliary inference and latency
 
-Work admission is a bounded introspection call. It starts concurrently with the
-primary model request and settles before a plain-text completion or provider
-tool batch crosses its execution boundary. Therefore its latency is not added
-unconditionally to primary latency; the pre-output critical path is:
+Work admission is a bounded introspection call. It starts before primary
+request preparation. Local model resolution and request preparation overlap
+it. Only a pristine first session turn may then wait for the shorter
+tool-surface deadline and remove schemas. The decision's typed
+`communicative_act` is necessary but not sufficient: the intent must also be
+`not_required` and `read_only`, no model/tool round may have started, and the
+history must contain no OpenAI, Anthropic, or Bedrock tool-call/result state.
+`task`, `question`, inconsistent, unknown, malformed, timed-out, and
+unavailable decisions retain the normal tool surface. Runtime never classifies
+user text with a keyword list.
+
+For that first-turn optimization, the pre-output critical path is:
 
 ```text
-request preparation
-  + max(primary provider path, Work-admission provider path)
+max(local request preparation, bounded tool-surface admission wait)
+  + primary provider path with the resolved tool surface
   + required reconciliation and client delivery
 ```
 
-If Work admission finishes first, the primary path determines the remaining
-time. If the primary response finishes first, the remaining Work-admission
-deadline can delay the first executable completion boundary. Provider cache
-hits, endpoint load, network variance, and scheduler delay can change the
-winner between otherwise identical turns.
+The tool-surface wait is shorter than the semantic Work-admission deadline. If
+it expires, Astra sends the full tool surface immediately but keeps the judge
+task alive for a later execution boundary. Later session turns never wait for
+this optimization and never remove the stable schema prefix. This avoids both
+invalid Anthropic requests (historical `tool_use`/`tool_result` requires tool
+declarations) and prompt-cache churn where saving the current schemas could
+force a much larger history prefix to be written again. Failures preserve
+capabilities rather than optimizing latency. Provider cache hits, endpoint
+load, network variance, and scheduler delay can change the observed benefit
+between otherwise identical first turns.
 
 The compatibility fix must not add a second provider attempt after a generic
 HTTP 400. Retrying after stripping fields would increase latency and may double
@@ -1111,7 +1124,8 @@ from end-to-end TTFT. Every primary and auxiliary attempt records:
 - resolved temperature emission and provenance, without request-body or secret
   values;
 - cache read/write token facts when the provider reports them;
-- Work-admission reconciliation wait after the primary result;
+- bounded first-turn Work-admission wait before provider tool-surface assembly,
+  including whether it timed out and preserved the full surface;
 - first durable output and first client-delivery timestamps;
 - typed failure class and whether semantic Primary degradation occurred.
 

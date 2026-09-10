@@ -577,6 +577,20 @@ pub struct TurnIntent {
 }
 
 impl TurnIntent {
+    /// Whether this typed intent is sufficiently self-consistent to permit a
+    /// tool-free provider surface.
+    ///
+    /// Callers must still apply stateful safeguards such as preserving tools
+    /// after a prior tool protocol message or after execution has started.
+    #[must_use]
+    pub const fn permits_tool_free_surface(&self) -> bool {
+        matches!(
+            self.communicative_act,
+            TurnCommunicativeAct::Acknowledgement | TurnCommunicativeAct::Social
+        ) && matches!(self.work_lifecycle, WorkLifecycleIntent::NotRequired)
+            && matches!(self.workspace_mutation, WorkspaceMutationIntent::ReadOnly)
+    }
+
     #[must_use]
     pub fn with_domain(mut self, domain: TurnIntentDomain) -> Self {
         self.domain = Some(domain);
@@ -1107,6 +1121,35 @@ mod tests {
                 "{act:?} must produce a tool-free base surface"
             );
         }
+    }
+
+    #[test]
+    fn tool_free_surface_requires_a_self_consistent_non_work_intent() {
+        let social = TurnIntent::default()
+            .with_communicative_act(TurnCommunicativeAct::Social)
+            .with_work_lifecycle(WorkLifecycleIntent::NotRequired)
+            .with_workspace_mutation(WorkspaceMutationIntent::ReadOnly);
+        assert!(social.permits_tool_free_surface());
+
+        assert!(
+            !TurnIntent::default()
+                .with_communicative_act(TurnCommunicativeAct::Social)
+                .permits_tool_free_surface(),
+            "missing lifecycle and mutation evidence must fail open"
+        );
+        assert!(
+            !social
+                .clone()
+                .with_work_lifecycle(WorkLifecycleIntent::Required)
+                .permits_tool_free_surface(),
+            "Required Work must retain tools"
+        );
+        assert!(
+            !social
+                .with_workspace_mutation(WorkspaceMutationIntent::MayMutate)
+                .permits_tool_free_surface(),
+            "a potentially mutating turn must retain tools"
+        );
     }
 
     #[test]

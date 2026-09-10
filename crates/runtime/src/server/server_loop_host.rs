@@ -709,11 +709,29 @@ fn provider_context_tool_surface<'a>(
         .unwrap_or(authority_surface)
 }
 
-/// The semantic judge is auxiliary to the primary conversation. It runs in
-/// parallel with primary request preparation/inference, so this bound limits
-/// how long a slow provider can delay the first *executable* boundary without
-/// serially adding that time to every turn.
+/// Whether this request is still at the only boundary where physically
+/// removing every tool declaration is protocol- and cache-safe.
+///
+/// The typed intent itself is checked by the caller. This guard owns the
+/// stateful half of the contract: no prior visible turn, no inner model/tool
+/// round, and no historical provider tool protocol.
+fn tool_free_surface_state_is_safe(state: &AgenticLoopState) -> bool {
+    state.session_turn == 1
+        && state.llm_rounds_completed == 0
+        && state.current_round_index == 0
+        && state.recent_tools.is_empty()
+        && state.tool_results.is_empty()
+        && !astra_turn_core::tool_protocol_history::messages_contain_tool_protocol(&state.messages)
+}
+
+/// The semantic judge is auxiliary to the primary conversation. This is its
+/// semantic execution-boundary deadline; it must not be reused as the much
+/// shorter provider tool-surface optimization deadline below.
 const TURN_INTENT_JUDGE_DEADLINE: Duration = Duration::from_secs(12);
+/// A first-turn tool-surface optimization may briefly wait for a typed
+/// non-work decision. Expiry fails open to the full surface while the same
+/// judge task remains alive for the later execution boundary.
+const TOOL_SURFACE_ADMISSION_WAIT: Duration = Duration::from_secs(5);
 /// A canonical Work item is deliberately narrow. After a few executed tools,
 /// the next model boundary must re-evaluate its exact expected result rather
 /// than silently turning one item into open-ended exploration.
@@ -5379,12 +5397,30 @@ impl ServerAgenticLoopHost {
         true
     }
 
-    /// Reconcile the built-in semantic Work preflight without adding another
-    /// model boundary to the happy path. A non-blocking poll is used before
-    /// primary provider I/O; the final reconciliation waits for the bounded
-    /// judge deadline and therefore cannot expose or execute a provider tool
-    /// before the typed Work decision is known.
+    /// Reconcile the built-in semantic Work preflight. Ordinary calls either
+    /// poll or settle it at an execution boundary. The separate first-turn
+    /// helper below owns the shorter, fail-open tool-surface wait.
     async fn resolve_pending_work_admission(&mut self, wait: bool) -> bool {
+        let deadline = if wait { None } else { Some(Duration::ZERO) };
+        self.resolve_pending_work_admission_with_deadline(deadline)
+            .await
+    }
+
+    /// Wait only long enough to optimize the provider tool surface. Unlike
+    /// the semantic execution-boundary wait, expiry retains the live join
+    /// handle so the authoritative decision can still settle later.
+    async fn resolve_pending_work_admission_for_tool_surface(&mut self) -> bool {
+        self.resolve_pending_work_admission_with_deadline(Some(TOOL_SURFACE_ADMISSION_WAIT))
+            .await
+    }
+
+    /// `deadline == None` settles the decision. `Some(Duration::ZERO)` polls,
+    /// while any other duration performs a cancellable bounded wait without
+    /// dropping the underlying judge task.
+    async fn resolve_pending_work_admission_with_deadline(
+        &mut self,
+        deadline: Option<Duration>,
+    ) -> bool {
         let Some(handle) = self.pending_work_admission_judge.take() else {
             return false;
         };
@@ -5393,14 +5429,37 @@ impl ServerAgenticLoopHost {
             .take()
             .unwrap_or_else(Instant::now);
         let round_index = self.pending_work_admission_round.take().unwrap_or_default();
-        if !wait && !handle.is_finished() {
+        let deadline = deadline.map(|budget| budget.saturating_sub(started_at.elapsed()));
+        if deadline == Some(Duration::ZERO) && !handle.is_finished() {
             self.pending_work_admission_judge = Some(handle);
             self.pending_work_admission_started_at = Some(started_at);
             self.pending_work_admission_round = Some(round_index);
             return false;
         }
 
-        let result = match handle.await {
+        let mut handle = handle;
+        let joined = if deadline == Some(Duration::ZERO) {
+            handle.await
+        } else if let Some(deadline) = deadline {
+            match tokio::time::timeout(deadline, &mut handle).await {
+                Ok(joined) => joined,
+                Err(_) => {
+                    self.pending_work_admission_judge = Some(handle);
+                    self.pending_work_admission_started_at = Some(started_at);
+                    self.pending_work_admission_round = Some(round_index);
+                    tracing::debug!(
+                        target: "astra::tool_surface",
+                        round_index,
+                        wait_ms = deadline.as_millis() as u64,
+                        "Work admission did not settle within the tool-surface budget; preserving the full surface"
+                    );
+                    return false;
+                }
+            }
+        } else {
+            handle.await
+        };
+        let result = match joined {
             Ok(result) => result,
             Err(error) => Err(astra_services::TurnIntentJudgeError::Transport(format!(
                 "work admission judge task failed: {error}"
@@ -5481,6 +5540,11 @@ impl ServerAgenticLoopHost {
             // same authority instead of running disconnected classifiers.
             let boundary_intent = decision.turn_intent();
             let mut intent = state.turn_intent.take().unwrap_or_default();
+            if boundary_intent.communicative_act
+                != astra_config::user_profile::TurnCommunicativeAct::Unknown
+            {
+                intent.communicative_act = boundary_intent.communicative_act;
+            }
             intent.work_lifecycle = boundary_intent.work_lifecycle;
             if boundary_intent.workspace_mutation
                 != astra_config::user_profile::WorkspaceMutationIntent::Unknown
@@ -10221,6 +10285,23 @@ impl ServerAgenticLoopHost {
         restricted_tools: &HashSet<String>,
         state: &AgenticLoopState,
     ) -> Vec<Value> {
+        if state
+            .turn_intent
+            .as_ref()
+            .is_some_and(astra_config::user_profile::TurnIntent::permits_tool_free_surface)
+            && tool_free_surface_state_is_safe(state)
+        {
+            tracing::info!(
+                target: "astra::tool_surface",
+                run_id = state.current_run_id.as_deref().unwrap_or_default(),
+                communicative_act = ?state
+                    .turn_intent
+                    .as_ref()
+                    .map(|intent| intent.communicative_act),
+                "omitting tool schemas for typed non-work communicative act"
+            );
+            return Vec::new();
+        }
         let mut tools = self.filtered_turn_tools(restricted_tools);
         // Build the candidate Work surface in a stable order, then let typed
         // runtime readiness remove transitions that cannot execute in the
@@ -11535,11 +11616,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             return outcome;
         }
 
-        // Start the bounded semantic admission in parallel with the primary
-        // request when adaptive capacity permits it. If no durable inference
+        // Start bounded semantic admission before primary request preparation
+        // when adaptive capacity permits it. Model resolution and other local
+        // preparation overlap the sidecar. Only a pristine first turn may
+        // briefly settle it for tool-surface optimization; later turns poll
+        // and preserve their stable schema prefix. If no durable inference
         // material is available, the typed primary Work contract remains the
-        // safe fallback; a provider tool/control response can still start the
-        // boundary judge below before any effect is admitted.
+        // safe fallback.
         self.start_work_admission_preflight(state, false, false)
             .await;
         crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable
@@ -12064,6 +12147,37 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             && (work_settlement_only
                 || preserve_text_only_tool_surface
                 || preserve_final_synthesis_wire_surface);
+
+        // Work admission is also the single semantic owner of the
+        // communicative act used for tool-surface projection. Only the first
+        // pristine session turn may wait briefly to remove schemas. Later
+        // turns poll without blocking and preserve the cache/protocol surface;
+        // the authoritative judge remains available at an execution boundary.
+        if tool_free_surface_state_is_safe(state) {
+            self.resolve_pending_work_admission_for_tool_surface().await;
+        } else {
+            self.resolve_pending_work_admission(false).await;
+        }
+        self.flush_completed_work_admission_phase(state);
+        if let Some(error) = self.work_admission_terminal_error() {
+            tracing::error!(
+                target: "astra::turn_intent",
+                operation = "turn_intent.judge",
+                source = "work_admission_judge",
+                status = "terminal",
+                round_index = state.current_round_index,
+                error = %error,
+                "unsupported Work admission contract stopped the run before provider tool-surface assembly"
+            );
+            self.complete_request_preparation_phase(
+                state,
+                turn_started,
+                0,
+                &mut request_preparation_recorded_attempts,
+                TurnPhaseOutcome::Failed,
+            );
+            return Err(error);
+        }
         let effective_restricted =
             self.compute_effective_restricted(state, true, preserve_text_only_tool_surface);
         tracing::debug!(
@@ -17676,6 +17790,101 @@ mod tests {
     }
 
     #[test]
+    fn typed_non_work_act_omits_tools_while_unknown_or_inconsistent_intent_fails_open() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-tool-surface".to_string(),
+            "s-tool-surface".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        let restricted = HashSet::new();
+        let mut state = create_test_state();
+        state.session_turn = 1;
+
+        let baseline = host.filtered_runtime_ready_turn_tools(&restricted, &state);
+        assert!(
+            !baseline.is_empty(),
+            "an unresolved turn must retain the normal tool surface"
+        );
+
+        for act in [
+            astra_config::user_profile::TurnCommunicativeAct::Social,
+            astra_config::user_profile::TurnCommunicativeAct::Acknowledgement,
+        ] {
+            state.turn_intent = Some(
+                astra_config::user_profile::TurnIntent::default()
+                    .with_communicative_act(act)
+                    .with_work_lifecycle(
+                        astra_config::user_profile::WorkLifecycleIntent::NotRequired,
+                    )
+                    .with_workspace_mutation(
+                        astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+                    ),
+            );
+            assert!(
+                host.filtered_runtime_ready_turn_tools(&restricted, &state)
+                    .is_empty(),
+                "a self-consistent {act:?} decision must not serialize tool schemas"
+            );
+        }
+
+        state.session_turn = 2;
+        assert!(
+            !host
+                .filtered_runtime_ready_turn_tools(&restricted, &state)
+                .is_empty(),
+            "later session turns preserve the stable provider/cache surface"
+        );
+        state.session_turn = 1;
+        state.messages = vec![json!({
+            "role": "assistant",
+            "tool_calls": [{"id":"call-1","type":"function","function":{"name":"bash","arguments":"{}"}}]
+        })];
+        assert!(
+            !host
+                .filtered_runtime_ready_turn_tools(&restricted, &state)
+                .is_empty(),
+            "historical tool protocol requires compatible declarations"
+        );
+        state.messages.clear();
+        state.llm_rounds_completed = 1;
+        assert!(
+            !host
+                .filtered_runtime_ready_turn_tools(&restricted, &state)
+                .is_empty(),
+            "an in-progress agentic turn must not lose tools"
+        );
+        state.llm_rounds_completed = 0;
+
+        state.turn_intent = Some(astra_config::user_profile::TurnIntent::default());
+        assert!(
+            !host
+                .filtered_runtime_ready_turn_tools(&restricted, &state)
+                .is_empty(),
+            "Unknown must remain tool-capable when admission is unavailable"
+        );
+
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_communicative_act(astra_config::user_profile::TurnCommunicativeAct::Social)
+                .with_work_lifecycle(astra_config::user_profile::WorkLifecycleIntent::Required)
+                .with_workspace_mutation(
+                    astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+                ),
+        );
+        assert!(
+            !host
+                .filtered_runtime_ready_turn_tools(&restricted, &state)
+                .is_empty(),
+            "an inconsistent Required+Social intent must fail open to the full surface"
+        );
+    }
+
+    #[test]
     fn work_tool_surface_separates_coordinator_and_attempt_roles() {
         let capabilities = crate::capabilities::lifecycle_server_capabilities(true, false);
         let unbound = ServerAgenticLoopHostBuilder::new(
@@ -17709,6 +17918,7 @@ mod tests {
         .build();
         parallel_bound.apply_work_admission_decision(
             astra_services::WorkAdmissionDecision::NotRequired {
+                communicative_act: astra_config::user_profile::TurnCommunicativeAct::Unknown,
                 workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::Unknown,
                 mutation_completion_scope:
                     astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -17730,6 +17940,7 @@ mod tests {
         .build();
         direct_parallel_bound.apply_work_admission_decision(
             astra_services::WorkAdmissionDecision::NotRequired {
+                communicative_act: astra_config::user_profile::TurnCommunicativeAct::Unknown,
                 workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::Unknown,
                 mutation_completion_scope:
                     astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -24538,6 +24749,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_surface_timeout_preserves_the_pending_admission_task() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-tool-surface-timeout".to_string(),
+            "s-tool-surface-timeout".to_string(),
+        )
+        .build();
+        host.pending_work_admission_judge = Some(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Err(astra_services::TurnIntentJudgeError::Transport(
+                "test timeout".to_string(),
+            ))
+        }));
+        host.pending_work_admission_started_at = Some(Instant::now());
+        host.pending_work_admission_round = Some(7);
+
+        let resolved = tokio::time::timeout(
+            Duration::from_millis(100),
+            host.resolve_pending_work_admission_with_deadline(Some(Duration::from_millis(1))),
+        )
+        .await
+        .expect("tool-surface wait must remain independently bounded");
+
+        assert!(!resolved);
+        assert!(
+            host.pending_work_admission_judge.is_some(),
+            "the semantic judge must survive a tool-surface optimization timeout"
+        );
+        assert_eq!(host.pending_work_admission_round, Some(7));
+        assert!(host.pending_work_admission.is_none());
+        host.abort_pending_work_admission();
+    }
+
+    #[tokio::test]
     async fn required_work_admission_wins_over_explicit_primary_fanout() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -25209,6 +25455,7 @@ mod tests {
         )
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            communicative_act: astra_config::user_profile::TurnCommunicativeAct::Unknown,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             execution_topology: astra_services::WorkExecutionTopology::Primary,
@@ -25327,6 +25574,7 @@ mod tests {
         assert!(explicit.task_profile.mutates_workspace);
 
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            communicative_act: astra_config::user_profile::TurnCommunicativeAct::Unknown,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             execution_topology: astra_services::WorkExecutionTopology::Primary,
@@ -25711,6 +25959,7 @@ mod tests {
         ))
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            communicative_act: astra_config::user_profile::TurnCommunicativeAct::Unknown,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             execution_topology: astra_services::WorkExecutionTopology::Primary,
@@ -25783,6 +26032,7 @@ mod tests {
         ))
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            communicative_act: astra_config::user_profile::TurnCommunicativeAct::Unknown,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             execution_topology: astra_services::WorkExecutionTopology::Primary,
@@ -25881,6 +26131,7 @@ mod tests {
         ))
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            communicative_act: astra_config::user_profile::TurnCommunicativeAct::Unknown,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             execution_topology: astra_services::WorkExecutionTopology::ParallelSubruns,
@@ -25944,6 +26195,7 @@ mod tests {
         );
 
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            communicative_act: astra_config::user_profile::TurnCommunicativeAct::Unknown,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             execution_topology: astra_services::WorkExecutionTopology::Primary,
@@ -26030,6 +26282,7 @@ mod tests {
         )
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            communicative_act: astra_config::user_profile::TurnCommunicativeAct::Unknown,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             execution_topology: astra_services::WorkExecutionTopology::Primary,
@@ -30087,7 +30340,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-    async fn provisional_work_admission_keeps_reasoning_preview_live() {
+    async fn later_turn_work_admission_does_not_delay_reasoning_preview() {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let session_id = "session-work-admission-reasoning";
         let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
@@ -30113,8 +30366,11 @@ mod tests {
         .with_test_inference_ledger(inference_ledger.clone())
         .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
         .build();
-        host.pending_work_admission_judge = Some(tokio::spawn(async {
-            tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let admission_completed = Arc::new(AtomicBool::new(false));
+        let admission_completed_for_task = admission_completed.clone();
+        host.pending_work_admission_judge = Some(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(2_000)).await;
+            admission_completed_for_task.store(true, Ordering::SeqCst);
             Err(astra_services::TurnIntentJudgeError::Transport(
                 "unused test decision".to_string(),
             ))
@@ -30122,20 +30378,25 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         host.set_event_tx(tx);
         let mut state = create_durable_execution_test_state(session_id);
+        state.session_turn = 2;
         state.message = "continue the task".to_string();
         state.user_intent = state.message.clone();
 
         let observe_reasoning = async {
             loop {
-                let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
                     .await
-                    .expect("reasoning preview must arrive during provider inference")
+                    .expect("later-turn reasoning preview must not wait for admission")
                     .expect("event channel remains open");
                 if event.get("type").and_then(Value::as_str) == Some("reasoning_delta") {
                     assert_eq!(event["content"].as_str(), Some("live work analysis"));
                     assert!(
+                        !admission_completed.load(Ordering::SeqCst),
+                        "a later turn must preserve tools and begin provider inference without serial admission"
+                    );
+                    assert!(
                         !provider_completed.load(Ordering::SeqCst),
-                        "Work admission buffered reasoning until provider completion"
+                        "reasoning still streams before provider completion once admission settles"
                     );
                     break;
                 }
@@ -30574,6 +30835,63 @@ mod tests {
         let gateway_requests = requests.lock().await;
         assert_eq!(gateway_requests.len(), 1, "one upstream request expected");
 
+        inference_ledger.assert_quiescent();
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn execute_turn_sends_no_tool_schemas_for_typed_social_intent() {
+        let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "disabled");
+        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let session_id = "session-social-wire-surface";
+        let (gateway_url, requests, server) = spawn_gateway(
+            axum::http::StatusCode::OK,
+            json!({
+                "choices": [{
+                    "message": {"content": "Hello!"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 3}
+            }),
+        )
+        .await;
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-social-wire".to_string(),
+            session_id.to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_test_inference_ledger(inference_ledger.clone())
+        .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(2_000))))
+        .build();
+        let mut state = create_durable_execution_test_state(session_id);
+        state.session_turn = 1;
+        state.message = "hello".to_string();
+        state.user_intent = state.message.clone();
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_communicative_act(astra_config::user_profile::TurnCommunicativeAct::Social)
+                .with_work_lifecycle(astra_config::user_profile::WorkLifecycleIntent::NotRequired)
+                .with_workspace_mutation(
+                    astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+                ),
+        );
+
+        host.execute_turn(&mut state).await.expect("social turn");
+
+        let requests = requests.lock().await.clone();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .get("tools")
+                .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)),
+            "the provider request must not contain tool schemas: {}",
+            requests[0]
+        );
         inference_ledger.assert_quiescent();
         server.abort();
     }
@@ -33397,6 +33715,76 @@ mod tests {
                     })),
                 "the sidecar must use the closed Work-admission contract"
             );
+            inference_ledger.assert_quiescent();
+            server.abort();
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+        async fn builtin_social_admission_projects_an_empty_server_tool_surface() {
+            let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
+            let inference_ledger =
+                crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+            let (gateway_url, requests, server) = spawn_gateway(
+                axum::http::StatusCode::OK,
+                json!({
+                    "choices": [{
+                        "message": {
+                            "content": "{\"communicative_act\":\"social\",\"work_lifecycle\":\"not_required\",\"workspace_mutation\":\"read_only\",\"execution_topology\":\"primary\",\"acceptance_unit_relationship\":\"single_outcome\",\"acceptance_units\":[]}"
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 8, "completion_tokens": 18}
+                }),
+            )
+            .await;
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-social-surface".to_string(),
+                "s-social-surface".to_string(),
+            )
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                true, false,
+            ))
+            .with_test_inference_ledger(inference_ledger.clone())
+            .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3_000))))
+            .build();
+            let mut state = create_durable_execution_test_state("s-social-surface");
+            state.session_turn = 1;
+            state.message = "hello".to_string();
+            state.user_intent = state.message.clone();
+
+            assert_eq!(
+                host.judge_turn_intent(&state).await,
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable
+            );
+            host.resolve_pending_work_admission(true).await;
+            host.flush_completed_work_admission_phase(&mut state);
+
+            let intent = state
+                .turn_intent
+                .as_ref()
+                .expect("completed admission must project typed turn intent");
+            assert_eq!(
+                intent.communicative_act,
+                astra_config::user_profile::TurnCommunicativeAct::Social
+            );
+            assert!(
+                host.filtered_runtime_ready_turn_tools(&HashSet::new(), &state)
+                    .is_empty(),
+                "a typed social turn must not send tool schemas to the primary provider"
+            );
+
+            let requests = requests.lock().await.clone();
+            assert_eq!(requests.len(), 1, "admission remains one sidecar request");
+            assert!(requests[0]["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("communicative_act"))
+                })
+            }));
             inference_ledger.assert_quiescent();
             server.abort();
         }
