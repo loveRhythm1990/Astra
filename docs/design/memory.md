@@ -48,7 +48,7 @@ Hosted or browser-login deployments use the application-scoped credential resolv
 - `read_only`: recall is allowed; write-oriented extraction, reflection and session-end cleanup are not admitted.
 - `read_write`: read and write operations are allowed. Transport checks remain in place to catch revocation or changes after admission.
 
-Trusted self-hosted deployments with `MEMORIA_MASTER_KEY` and no `MEMORIA_WEB_URL` use an owner-bound master-key port. This is an explicit deployment mode, not a fallback from failed scoped resolution. Every data request projects the authenticated Astra user as the Memoria owner; an unbound master-key port fails closed.
+Trusted self-hosted deployments with `MEMORIA_MASTER_KEY` and no `MEMORIA_WEB_URL` use an owner-bound master-key port. Data requests authenticate with Memoria's owner-scoped master scheme, which validates the deployment secret but removes administrator authority before routing to memory handlers. This is an explicit deployment mode, not a fallback from failed scoped resolution. Every data request projects the authenticated Astra user as the Memoria owner; an unbound or incompatible backend fails closed.
 
 The background coordinator may launch a lightweight admission task, but it checks consent before loading snapshots, resolving an LLM, generating memory, or scheduling persistence. See [authentication](authentication.md) for issuer, credential replacement and retention.
 

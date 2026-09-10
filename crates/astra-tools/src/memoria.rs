@@ -1319,12 +1319,7 @@ impl MemoriaToolGateway {
             if endpoint.is_empty() {
                 return payload.to_string();
             }
-            (
-                endpoint,
-                payload,
-                format!("Bearer {}", transport.credential),
-                method,
-            )
+            (endpoint, payload, transport.authorization_header(), method)
         } else {
             match Self::build_request_transport(
                 self.cloud_base.as_deref(),
@@ -1538,17 +1533,17 @@ impl MemoriaToolGateway {
         tool_transport: Option<&astra_memoria::MemoriaToolTransport>,
     ) -> Option<String> {
         let session_id = args.get("session_id").and_then(Value::as_str)?;
-        let (base_url, key, user_id) = if let Some(transport) = tool_transport {
+        let (base_url, authorization, user_id) = if let Some(transport) = tool_transport {
             (
                 transport.base_url.clone(),
-                transport.credential.clone(),
+                transport.authorization_header(),
                 transport.owner_user_id.clone(),
             )
         } else {
             let mem = astra_core::MemoriaSettings::from_env();
             (
                 mem.base_url,
-                mem.master_key?,
+                format!("Bearer {}", mem.master_key?),
                 args.get("user_id").and_then(Value::as_str)?.to_string(),
             )
         };
@@ -1565,7 +1560,7 @@ impl MemoriaToolGateway {
             .ok()?;
         let response = client
             .get(url)
-            .header("Authorization", format!("Bearer {key}"))
+            .header("Authorization", authorization)
             .header("X-User-Id", &user_id)
             .query(&[
                 ("session_id", session_id),
@@ -1675,7 +1670,7 @@ impl MemoriaToolGateway {
                 .map_err(|e| format!("build client: {e}"))?;
             let response = client
                 .post(url)
-                .header("Authorization", format!("Bearer {}", transport.credential))
+                .header("Authorization", transport.authorization_header())
                 .header("X-User-Id", &transport.owner_user_id)
                 .json(&json!({"name": name}))
                 .send()
@@ -2644,6 +2639,7 @@ mod tests {
                 base_url: server.uri(),
                 credential: "scoped-key".into(),
                 owner_user_id: "memoria-owner".into(),
+                owner_scoped_master: false,
             },
             admission: Arc::clone(&admission),
         });
@@ -2666,6 +2662,43 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert!(body.get("user_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn composition_owned_master_transport_uses_owner_only_authentication() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/memories/retrieve"))
+            .and(header("authorization", "Memoria-Owner master-key"))
+            .and(header("x-user-id", "astra-owner"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let port = Arc::new(ToolTransportPort {
+            transport: astra_memoria::MemoriaToolTransport {
+                base_url: server.uri(),
+                credential: "master-key".into(),
+                owner_user_id: "astra-owner".into(),
+                owner_scoped_master: true,
+            },
+            admission: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let gateway = MemoriaToolGateway::new(None, None).with_memoria_port(port);
+
+        let output = gateway
+            .call(
+                "recall",
+                &json!({
+                    "query": "preferences",
+                    "top_k": 3,
+                    "session_id": "session-1",
+                    "user_id": "attacker-selected-owner"
+                }),
+            )
+            .await;
+
+        assert!(!memoria_output_is_error(&output), "{output}");
     }
 
     #[tokio::test]

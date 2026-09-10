@@ -23,6 +23,20 @@ pub struct MemoriaToolTransport {
     pub base_url: String,
     pub credential: String,
     pub owner_user_id: String,
+    /// Authenticate a deployment master secret through Memoria's attenuated
+    /// owner-only scheme instead of unrestricted Bearer master authority.
+    pub owner_scoped_master: bool,
+}
+
+impl MemoriaToolTransport {
+    pub fn authorization_header(&self) -> String {
+        let scheme = if self.owner_scoped_master {
+            "Memoria-Owner"
+        } else {
+            "Bearer"
+        };
+        format!("{scheme} {}", self.credential)
+    }
 }
 
 /// Canonical owner + session boundary for session-scoped memory operations.

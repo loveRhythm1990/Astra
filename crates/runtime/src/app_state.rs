@@ -1024,10 +1024,10 @@ impl ReqwestMemoriaForwarder {
             .ok_or_else(|| {
                 "Memoria master-key request requires an authenticated owner".to_string()
             })?;
-        let request = self
-            .client
-            .request(method.clone(), url)
-            .header("Authorization", format!("Bearer {}", self.master_key));
+        let request = self.client.request(method.clone(), url).header(
+            "Authorization",
+            format!("Memoria-Owner {}", self.master_key),
+        );
         // Memoria's owner-scoped list endpoint is a GET with query
         // parameters.  Keep the existing JSON body for write/POST/PUT
         // routes, but never send a JSON body on GET: some HTTP servers ignore
@@ -1314,7 +1314,7 @@ mod tests {
                 .headers()
                 .get("Authorization")
                 .and_then(|value| value.to_str().ok()),
-            Some("Bearer test-key")
+            Some("Memoria-Owner test-key")
         );
         assert_eq!(
             request
@@ -1411,6 +1411,11 @@ mod tests {
                 let mut buf = vec![0u8; 4096];
                 let n = socket.read(&mut buf).await.unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(
+                    req.to_ascii_lowercase()
+                        .contains("authorization: memoria-owner test-key\r\n"),
+                    "self-hosted user requests must attenuate master authority: {req}"
+                );
                 assert!(
                     req.to_ascii_lowercase().contains("x-user-id: user-3\r\n"),
                     "authenticated owner must be projected to Memoria scope: {req}"

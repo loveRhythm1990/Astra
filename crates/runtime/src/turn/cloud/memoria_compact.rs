@@ -226,6 +226,7 @@ pub struct HttpMemoriaPort {
     http: reqwest::Client,
     owner_user_id: Option<String>,
     owner_binding_required: bool,
+    owner_scoped_master: bool,
 }
 
 impl HttpMemoriaPort {
@@ -242,12 +243,14 @@ impl HttpMemoriaPort {
             ),
             owner_user_id: None,
             owner_binding_required: false,
+            owner_scoped_master: false,
         }
     }
 
     fn new_master(base_url: String, master_key: String) -> Self {
         Self {
             owner_binding_required: true,
+            owner_scoped_master: true,
             ..Self::new(base_url, master_key)
         }
     }
@@ -299,10 +302,18 @@ impl HttpMemoriaPort {
                 "Memoria master-key data request requires an authenticated owner binding".into(),
             );
         }
+        let authorization_scheme = if self.owner_scoped_master {
+            "Memoria-Owner"
+        } else {
+            "Bearer"
+        };
         let request = self
             .http
             .request(method, url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header(
+                "Authorization",
+                format!("{authorization_scheme} {}", self.api_key),
+            )
             .header("X-Memoria-Tool", "astra");
         Ok(match owner {
             Some(owner) => request.header("X-User-Id", owner),
@@ -429,6 +440,7 @@ impl MemoriaPort for UserScopedMemoriaPort {
             base_url: self.resolver.provider.base_url.clone(),
             credential: credential.key,
             owner_user_id: credential.owner,
+            owner_scoped_master: false,
         }))
     }
 
@@ -639,6 +651,7 @@ impl MemoriaPort for HttpMemoriaPort {
             base_url: self.base_url.clone(),
             credential: self.api_key.clone(),
             owner_user_id: scope.user_id,
+            owner_scoped_master: self.owner_scoped_master,
         }))
     }
 
@@ -1535,6 +1548,8 @@ mod tests {
         assert_eq!(transport.base_url, "http://memoria.local");
         assert_eq!(transport.owner_user_id, "astra-owner");
         assert_eq!(transport.credential, "master-key");
+        assert!(transport.owner_scoped_master);
+        assert_eq!(transport.authorization_header(), "Memoria-Owner master-key");
     }
 
     #[test]
