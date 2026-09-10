@@ -27,7 +27,10 @@ pub const DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS: u32 = 800;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_config::user_profile::{TurnCommunicativeAct, TurnIntent, TurnIntentDomain};
+    use astra_config::user_profile::{
+        TurnCommunicativeAct, TurnIntent, TurnIntentDomain, WorkLifecycleIntent,
+        WorkspaceMutationIntent,
+    };
     use astra_turn_core::tool::schema::tool_schema_name;
     use astra_turn_core::tool_registry_report::ToolSelectionReport;
     use serde_json::Value;
@@ -48,6 +51,13 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    fn tool_free_intent(act: TurnCommunicativeAct) -> TurnIntent {
+        TurnIntent::default()
+            .with_communicative_act(act)
+            .with_work_lifecycle(WorkLifecycleIntent::NotRequired)
+            .with_workspace_mutation(WorkspaceMutationIntent::ReadOnly)
     }
 
     // ── Catalog invariants ──
@@ -260,7 +270,7 @@ mod tests {
                 Some(TurnIntentDomain::Code),
                 Some(TurnIntentDomain::Database),
             ] {
-                let mut intent = TurnIntent::default().with_communicative_act(act);
+                let mut intent = tool_free_intent(act);
                 intent.domain = domain;
                 let selected = registry.build_turn_surface(Some(&intent));
                 assert!(
@@ -376,7 +386,7 @@ mod tests {
     #[test]
     fn build_surface_with_report_non_work_act_is_empty() {
         let registry = ToolRegistry::new(mock_schemas());
-        let intent = TurnIntent::default().with_communicative_act(TurnCommunicativeAct::Social);
+        let intent = tool_free_intent(TurnCommunicativeAct::Social);
         let (schemas, report) = registry.build_turn_surface_with_report(Some(&intent), 3000);
         assert_eq!(
             report.schema_budget_used, 0,
@@ -460,8 +470,7 @@ mod tests {
     #[test]
     fn acknowledgement_returns_no_tools() {
         let reg = ToolRegistry::new(mock_schemas());
-        let intent =
-            TurnIntent::default().with_communicative_act(TurnCommunicativeAct::Acknowledgement);
+        let intent = tool_free_intent(TurnCommunicativeAct::Acknowledgement);
         let (schemas, _) = reg.build_turn_surface_with_report(Some(&intent), 2000);
         assert!(
             schemas.is_empty(),
