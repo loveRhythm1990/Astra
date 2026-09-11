@@ -7,6 +7,8 @@ use serde::Deserialize;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod device_login;
+
 /// Session authentication failure that can be repaired by `/login`.
 ///
 /// Excludes upstream model-provider credential failures. Those belong to the
@@ -185,6 +187,12 @@ pub(crate) async fn do_memoria_browser_login(
 ) -> Result<String, String> {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
+    if let Some(token) = device_login::try_login(api, profile, website_base).await? {
+        return Ok(token);
+    }
+    eprintln!(
+        "The website uses the legacy local callback. Safari requires an updated website for automatic login."
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|error| format!("failed to start local login callback: {error}"))?;

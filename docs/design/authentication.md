@@ -90,7 +90,49 @@ shared signing secret.
 
 `GET /auth/methods` advertises the Server's website and issuer. An unset website retains interactive password login, including all-in-one deployments. The CLI falls back to the older password journey only on discovery 404, not on outages or malformed configuration. Explicit username/password and manual scoped-key login remain available.
 
-Browser login URLs require HTTPS except for explicit loopback development addresses. The callback remains bound to 127.0.0.1 with exact Origin, nonce, method, content-type and bounded request validation. Windows passes the URL as child-process environment data, not shell source.
+Browser login URLs require HTTPS except for explicit loopback development addresses. Windows passes the URL as child-process environment data, not shell source.
+
+### Website-mediated CLI approval
+
+The CLI first calls the discovered website's
+`POST /api/auth/astra/device-login/start` with a SHA-256 `code_challenge` of a
+private, randomly generated base64url verifier. The website returns a signed,
+five-minute `login_ticket`, comparison `user_code`, `expires_in` and `interval`.
+The CLI constructs `/connect/astra?request=<ticket>&cli_version=...` on the same
+discovered website; it does not trust a response-provided redirect URL. The
+verifier never enters the browser URL or logs.
+
+The signed-in browser confirms the code matches the user's terminal and approves
+the request through the website's authenticated, same-origin API. It receives
+neither a connection key nor an Astra session token. There is no browser request
+to localhost, HTTPS-to-HTTP form, popup callback or browser security exception.
+Users must reject login links they did not initiate; device-style approval can
+otherwise authorize a remote initiator. The browser reports approval, not
+successful CLI token storage.
+
+The CLI polls `POST /api/auth/astra/device-login/poll` with `login_ticket` and
+`code_verifier` in its JSON body. `pending` without a key is repeated at the
+advertised interval; `approved` must contain a nonempty `connection_key`. The
+website binds approval to the account and exact active integration-key generation,
+validates the verifier and expiry, and consumes approval once before returning
+the key. Rotation, revocation, inactive accounts and replay fail closed. Browser
+approval reuses the existing memory-consent owner; it never expands permissions.
+The CLI then uses the existing `/auth/memoria` exchange and profile credential
+storage. No Astra Server auth schema, identity mapping or session lifecycle changes.
+
+Website HTTP redirects are not followed. Response sizes, request durations and
+total approval wait are bounded. Failed or ambiguous redemption is not replayed;
+restart login, since a successful server-side consume may have lost its response.
+Only start-endpoint **404** selects the unchanged legacy callback protocol,
+with an explicit warning that an old website does not fix Safari. That callback
+remains bound to 127.0.0.1 with exact Origin, nonce, method, content-type and
+bounded request validation. Other errors never silently downgrade.
+
+Deployment dependency: update the memoria-website frontend first, then its
+backend (including additive `srv_astra_device_logins` table), then distribute the
+new CLI. Old CLI links remain supported; a CLI-only upgrade against an old website
+does not solve Safari. This is a transport for existing scoped-key authentication,
+not a separate OAuth/account system. Explicit manual/password login is unchanged.
 
 ## Verification
 
