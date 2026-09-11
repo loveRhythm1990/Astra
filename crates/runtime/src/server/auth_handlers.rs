@@ -250,13 +250,13 @@ async fn memory_proxy_call_for_user(
     } else {
         None
     };
+    let authority = resolve_memoria_user_authority(state, user_id, requires_write)
+        .await
+        .map_err(map_memoria_forward_error)?;
     let strict_validation_scope = match strict_recall_scope.as_ref() {
         Some(scope) => Some(
-            astra_memoria::MemoryScope::new(
-                &memoria_owner_id_for_user(state, user_id).await?,
-                &scope.session_id,
-            )
-            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?,
+            astra_memoria::MemoryScope::new(authority.owner(), &scope.session_id)
+                .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?,
         ),
         None => None,
     };
@@ -266,28 +266,17 @@ async fn memory_proxy_call_for_user(
         .as_ref()
         .map(|_| strict_session_recall_limit(&body));
 
-    let mut response =
-        forward_memoria_for_user(state, user_id, requires_write, method, endpoint, body)
-            .await
-            .map_err(|error| {
-                tracing::warn!(
-                    target: "astra_runtime::auth",
-                    endpoint = endpoint,
-                    error = %error,
-                    "memory proxy forward failed"
-                );
-                if error.contains("not configured") {
-                    error_response(StatusCode::SERVICE_UNAVAILABLE, &error)
-                } else if error.contains("disabled by the user")
-                    || error.contains("not enabled for this Astra account")
-                {
-                    error_response(StatusCode::FORBIDDEN, &error)
-                } else if let Some(status) = parse_memoria_forward_status(&error) {
-                    error_response(status, &error)
-                } else {
-                    internal_error(&error)
-                }
-            })?;
+    let mut response = forward_memoria_with_authority(state, &authority, method, endpoint, body)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                target: "astra_runtime::auth",
+                endpoint = endpoint,
+                error = %error,
+                "memory proxy forward failed"
+            );
+            map_memoria_forward_error(error)
+        })?;
 
     if let Some(scope) = strict_validation_scope.as_ref() {
         if let Err(error) = astra_memoria::validate_strict_recall_payload(&response, scope) {
@@ -321,10 +310,9 @@ async fn memory_proxy_call_for_user(
                 "memory_type": "working",
                 "limit": limit,
             });
-            match forward_memoria_for_user(
+            match forward_memoria_with_authority(
                 state,
-                user_id,
-                false,
+                &authority,
                 reqwest::Method::GET,
                 "/v1/memories",
                 list_request,
@@ -384,69 +372,105 @@ async fn memory_proxy_call_for_user(
     Ok(Json(response))
 }
 
-async fn memoria_owner_id_for_user(
-    state: &AppState,
-    user_id: &str,
-) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-    if state.memoria_forwarder_is_override || state.memoria_user_access_uses_master_key {
-        return Ok(user_id.to_string());
-    }
-    let Some(resolver) = state.auth_service.memoria_credentials() else {
-        return Err(error_response(
-            StatusCode::FORBIDDEN,
-            "Memoria connection is not configured",
-        ));
-    };
-    resolver
-        .resolve(user_id)
-        .await
-        .map_err(internal_error)?
-        .map(|credential| credential.owner)
-        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "memory access is not enabled"))
+enum MemoriaUserAuthority {
+    Override {
+        owner: String,
+    },
+    Scoped {
+        base_url: String,
+        key: String,
+        owner: String,
+    },
+    SelfHosted {
+        owner: String,
+    },
 }
 
-async fn forward_memoria_for_user(
+impl MemoriaUserAuthority {
+    fn owner(&self) -> &str {
+        match self {
+            Self::Override { owner } | Self::Scoped { owner, .. } | Self::SelfHosted { owner } => {
+                owner
+            }
+        }
+    }
+}
+
+async fn resolve_memoria_user_authority(
     state: &AppState,
     user_id: &str,
     requires_write: bool,
+) -> Result<MemoriaUserAuthority, String> {
+    if state.memoria_forwarder_is_override {
+        return Ok(MemoriaUserAuthority::Override {
+            owner: user_id.to_string(),
+        });
+    }
+    let resolver = state
+        .auth_service
+        .memoria_credentials()
+        .ok_or("Memoria credential resolver is not configured")?;
+    match crate::turn::cloud::memoria_compact::select_memoria_authority(
+        resolver.resolve(user_id).await?,
+        state.memoria_self_hosted_fallback_enabled,
+    ) {
+        crate::turn::cloud::memoria_compact::MemoriaAuthoritySelection::Scoped(credential) => {
+            if !credential.access.allows(requires_write) {
+                return Err("memory access is disabled by the user".into());
+            }
+            Ok(MemoriaUserAuthority::Scoped {
+                base_url: resolver.provider.base_url,
+                key: credential.key,
+                owner: credential.owner,
+            })
+        }
+        crate::turn::cloud::memoria_compact::MemoriaAuthoritySelection::SelfHosted => {
+            Ok(MemoriaUserAuthority::SelfHosted {
+                owner: user_id.to_string(),
+            })
+        }
+        crate::turn::cloud::memoria_compact::MemoriaAuthoritySelection::Disabled => {
+            Err("memory access is not enabled for this Astra account".into())
+        }
+    }
+}
+
+async fn forward_memoria_with_authority(
+    state: &AppState,
+    authority: &MemoriaUserAuthority,
     method: reqwest::Method,
     endpoint: &str,
     mut body: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    // Explicit fixture overrides and trusted self-hosted composition use the
-    // owner-bound master-key forwarder. Hosted composition remains BYOK-only.
-    if state.memoria_forwarder_is_override || state.memoria_user_access_uses_master_key {
+    if matches!(
+        authority,
+        MemoriaUserAuthority::Override { .. } | MemoriaUserAuthority::SelfHosted { .. }
+    ) {
+        let object = body
+            .as_object_mut()
+            .ok_or("Memoria owner-scoped request requires a JSON object body")?;
+        object.insert(
+            "user_id".to_string(),
+            serde_json::Value::String(authority.owner().to_string()),
+        );
         return state
             .memoria_forwarder
             .forward(method, endpoint, body)
             .await;
     }
-    let resolver = state
-        .auth_service
-        .memoria_credentials()
-        .ok_or("Memoria connection is not configured")?;
-    let credential = resolver
-        .resolve(user_id)
-        .await?
-        .ok_or("memory access is not enabled for this Astra account")?;
-    if !credential.access.allows(requires_write) {
-        return Err("memory access is disabled by the user".into());
-    }
-    let connection_key = credential.key;
+    let MemoriaUserAuthority::Scoped { base_url, key, .. } = authority else {
+        unreachable!("non-scoped authorities return through the configured forwarder")
+    };
     if let Some(object) = body.as_object_mut() {
         object.remove("user_id");
     }
-    let url = format!(
-        "{}{}",
-        resolver.provider.base_url.trim_end_matches('/'),
-        endpoint
-    );
+    let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
     let request = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| "Memoria HTTP client unavailable")?
         .request(method.clone(), url)
-        .bearer_auth(connection_key)
+        .bearer_auth(key)
         .header("X-Memoria-Tool", "astra")
         .timeout(std::time::Duration::from_secs(30));
     let response = if method == reqwest::Method::GET {
@@ -470,6 +494,32 @@ async fn forward_memoria_for_user(
         return Ok(serde_json::json!({}));
     }
     serde_json::from_str(&text).map_err(|error| format!("Memoria parse error: {error}"))
+}
+
+async fn forward_memoria_for_user(
+    state: &AppState,
+    user_id: &str,
+    requires_write: bool,
+    method: reqwest::Method,
+    endpoint: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let authority = resolve_memoria_user_authority(state, user_id, requires_write).await?;
+    forward_memoria_with_authority(state, &authority, method, endpoint, body).await
+}
+
+fn map_memoria_forward_error(error: String) -> (StatusCode, Json<ErrorResponse>) {
+    if error.contains("not configured") {
+        error_response(StatusCode::SERVICE_UNAVAILABLE, &error)
+    } else if error.contains("disabled by the user")
+        || error.contains("not enabled for this Astra account")
+    {
+        error_response(StatusCode::FORBIDDEN, &error)
+    } else if let Some(status) = parse_memoria_forward_status(&error) {
+        error_response(status, &error)
+    } else {
+        internal_error(&error)
+    }
 }
 
 const MAX_STRICT_SESSION_RECALL_ITEMS: usize = 50;

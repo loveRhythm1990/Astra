@@ -64,7 +64,7 @@ pub async fn build_server_state(
             settings.memoria.base_url.clone(),
             settings.memoria.master_key.clone(),
         )
-        .with_self_hosted_memoria_user_access(settings.memoria.uses_self_hosted_master_key());
+        .with_self_hosted_memoria_fallback(settings.memoria.allows_self_hosted_master_fallback());
     let state = install_skillify_harness_service(state, &settings, &shared_pool, &shared_encryptor);
 
     let wiring =

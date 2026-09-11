@@ -96,6 +96,7 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
     let provider = MemoriaSettings {
         base_url: base,
         master_key: None,
+        self_hosted_master_access: false,
         issuer: None,
         web_url: Some("http://localhost".into()),
         legacy_issuer: None,
@@ -115,12 +116,17 @@ async fn public_memoria_auth_uses_one_provider_and_enforces_disconnect() {
         .with_memoria_settings(&provider)
         .unwrap(),
     );
-    // An independent override must never reroute the scoped credential.
+    // Even with self-hosted fallback enabled, the persisted scoped binding
+    // remains authoritative for its owner and consent mode.
     let app = build_app(
         AppState::new(ServiceInfo::default(), Arc::new(Healthy))
             .with_shared_pool(pool)
             .with_auth_service(auth.clone())
-            .with_memoria_config("http://127.0.0.1:1", None),
+            .with_memoria_config(
+                "http://127.0.0.1:1",
+                Some("self-hosted-fallback-key".into()),
+            )
+            .with_self_hosted_memoria_fallback(true),
     );
 
     let (status, methods) = request(app.clone(), "GET", "/auth/methods", None, json!({})).await;

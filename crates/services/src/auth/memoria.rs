@@ -349,6 +349,7 @@ impl DatabaseAuthService {
         self.with_memoria_settings(&MemoriaSettings {
             base_url,
             master_key: None,
+            self_hosted_master_access: false,
             issuer: None,
             web_url: None,
             legacy_issuer: None,
@@ -585,6 +586,7 @@ async fn verify_connection(
     let provider = MemoriaProvider::new(&MemoriaSettings {
         base_url: base_url.into(),
         master_key: None,
+        self_hosted_master_access: false,
         issuer: None,
         web_url: None,
         legacy_issuer: None,
@@ -731,6 +733,7 @@ mod provider_contract_tests {
         MemoriaSettings {
             base_url: base.into(),
             master_key: None,
+            self_hosted_master_access: false,
             issuer: None,
             web_url: web.map(str::to_string),
             legacy_issuer: None,

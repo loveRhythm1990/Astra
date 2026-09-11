@@ -245,6 +245,7 @@ async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
     let settings = astra_core::MemoriaSettings {
         base_url: base.clone(),
         master_key: None,
+        self_hosted_master_access: false,
         issuer: None,
         web_url: Some("http://localhost".into()),
         legacy_issuer: None,

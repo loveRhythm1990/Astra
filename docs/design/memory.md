@@ -40,7 +40,7 @@ The design does not require one physical backend. Vector, fulltext, graph, tabul
 
 ## Credential authority and admission
 
-The Server selects one memory credential authority during application composition. Prompt recall, background extraction, explicit `memory` tools, and HTTP memory routes must use that same authority.
+The Server composes one per-user memory authority policy. Prompt recall, background extraction, explicit `memory` tools, HTTP memory routes and session-end governance must use that same policy.
 
 Hosted or browser-login deployments use the application-scoped credential resolver owned by authentication. Each operation resolves the current owner binding and generation; no master-key fallback is inferred by a generic pool builder.
 
@@ -48,7 +48,7 @@ Hosted or browser-login deployments use the application-scoped credential resolv
 - `read_only`: recall is allowed; write-oriented extraction, reflection and session-end cleanup are not admitted.
 - `read_write`: read and write operations are allowed. Transport checks remain in place to catch revocation or changes after admission.
 
-Trusted self-hosted deployments with `MEMORIA_MASTER_KEY` and no `MEMORIA_WEB_URL` use an owner-bound master-key port. Data requests authenticate with Memoria's owner-scoped master scheme, which validates the deployment secret but removes administrator authority before routing to memory handlers. This is an explicit deployment mode, not a fallback from failed scoped resolution. Every data request projects the authenticated Astra user as the Memoria owner; an unbound or incompatible backend fails closed.
+Trusted self-hosted deployments may explicitly enable `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1` with `MEMORIA_MASTER_KEY` and no `MEMORIA_WEB_URL`. A persisted scoped binding always wins, preserving its owner namespace and consent. Only a successful lookup that returns no binding may select the owner-bound master port; lookup errors fail closed. These data requests authenticate with Memoria's owner-scoped master scheme, which validates the deployment secret but removes administrator authority before routing to memory handlers. Every request projects the authenticated Astra user as the Memoria owner; an unbound or incompatible backend fails closed. Memoria must contain the `Memoria-Owner` support introduced by `matrixorigin/Memoria#250` (not present in v0.5.1).
 
 The background coordinator may launch a lightweight admission task, but it checks consent before loading snapshots, resolving an LLM, generating memory, or scheduling persistence. See [authentication](authentication.md) for issuer, credential replacement and retention.
 

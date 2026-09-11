@@ -213,10 +213,10 @@ pub struct AppState {
     /// resolve a per-user credential instead of falling back to the
     /// server-wide forwarder merely because one is configured.
     pub(crate) memoria_forwarder_is_override: bool,
-    /// Trusted self-hosted deployments explicitly use the configured master
-    /// key for authenticated Astra users. Hosted/BYOK deployments leave this
-    /// false and resolve per-user scoped credentials.
-    pub(crate) memoria_user_access_uses_master_key: bool,
+    /// Trusted self-hosted deployments may explicitly allow the configured
+    /// master only when a user's scoped credential lookup reports no binding.
+    /// Persisted consent and lookup errors never select this fallback.
+    pub(crate) memoria_self_hosted_fallback_enabled: bool,
     memoria_health_cache: Arc<std::sync::RwLock<CachedMemoriaHealth>>,
     memoria_health_refresh: Arc<tokio::sync::Mutex<()>>,
     pub shared_pool: Option<SharedPool>,
@@ -337,7 +337,7 @@ impl AppState {
             memoria_master_key: default_memoria.master_key,
             memoria_forwarder: Arc::new(NoopMemoriaForwarder),
             memoria_forwarder_is_override: false,
-            memoria_user_access_uses_master_key: false,
+            memoria_self_hosted_fallback_enabled: false,
             memoria_health_cache: Arc::new(std::sync::RwLock::new(CachedMemoriaHealth::new(
                 MemoriaHealth::Disabled,
             ))),
@@ -431,7 +431,7 @@ impl AppState {
             Arc::new(ReqwestMemoriaForwarder::new(base_url.clone(), key))
         };
         self.memoria_forwarder_is_override = false;
-        self.memoria_user_access_uses_master_key = false;
+        self.memoria_self_hosted_fallback_enabled = false;
         *astra_core::sync_poison::recover_rwlock_write(&self.memoria_health_cache) =
             CachedMemoriaHealth::new(
                 if master_key.as_deref().is_some_and(|key| !key.is_empty()) {
@@ -445,8 +445,8 @@ impl AppState {
         self
     }
 
-    pub fn with_self_hosted_memoria_user_access(mut self, enabled: bool) -> Self {
-        self.memoria_user_access_uses_master_key = enabled
+    pub fn with_self_hosted_memoria_fallback(mut self, enabled: bool) -> Self {
+        self.memoria_self_hosted_fallback_enabled = enabled
             && self
                 .memoria_master_key
                 .as_deref()
@@ -1056,6 +1056,15 @@ impl ReqwestMemoriaForwarder {
         }
         String::from_utf8_lossy(&body).into_owned()
     }
+
+    fn owner_scoped_error(status: reqwest::StatusCode, body: &str) -> String {
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return format!(
+                "Memoria error {status}: owner-scoped authentication failed; verify MEMORIA_MASTER_KEY and upgrade Memoria to a version that supports the Memoria-Owner authorization scheme. Backend response: {body}"
+            );
+        }
+        format!("Memoria error {status}: {body}")
+    }
 }
 
 #[async_trait]
@@ -1074,7 +1083,7 @@ impl MemoriaForwarder for ReqwestMemoriaForwarder {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = Self::bounded_error_body(resp, 4096).await;
-            return Err(format!("Memoria error {status}: {text}"));
+            return Err(Self::owner_scoped_error(status, &text));
         }
         let text = resp
             .text()
@@ -1331,6 +1340,17 @@ mod tests {
         )
         .unwrap();
         assert!(payload.get("user_id").is_none());
+    }
+
+    #[test]
+    fn owner_scoped_forwarder_unauthorized_error_explains_compatibility() {
+        let error = ReqwestMemoriaForwarder::owner_scoped_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "Missing Bearer token",
+        );
+        assert!(error.contains("verify MEMORIA_MASTER_KEY"));
+        assert!(error.contains("supports the Memoria-Owner authorization scheme"));
+        assert!(error.contains("Missing Bearer token"));
     }
 
     #[test]
