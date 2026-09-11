@@ -15,6 +15,18 @@ pub enum MemoryAccess {
     ReadWrite,
 }
 impl MemoryAccess {
+    /// User-facing remediation shared by explicit tools and HTTP memory routes.
+    pub fn denial_message(self, write: bool) -> Option<&'static str> {
+        match (self, write) {
+            (Self::None, _) => Some(
+                "Memory sharing with Astra is disabled. Open Memoria Settings → Connected apps → Astra Cloud → Memory sharing settings and choose read-only or read/write access. Signing in to Astra does not enable memory sharing automatically.",
+            ),
+            (Self::ReadOnly, true) => Some(
+                "Memory sharing is read-only. Reading memories is allowed, but saving or modifying them requires read/write access. Open Memoria Settings → Connected apps → Astra Cloud → Memory sharing settings to change access.",
+            ),
+            _ => None,
+        }
+    }
     pub fn allows(self, write: bool) -> bool {
         self == Self::ReadWrite || (!write && self == Self::ReadOnly)
     }
@@ -650,6 +662,21 @@ async fn verify_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn consent_remediation_preserves_sign_in_and_memory_sharing_separation() {
+        for write in [false, true] {
+            let message = MemoryAccess::None.denial_message(write).unwrap();
+            assert!(message.contains("Memory sharing with Astra is disabled"));
+            assert!(message.contains("Memory sharing settings"));
+            assert!(!message.contains("/login"));
+            assert!(!message.contains("MEMORIA_MASTER_KEY"));
+            assert!(MemoryAccess::ReadWrite.denial_message(write).is_none());
+        }
+        assert!(MemoryAccess::ReadOnly.denial_message(false).is_none());
+        let message = MemoryAccess::ReadOnly.denial_message(true).unwrap();
+        assert!(message.contains("read-only"));
+        assert!(message.contains("requires read/write access"));
+    }
     #[test]
     fn step_up_proof_hash_binds_issuer_subject_and_generation_without_ambiguous_fields() {
         let binding = ReauthenticationBinding {

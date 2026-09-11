@@ -12140,7 +12140,7 @@ esac
             .await;
 
         assert!(result.is_error, "{}", result.output);
-        assert!(result.output.contains("composition-owned memory authority"));
+        assert!(result.output.contains("memory_service_misconfigured"));
     }
 
     #[tokio::test]

@@ -1290,7 +1290,8 @@ impl MemoriaToolGateway {
             }
         } else if self.composition_port_required {
             return json!({
-                "error": "Memory unavailable: the server did not provide its composition-owned memory authority"
+                "error": "Memory service configuration is incomplete. Please contact the server administrator.",
+                "code": "memory_service_misconfigured"
             })
             .to_string();
         } else {
@@ -1603,8 +1604,9 @@ impl MemoriaToolGateway {
             None => {
                 return Err(
                     json!({
-                        "error": "Memory unavailable: not connected to cloud and MEMORIA_MASTER_KEY not set",
-                        "hint": "Login with /login to enable cloud-backed memory with user isolation"
+                        "error": "Memory is not configured for this local execution path: MEMORIA_MASTER_KEY is not set.",
+                        "code": "local_memory_not_configured",
+                        "hint": "For a local Memoria deployment, configure its endpoint and MEMORIA_MASTER_KEY. To use cloud memory, connect this client to your Astra server; memory sharing is configured separately in Memoria Settings → Connected apps → Astra Cloud → Memory sharing settings."
                     })
                     .to_string(),
                 );
@@ -2720,10 +2722,10 @@ mod tests {
             .await;
 
         assert!(memoria_output_is_error(&output), "{output}");
-        assert!(
-            output.contains("composition-owned memory authority"),
-            "{output}"
-        );
+        assert!(output.contains("memory_service_misconfigured"), "{output}");
+        assert!(output.contains("server administrator"));
+        assert!(!output.contains("/login"));
+        assert!(!output.contains("MEMORIA_MASTER_KEY"));
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 

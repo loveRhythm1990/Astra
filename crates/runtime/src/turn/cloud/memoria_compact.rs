@@ -465,16 +465,21 @@ impl UserScopedMemoriaPort {
 }
 
 fn enforce_memory_access(access: &str, write: bool) -> Result<(), String> {
-    if access == "none" {
-        return Err("memory access is disabled by the user".to_string());
+    use astra_services::auth::memoria::MemoryAccess;
+    let access =
+        match access {
+            "none" => MemoryAccess::None,
+            "read_only" => MemoryAccess::ReadOnly,
+            "read_write" => MemoryAccess::ReadWrite,
+            _ => return Err(
+                "Memory service configuration is invalid. Please contact the server administrator."
+                    .into(),
+            ),
+        };
+    match access.denial_message(write) {
+        Some(message) => Err(message.into()),
+        None => Ok(()),
     }
-    if write && access != "read_write" {
-        return Err("memory write access is disabled by the user".to_string());
-    }
-    if access != "read_only" && access != "read_write" {
-        return Err("Memoria credential has an invalid access mode".to_string());
-    }
-    Ok(())
 }
 
 #[async_trait::async_trait]

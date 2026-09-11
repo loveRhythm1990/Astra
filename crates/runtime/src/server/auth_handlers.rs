@@ -415,8 +415,8 @@ async fn resolve_memoria_user_authority(
         state.memoria_self_hosted_fallback_enabled,
     ) {
         crate::turn::cloud::memoria_compact::MemoriaAuthoritySelection::Scoped(credential) => {
-            if !credential.access.allows(requires_write) {
-                return Err("memory access is disabled by the user".into());
+            if let Some(message) = credential.access.denial_message(requires_write) {
+                return Err(message.into());
             }
             Ok(MemoriaUserAuthority::Scoped {
                 base_url: resolver.provider.base_url,
