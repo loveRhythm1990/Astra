@@ -366,16 +366,21 @@ pub(crate) enum MemoriaAuthoritySelection<T> {
 }
 
 /// The user's persisted binding is authoritative whenever it exists. The
-/// deployment master can only fill an actually missing binding; it cannot
-/// replace consent or an upstream owner namespace.
+/// deployment master requires an explicitly eligible active local account;
+/// revoked or inactive authority cannot become fallback authority.
 pub(crate) fn select_memoria_authority<T>(
-    scoped: Option<T>,
+    resolution: astra_services::auth::memoria::MemoriaCredentialResolution<T>,
     self_hosted_fallback_enabled: bool,
 ) -> MemoriaAuthoritySelection<T> {
-    match scoped {
-        Some(scoped) => MemoriaAuthoritySelection::Scoped(scoped),
-        None if self_hosted_fallback_enabled => MemoriaAuthoritySelection::SelfHosted,
-        None => MemoriaAuthoritySelection::Disabled,
+    use astra_services::auth::memoria::MemoriaCredentialResolution;
+    match resolution {
+        MemoriaCredentialResolution::Scoped(scoped) => MemoriaAuthoritySelection::Scoped(scoped),
+        MemoriaCredentialResolution::UnboundLocal if self_hosted_fallback_enabled => {
+            MemoriaAuthoritySelection::SelfHosted
+        }
+        MemoriaCredentialResolution::UnboundLocal | MemoriaCredentialResolution::Denied => {
+            MemoriaAuthoritySelection::Disabled
+        }
     }
 }
 
@@ -411,8 +416,8 @@ impl UserScopedMemoriaPort {
         }
     }
 
-    /// Allow owner-scoped master access only when this user's scoped
-    /// credential lookup succeeds and explicitly reports no binding.
+    /// Allow owner-scoped master access only when authentication explicitly
+    /// reports an eligible active local account with no binding.
     pub fn with_self_hosted_fallback(mut self, base_url: String, master_key: String) -> Self {
         self.self_hosted_fallback = Some(SelfHostedMemoriaFallback {
             base_url,
@@ -429,7 +434,7 @@ impl UserScopedMemoriaPort {
     async fn client(&self, write: bool) -> Result<(HttpMemoriaPort, String), String> {
         let owner_user_id = self.owner_user_id()?;
         match select_memoria_authority(
-            self.resolver.resolve(owner_user_id).await?,
+            self.resolver.resolve_runtime(owner_user_id).await?,
             self.self_hosted_fallback.is_some(),
         ) {
             MemoriaAuthoritySelection::Scoped(credential) => {
@@ -477,7 +482,7 @@ impl MemoriaPort for UserScopedMemoriaPort {
     async fn admits_operation(&self, write: bool) -> Result<bool, String> {
         Ok(
             match select_memoria_authority(
-                self.resolver.resolve(self.owner_user_id()?).await?,
+                self.resolver.resolve_runtime(self.owner_user_id()?).await?,
                 self.self_hosted_fallback.is_some(),
             ) {
                 MemoriaAuthoritySelection::Scoped(credential) => credential.access.allows(write),
@@ -1638,16 +1643,21 @@ mod tests {
 
     #[test]
     fn scoped_binding_always_wins_over_self_hosted_fallback() {
+        use astra_services::auth::memoria::MemoriaCredentialResolution;
         assert!(matches!(
-            select_memoria_authority(Some("scoped-owner"), true),
+            select_memoria_authority(MemoriaCredentialResolution::Scoped("scoped-owner"), true),
             MemoriaAuthoritySelection::Scoped("scoped-owner")
         ));
         assert!(matches!(
-            select_memoria_authority::<&str>(None, true),
+            select_memoria_authority::<&str>(MemoriaCredentialResolution::UnboundLocal, true),
             MemoriaAuthoritySelection::SelfHosted
         ));
         assert!(matches!(
-            select_memoria_authority::<&str>(None, false),
+            select_memoria_authority::<&str>(MemoriaCredentialResolution::UnboundLocal, false),
+            MemoriaAuthoritySelection::Disabled
+        ));
+        assert!(matches!(
+            select_memoria_authority::<&str>(MemoriaCredentialResolution::Denied, true),
             MemoriaAuthoritySelection::Disabled
         ));
     }

@@ -466,6 +466,10 @@ async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
     auth.disconnect_memoria(&user).await.unwrap();
     auth.disconnect_memoria(&user).await.unwrap(); // idempotent service operation
     assert!(resolver.resolve(&user).await.unwrap().is_none());
+    assert!(matches!(
+        resolver.resolve_runtime(&user).await.unwrap(),
+        astra_services::auth::memoria::MemoriaCredentialResolution::Denied
+    ));
     assert_eq!(
         auth.current_user(&headers).await.err().unwrap().0,
         StatusCode::UNAUTHORIZED
@@ -513,6 +517,10 @@ async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
         .await
         .unwrap();
     assert!(resolver.resolve(&user).await.unwrap().is_none());
+    assert!(matches!(
+        resolver.resolve_runtime(&user).await.unwrap(),
+        astra_services::auth::memoria::MemoriaCredentialResolution::Denied
+    ));
     assert_eq!(
         auth.login_memoria("retention-key").await.err().unwrap().0,
         StatusCode::FORBIDDEN

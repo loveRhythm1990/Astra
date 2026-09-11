@@ -170,6 +170,19 @@ pub struct MemoriaCredential {
     connection_generation: Option<String>,
 }
 
+/// Current runtime authority for one Astra account.
+///
+/// `UnboundLocal` is deliberately narrower than an absent credential: only an
+/// active password account with no retained Memoria identity may receive the
+/// explicitly enabled self-hosted fallback. Disconnect and account lifecycle
+/// changes therefore cannot turn a previously scoped runtime into a new
+/// deployment-master grant.
+pub enum MemoriaCredentialResolution<T> {
+    Scoped(T),
+    UnboundLocal,
+    Denied,
+}
+
 #[derive(PartialEq, Eq)]
 pub(super) struct ReauthenticationBinding {
     provider_id: String,
@@ -220,6 +233,28 @@ impl MemoriaCredentialResolver {
             self.provider.provider_id
         ))
     }
+    fn decode_credential(
+        &self,
+        ciphertext: Option<&str>,
+        metadata: Option<&str>,
+    ) -> Result<MemoriaCredential, String> {
+        let identity: VerifiedMemoriaIdentity = serde_json::from_str(metadata.unwrap_or(""))
+            .map_err(|_| "Invalid Memoria binding metadata".to_string())?;
+        if identity.issuer != self.provider.issuer {
+            return Err("Memoria binding issuer mismatch".into());
+        }
+        let key = self
+            .encryptor
+            .decrypt(ciphertext.ok_or("Missing Memoria credential")?)
+            .map_err(|_| "Memoria credential decryption failed".to_string())?;
+        Ok(MemoriaCredential {
+            key,
+            owner: identity.memoria_user_id,
+            generation: identity.key_id,
+            access: identity.memory_access,
+            connection_generation: identity.connection_generation,
+        })
+    }
     pub async fn resolve(&self, user: &str) -> Result<Option<MemoriaCredential>, String> {
         let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT encrypted_value, CAST(metadata AS CHAR) FROM auth_tokens WHERE token_id = ? AND type = 'memoria_connection' AND provider = 'memoria' AND scope_user_id = ? AND is_active = 1 AND EXISTS (SELECT 1 FROM auth_users WHERE user_id = auth_tokens.scope_user_id AND is_active = 1)")
@@ -228,23 +263,37 @@ impl MemoriaCredentialResolver {
         let Some((ciphertext, metadata)) = row else {
             return Ok(None);
         };
-        let identity: VerifiedMemoriaIdentity =
-            serde_json::from_str(metadata.as_deref().unwrap_or(""))
-                .map_err(|_| "Invalid Memoria binding metadata".to_string())?;
-        if identity.issuer != self.provider.issuer {
-            return Err("Memoria binding issuer mismatch".into());
+        self.decode_credential(ciphertext.as_deref(), metadata.as_deref())
+            .map(Some)
+    }
+
+    /// Resolve both the current credential and whether an absent credential
+    /// represents an active, genuinely local account that is eligible for the
+    /// opt-in self-hosted fallback.
+    pub async fn resolve_runtime(
+        &self,
+        user: &str,
+    ) -> Result<MemoriaCredentialResolution<MemoriaCredential>, String> {
+        if let Some(credential) = self.resolve(user).await? {
+            return Ok(MemoriaCredentialResolution::Scoped(credential));
         }
-        let key = self
-            .encryptor
-            .decrypt(ciphertext.as_deref().ok_or("Missing Memoria credential")?)
-            .map_err(|_| "Memoria credential decryption failed".to_string())?;
-        Ok(Some(MemoriaCredential {
-            key,
-            owner: identity.memoria_user_id,
-            generation: identity.key_id,
-            access: identity.memory_access,
-            connection_generation: identity.connection_generation,
-        }))
+        let eligible: Option<String> = sqlx::query_scalar(
+            "SELECT u.user_id FROM auth_users u \
+             WHERE u.user_id = ? AND u.is_active = 1 AND u.password_hash <> '' \
+             AND NOT EXISTS (SELECT 1 FROM auth_tokens t WHERE t.type = 'memoria_connection' AND t.provider = 'memoria' AND t.scope_user_id = u.user_id) \
+             AND NOT EXISTS (SELECT 1 FROM auth_external_identities e WHERE e.astra_user_id = u.user_id AND e.provider_id LIKE 'memoria:%') \
+             AND NOT EXISTS (SELECT 1 FROM auth_memoria_identities l WHERE l.astra_user_id = u.user_id) \
+             LIMIT 1",
+        )
+        .bind(user)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|_| "Memoria runtime fallback eligibility lookup failed".to_string())?;
+        Ok(if eligible.is_some() {
+            MemoriaCredentialResolution::UnboundLocal
+        } else {
+            MemoriaCredentialResolution::Denied
+        })
     }
 }
 impl DatabaseAuthService {

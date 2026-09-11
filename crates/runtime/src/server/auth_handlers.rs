@@ -411,7 +411,7 @@ async fn resolve_memoria_user_authority(
         .memoria_credentials()
         .ok_or("Memoria credential resolver is not configured")?;
     match crate::turn::cloud::memoria_compact::select_memoria_authority(
-        resolver.resolve(user_id).await?,
+        resolver.resolve_runtime(user_id).await?,
         state.memoria_self_hosted_fallback_enabled,
     ) {
         crate::turn::cloud::memoria_compact::MemoriaAuthoritySelection::Scoped(credential) => {
