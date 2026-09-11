@@ -97,13 +97,15 @@ Browser login URLs require HTTPS except for explicit loopback development addres
 The CLI first calls the discovered website's
 `POST /api/auth/astra/device-login/start` with a SHA-256 `code_challenge` of a
 private, randomly generated base64url verifier. The website returns a signed,
-five-minute `login_ticket`, comparison `user_code`, `expires_in` and `interval`.
+five-minute `login_ticket`, `expires_in` and `interval`. The CLI ignores the
+website's legacy `user_code` response field; no code is displayed or entered.
 The CLI constructs `/connect/astra?request=<ticket>&cli_version=...` on the same
 discovered website; it does not trust a response-provided redirect URL. The
 verifier never enters the browser URL or logs.
 
-The signed-in browser confirms the code matches the user's terminal and approves
-the request through the website's authenticated, same-origin API. It receives
+The signed-in browser shows the account and a single explicit sign-in button,
+without code matching or an extra checkbox. Clicking it approves the request
+through the website's authenticated, same-origin API. It receives
 neither a connection key nor an Astra session token. There is no browser request
 to localhost, HTTPS-to-HTTP form, popup callback or browser security exception.
 Users must reject login links they did not initiate; device-style approval can

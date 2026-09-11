@@ -10,7 +10,6 @@ use std::time::Duration;
 #[derive(Deserialize)]
 struct Started {
     login_ticket: String,
-    user_code: String,
     expires_in: u64,
     interval: u64,
 }
@@ -55,12 +54,6 @@ fn login_url(website: &str, started: &Started) -> Result<String, String> {
             .login_ticket
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        || started.user_code.len() != 9
-        || started.user_code.as_bytes()[4] != b'-'
-        || !started
-            .user_code
-            .bytes()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
         || !(1..=300).contains(&started.expires_in)
         || !(1..=10).contains(&started.interval)
     {
@@ -84,10 +77,7 @@ pub(super) async fn try_login(
         None => return Ok(None),
     };
     let url = login_url(website, &started)?;
-    eprintln!(
-        "Open this page to connect Astra:\n{url}\n\nConfirm this code on the page: {}\nOnly approve a login you started yourself.",
-        started.user_code
-    );
+    eprintln!("Open this page to connect Astra:\n{url}");
     open_login_url(&url);
     let key = wait_for_approval(&client, website, &started, &secret).await?;
     // Preserve canonical issuer binding, memory permissions and local storage.
@@ -190,17 +180,24 @@ mod tests {
         assert_eq!(url.path(), "/connect/astra");
         assert!(!url.as_str().contains(&secret));
         assert!(!url.as_str().contains("code_verifier"));
-        for field in ["login_ticket", "user_code"] {
-            let mut invalid = configuration();
-            invalid[field] = json!("https://evil.invalid/\n");
-            assert!(
-                login_url(
-                    "https://example.com",
-                    &serde_json::from_value(invalid).unwrap()
-                )
-                .is_err()
-            );
-        }
+        let mut invalid = configuration();
+        invalid["login_ticket"] = json!("https://evil.invalid/\n");
+        assert!(
+            login_url(
+                "https://example.com",
+                &serde_json::from_value(invalid).unwrap()
+            )
+            .is_err()
+        );
+        let mut without_code = configuration();
+        without_code.as_object_mut().unwrap().remove("user_code");
+        assert!(
+            login_url(
+                "https://example.com",
+                &serde_json::from_value(without_code).unwrap()
+            )
+            .is_ok()
+        );
         for (field, value) in [
             ("expires_in", 0),
             ("expires_in", 301),
