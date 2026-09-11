@@ -92,49 +92,65 @@ shared signing secret.
 
 Browser login URLs require HTTPS except for explicit loopback development addresses. Windows passes the URL as child-process environment data, not shell source.
 
-### Website-mediated CLI approval
+### Browser-delivered local authorization codes
 
-The CLI first calls the discovered website's
-`POST /api/auth/astra/device-login/start` with a SHA-256 `code_challenge` of a
-private, randomly generated base64url verifier. The website returns a signed,
-five-minute `login_ticket`, `expires_in` and `interval`. The CLI ignores the
-website's legacy `user_code` response field; no code is displayed or entered.
-The CLI constructs `/connect/astra?request=<ticket>&cli_version=...` on the same
-discovered website; it does not trust a response-provided redirect URL. The
-verifier never enters the browser URL or logs.
+The CLI binds its existing listener to `127.0.0.1:0`, generates a fresh state
+and private verifier, and opens the discovered website's `/connect/astra` with
+`port`, `state`, `cli_version`, `callback_transport=authorization_code_v1`,
+`code_challenge_method=S256`, and SHA-256 `code_challenge`. The verifier never
+enters the browser URL, logs, or profile storage. No anonymous start endpoint
+or remote approval polling exists.
 
-The signed-in browser shows the account and a single explicit sign-in button,
-without code matching or an extra checkbox. Clicking it approves the request
-through the website's authenticated, same-origin API. It receives
-neither a connection key nor an Astra session token. There is no browser request
-to localhost, HTTPS-to-HTTP form, popup callback or browser security exception.
-Users must reject login links they did not initiate; device-style approval can
-otherwise authorize a remote initiator. The browser reports approval, not
-successful CLI token storage.
+The signed-in browser shows the account and the existing single confirmation
+button. There is no code to enter or compare and no additional checkbox.
+Confirmation calls the website's authenticated
+`POST /api/integrations/astra/browser-login/authorize`. It reuses the canonical
+integration-key/consent owner and returns only a random, one-time authorization
+code with a 60-second lifetime, never a connection key or Astra session token.
 
-The CLI polls `POST /api/auth/astra/device-login/poll` with `login_ticket` and
-`code_verifier` in its JSON body. `pending` without a key is repeated at the
-advertised interval; `approved` must contain a nonempty `connection_key`. The
-website binds approval to the account and exact active integration-key generation,
-validates the verifier and expiry, and consumes approval once before returning
-the key. Rotation, revocation, inactive accounts and replay fail closed. Browser
-approval reuses the existing memory-consent owner; it never expands permissions.
-The CLI then uses the existing `/auth/memoria` exchange and profile credential
-storage. No Astra Server auth schema, identity mapping or session lifecycle changes.
+The browser performs a **top-level GET navigation** to
+`http://127.0.0.1:<port>/callback?code=...&state=...`. This is a native-app
+loopback redirect, not cross-origin fetch, an iframe, a popup, or an insecure
+form POST. The destination is constructed from a validated integer port; no
+caller-provided hostname or arbitrary redirect URL is accepted.
 
-Website HTTP redirects are not followed. Response sizes, request durations and
-total approval wait are bounded. Failed or ambiguous redemption is not replayed;
-restart login, since a successful server-side consume may have lost its response.
-Only start-endpoint **404** selects the unchanged legacy callback protocol,
-with an explicit warning that an old website does not fix Safari. That callback
-remains bound to 127.0.0.1 with exact Origin, nonce, method, content-type and
-bounded request validation. Other errors never silently downgrade.
+The local listener checks the state and bounded, unambiguous request, then
+redeems the code once through
+`POST /api/auth/astra/browser-login/redeem` on the discovered website. The
+request carries the code, private verifier, exact redirect URI and state.
+The website checks S256, expiry, active account, and the exact active
+integration-key generation under the canonical account lock. A conditional
+consume admits one winner. Rotation, revocation, inactivity and replay fail
+closed. Only code hashes and binding metadata are stored in the additive
+`srv_astra_login_codes` table.
 
-Deployment dependency: update the memoria-website frontend first, then its
-backend (including additive `srv_astra_device_logins` table), then distribute the
-new CLI. Old CLI links remain supported; a CLI-only upgrade against an old website
-does not solve Safari. This is a transport for existing scoped-key authentication,
-not a separate OAuth/account system. Explicit manual/password login is unchanged.
+Security boundary: transferring the initial website URL to another computer
+does not deliver its browser's code to the remote initiator. A public challenge,
+state, port, or even the initiator's private verifier alone cannot retrieve
+a code or credential. The remote initiator has no polling endpoint. A local
+process that intercepts the callback still lacks the private verifier. This
+does not defend against a compromised local host or a user deliberately
+forwarding the final secret authorization code.
+
+After redemption, the CLI uses the existing `/auth/memoria` exchange and saves
+the existing Astra profile tokens. Only then does the local page report
+successful login. The response has no external resources, uses `no-store`
+and `no-referrer`, and contains no credentials. No Astra Server schema, identity
+mapping or session-lifecycle change is needed.
+
+Website HTTPS is required except explicit loopback development URLs. Code
+exchange does not follow redirects, bounds response size and duration, and is
+not automatically replayed after failure: consumption may already have
+succeeded. Invalid/mismatched GET callbacks do not trigger token exchange.
+The five-minute local listener deadline remains in effect.
+
+Compatibility is explicit in the CLI link. An old website can ignore the
+capability fields and use the unchanged JSON POST callback, which still checks
+exact website Origin, state, method and content type. There is no speculative
+start call and no 404/405/HTML-based fallback decision. A CLI-only update does
+not fix Safari against an old website; upgrade website backend and frontend
+before distributing the new CLI. Old CLI links remain supported. Explicit
+password and manual-key login remain unchanged.
 
 ## Verification
 
