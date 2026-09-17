@@ -1630,7 +1630,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(body)
             .send()
             .await?;
@@ -1647,7 +1647,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .query(&[("expected_session_id", expected_session_id)])
             .send()
             .await?;
