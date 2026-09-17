@@ -126,7 +126,7 @@ fn base_is_loopback(base: &Url) -> bool {
 }
 
 fn client_builder_for_base(base: &Url) -> reqwest::ClientBuilder {
-    let builder = Client::builder();
+    let builder = Client::builder().redirect(reqwest::redirect::Policy::none());
     if base_is_loopback(base) {
         // Loopback is a process-local control-plane boundary, never an
         // outbound destination. Bypass inherited proxy variables even when
@@ -157,7 +157,11 @@ fn streaming_http_client(base: &Url) -> Result<Client, reqwest::Error> {
 }
 
 /// Stateless façade over the astra HTTP API (thin client).
-#[derive(Debug, Clone)]
+pub trait BearerProvider: std::fmt::Debug + Send + Sync {
+    fn token(&self) -> futures_util::future::BoxFuture<'_, Result<String, ThinClientError>>;
+}
+
+#[derive(Clone)]
 pub struct ThinClient {
     http: Client,
     /// Separate client for SSE streams — auto-decompression disabled to prevent
@@ -167,6 +171,15 @@ pub struct ThinClient {
     base: Url,
     /// Default bearer when call sites omit per-request token (optional).
     bearer_token: Option<String>,
+    bearer_provider: Option<std::sync::Arc<dyn BearerProvider>>,
+}
+
+impl std::fmt::Debug for ThinClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThinClient")
+            .field("base", &self.base)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ThinClient {
@@ -183,7 +196,15 @@ impl ThinClient {
             http_stream,
             base,
             bearer_token,
+            bearer_provider: None,
         })
+    }
+
+    /// Credentials stay owned by the caller. The transport asks the owner at
+    /// dispatch time, including reconnects and background requests.
+    pub fn with_bearer_provider(mut self, provider: std::sync::Arc<dyn BearerProvider>) -> Self {
+        self.bearer_provider = Some(provider);
+        self
     }
 
     /// Shared `reqwest::Client` (TLS / proxy policy aligned with thin API). For optional in-library LLM tool surface and ad-hoc calls to other origins (e.g. Memoria health).
@@ -211,28 +232,27 @@ impl ThinClient {
         Ok(h)
     }
 
-    fn auth_headers_for(&self, token_override: Option<&str>) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        let token = token_override.or(self.bearer_token.as_deref());
-        if let Some(t) = token
-            && let Ok(v) = HeaderValue::from_str(&format!("Bearer {t}"))
-        {
-            h.insert(header::AUTHORIZATION, v);
+    async fn auth_headers_for(
+        &self,
+        token_override: Option<&str>,
+    ) -> Result<HeaderMap, ThinClientError> {
+        if let Some(provider) = &self.bearer_provider {
+            return Self::bearer_headers(&provider.token().await?);
         }
-        h
+        let token = token_override.or(self.bearer_token.as_deref());
+        match token {
+            Some(t) => Self::bearer_headers(t),
+            None => Ok(HeaderMap::new()),
+        }
     }
 
-    fn work_api_headers(token: &str) -> Result<HeaderMap, ThinClientError> {
-        let mut headers = Self::bearer_headers(token)?;
+    async fn work_api_headers(&self, token: &str) -> Result<HeaderMap, ThinClientError> {
+        let mut headers = self.auth_headers_for(Some(token)).await?;
         headers.insert(
             WORK_API_MAJOR_HEADER,
             HeaderValue::from_static(WORK_API_MAJOR),
         );
         Ok(headers)
-    }
-
-    fn resolved_bearer_token<'a>(&'a self, token_override: Option<&'a str>) -> Option<&'a str> {
-        token_override.or(self.bearer_token.as_deref())
     }
 
     async fn text_or_api(resp: Response) -> Result<String, ThinClientError> {
@@ -283,7 +303,10 @@ impl ThinClient {
         query: &[(&str, String)],
     ) -> Result<String, ThinClientError> {
         let url = self.url(path)?;
-        let mut req = self.http.get(url).headers(Self::bearer_headers(token)?);
+        let mut req = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(Some(token)).await?);
         if !query.is_empty() {
             req = req.query(query);
         }
@@ -299,7 +322,10 @@ impl ThinClient {
         query: &[(&str, String)],
     ) -> Result<T, ThinClientError> {
         let url = self.url(path)?;
-        let mut req = self.http.get(url).headers(Self::bearer_headers(token)?);
+        let mut req = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(Some(token)).await?);
         if !query.is_empty() {
             req = req.query(query);
         }
@@ -318,7 +344,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .header(header::CONTENT_TYPE, "application/json")
             .json(body)
             .send()
@@ -337,7 +363,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .header(header::CONTENT_TYPE, "application/json")
             .json(body)
             .send()
@@ -356,7 +382,7 @@ impl ThinClient {
         let resp = self
             .http
             .put(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .header(header::CONTENT_TYPE, "application/json")
             .json(body)
             .send()
@@ -374,7 +400,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -390,7 +416,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::typed_json_or_error(resp).await
@@ -406,7 +432,7 @@ impl ThinClient {
         let resp = self
             .http
             .delete(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -472,7 +498,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -498,7 +524,7 @@ impl ThinClient {
         Ok(self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .timeout(timeout)
             .send()
             .await?)
@@ -560,7 +586,7 @@ impl ThinClient {
         let mut request = self
             .http
             .get(url.clone())
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .timeout(timeout);
         if let Some((provider, model_name, model_id)) = cursor {
             request = request.query(&[
@@ -606,7 +632,7 @@ impl ThinClient {
         let mut request = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .timeout(timeout);
         if let Some((provider, model_name, model_id)) = cursor {
             request = request.query(&[
@@ -627,7 +653,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -644,7 +670,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .json(body)
             .send()
             .await?;
@@ -660,7 +686,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .query(query)
             .send()
             .await?;
@@ -676,7 +702,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -691,7 +717,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -706,7 +732,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -721,7 +747,7 @@ impl ThinClient {
         let resp = self
             .http
             .delete(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -740,7 +766,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -759,7 +785,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         let status = resp.status();
@@ -784,7 +810,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .json(body)
             .send()
             .await?;
@@ -800,7 +826,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -817,7 +843,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .query(query)
             .timeout(authed_text_request_timeout())
             .send()
@@ -835,7 +861,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .query(query)
             .timeout(authed_text_request_timeout())
             .send()
@@ -852,7 +878,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .query(query)
             .send()
             .await?;
@@ -870,7 +896,7 @@ impl ThinClient {
         Ok(self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .json(body)
             .send()
             .await?)
@@ -885,7 +911,7 @@ impl ThinClient {
         Ok(self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .json(body)
             .send()
             .await?)
@@ -900,7 +926,7 @@ impl ThinClient {
         Ok(self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .json(body)
             .send()
             .await?)
@@ -915,7 +941,7 @@ impl ThinClient {
         Ok(self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .json(body)
             .send()
             .await?)
@@ -935,7 +961,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .timeout(
                 std::time::Duration::from_millis(request.timeout_ms)
                     .saturating_add(std::time::Duration::from_secs(5)),
@@ -958,7 +984,7 @@ impl ThinClient {
         let response = self
             .http
             .post(url)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .json(request)
             .send()
             .await?;
@@ -972,7 +998,7 @@ impl ThinClient {
         let response = self
             .http
             .get(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .send()
             .await?;
         Self::json_or_error(response).await
@@ -990,7 +1016,7 @@ impl ThinClient {
         let response = self
             .http
             .get(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .send()
             .await?;
         Self::typed_json_or_error(response).await
@@ -1010,7 +1036,7 @@ impl ThinClient {
         let response = self
             .http
             .get(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .send()
             .await?;
         let execution: WorkExecutionViewV1 = Self::typed_json_or_error(response).await?;
@@ -1038,7 +1064,7 @@ impl ThinClient {
         let response = self
             .http
             .get(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .send()
             .await?;
         let targets: WorkExecutionTargetPageV1 = Self::typed_json_or_error(response).await?;
@@ -1065,7 +1091,7 @@ impl ThinClient {
         let response = self
             .http
             .get(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .send()
             .await?;
         Self::typed_json_or_error(response).await
@@ -1085,7 +1111,7 @@ impl ThinClient {
         let response = self
             .http
             .post(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .json(request)
             .send()
             .await?;
@@ -1132,7 +1158,7 @@ impl ThinClient {
         } else {
             response.query(&query)
         }
-        .headers(Self::work_api_headers(token)?)
+        .headers(self.work_api_headers(token).await?)
         .send()
         .await?;
         let page: WorkTaskGraphPageV2 = Self::typed_json_or_error(response).await?;
@@ -1155,7 +1181,7 @@ impl ThinClient {
         let response = self
             .http
             .post(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .json(request)
             .send()
             .await?;
@@ -1175,7 +1201,7 @@ impl ThinClient {
         let response = self
             .http
             .post(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .json(request)
             .send()
             .await?;
@@ -1198,7 +1224,7 @@ impl ThinClient {
         let response = self
             .http
             .delete(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .send()
             .await?;
         Self::text_or_api(response).await.map(|_| ())
@@ -1215,7 +1241,7 @@ impl ThinClient {
     ) -> Result<Response, ThinClientError> {
         let path = paths::work_branch_turns(work_id, branch_id)
             .ok_or_else(|| ThinClientError::InvalidInput("invalid work_id or branch_id".into()))?;
-        let mut headers = Self::work_api_headers(token)?;
+        let mut headers = self.work_api_headers(token).await?;
         headers.insert(
             header::ACCEPT,
             HeaderValue::from_static("text/event-stream"),
@@ -1243,7 +1269,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .timeout(authed_text_request_timeout())
             .send()
             .await?;
@@ -1268,7 +1294,7 @@ impl ThinClient {
             url = %url,
             "starting Server-owned developer loop"
         );
-        let mut headers = Self::bearer_headers(token)?;
+        let mut headers = self.auth_headers_for(Some(token)).await?;
         headers.insert(
             header::ACCEPT,
             HeaderValue::from_static("text/event-stream"),
@@ -1371,12 +1397,10 @@ impl ThinClient {
                 .boxed();
             }
         };
-        let req = self
-            .http
-            .post(url)
-            .headers(self.auth_headers_for(bearer_override))
-            .json(body);
+        let req = self.http.post(url).json(body);
+        let bearer_override = bearer_override.map(str::to_owned);
         let fut = async move {
+            let req = req.headers(self.auth_headers_for(bearer_override.as_deref()).await?);
             let resp = req.send().await?;
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -1473,7 +1497,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(body)
             .timeout(std::time::Duration::from_secs(10))
             .send()
@@ -1490,7 +1514,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1507,7 +1531,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .query(&[("limit", limit)])
             .send()
             .await?;
@@ -1540,7 +1564,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .query(&query)
             .send()
             .await?;
@@ -1557,7 +1581,7 @@ impl ThinClient {
         let resp = self
             .http
             .put(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(body)
             .send()
             .await?;
@@ -1573,7 +1597,7 @@ impl ThinClient {
         let resp = self
             .http
             .delete(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1589,7 +1613,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1641,7 +1665,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(body)
             .send()
             .await?;
@@ -1658,7 +1682,7 @@ impl ThinClient {
         let resp = self
             .http
             .delete(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1674,7 +1698,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1690,7 +1714,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1715,7 +1739,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .query(&query)
             .send()
             .await?;
@@ -1764,12 +1788,10 @@ impl ThinClient {
         if replay_only {
             query.push(("replay_only", "true".to_string()));
         }
-        let req = self
-            .http
-            .get(url)
-            .headers(self.auth_headers_for(bearer_override))
-            .query(&query);
+        let req = self.http.get(url).query(&query);
+        let bearer_override = bearer_override.map(str::to_owned);
         let fut = async move {
+            let req = req.headers(self.auth_headers_for(bearer_override.as_deref()).await?);
             let resp = req.send().await?;
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -1862,7 +1884,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(body)
             .send()
             .await?;
@@ -1879,7 +1901,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1896,7 +1918,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(&serde_json::json!({"expected_session_id": expected_session_id}))
             .send()
             .await?;
@@ -1914,7 +1936,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(&serde_json::json!({"expected_session_id": expected_session_id}))
             .send()
             .await?;
@@ -1931,7 +1953,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(body)
             .timeout(std::time::Duration::from_secs(10))
             .send()
@@ -1946,8 +1968,12 @@ impl ThinClient {
         body: &Value,
     ) -> Result<SyncOutboxAck, ThinClientError> {
         let url = self.url(paths::SYNC_OUTBOX_EVENTS)?;
-        let mut headers = self.auth_headers_for(bearer_override);
-        if let Some(token) = self.resolved_bearer_token(bearer_override) {
+        let mut headers = self.auth_headers_for(bearer_override).await?;
+        if let Some(token) = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+        {
             let signature = sync_outbox_request_signature(token, body);
             let header = HeaderValue::from_str(&signature).map_err(|error| {
                 ThinClientError::InvalidInput(format!(
@@ -1977,7 +2003,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await?;
@@ -2014,7 +2040,7 @@ impl ThinClient {
             let mut req = self
                 .http
                 .post(url.clone())
-                .headers(self.auth_headers_for(bearer_override))
+                .headers(self.auth_headers_for(bearer_override).await?)
                 .timeout(timeout)
                 .json(body);
             if let Some(id) = edge_executor_id
@@ -2060,7 +2086,7 @@ impl ThinClient {
             match self
                 .http
                 .post(url.clone())
-                .headers(self.auth_headers_for(bearer_override))
+                .headers(self.auth_headers_for(bearer_override).await?)
                 .timeout(timeout)
                 .json(body)
                 .send()
@@ -2104,7 +2130,7 @@ impl ThinClient {
             match self
                 .http
                 .post(url.clone())
-                .headers(self.auth_headers_for(bearer_override))
+                .headers(self.auth_headers_for(bearer_override).await?)
                 .timeout(timeout)
                 .json(body)
                 .send()
@@ -2130,7 +2156,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(body)
             .send()
             .await?;
@@ -2149,7 +2175,7 @@ impl ThinClient {
         let mut req = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(body);
         if let Some(id) = edge_transport_id
             && let Ok(v) = HeaderValue::from_str(id)
@@ -2171,7 +2197,7 @@ impl ThinClient {
         let mut req = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(body);
         if let Some(id) = edge_transport_id
             && let Ok(v) = HeaderValue::from_str(id)
@@ -2212,6 +2238,89 @@ mod tests {
     use super::*;
     use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[derive(Debug, Default)]
+    struct RotatingBearer(std::sync::atomic::AtomicUsize);
+
+    impl BearerProvider for RotatingBearer {
+        fn token(&self) -> futures_util::future::BoxFuture<'_, Result<String, ThinClientError>> {
+            Box::pin(async move {
+                let generation = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if generation >= 3 {
+                    return Err(ThinClientError::InvalidInput("session logged out".into()));
+                }
+                Ok(format!("synthetic-fresh-{generation}"))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_owner_is_consulted_for_http_work_and_stream_without_legacy_fallback() {
+        let server = MockServer::start().await;
+        for (verb, route, generation) in [
+            ("GET", paths::AUTH_ME, 0),
+            ("GET", "/v1/works/work-1", 1),
+            ("POST", paths::CHAT_STREAM, 2),
+        ] {
+            Mock::given(method(verb))
+                .and(path(route))
+                .and(header(
+                    "authorization",
+                    format!("Bearer synthetic-fresh-{generation}"),
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header(
+                            astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
+                            astra_server_types::AGENT_INTERACTION_API_MAJOR,
+                        )
+                        .set_body_json(serde_json::json!({"ok":true})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let client = ThinClient::new(&server.uri(), Some("legacy-default-must-not-escape".into()))
+            .unwrap()
+            .with_bearer_provider(std::sync::Arc::new(RotatingBearer::default()));
+        client
+            .get_auth_me_text("stale-per-request-token")
+            .await
+            .unwrap();
+        client
+            .get_work("stale-per-request-token", "work-1")
+            .await
+            .unwrap();
+        client
+            .post_developer_loop("stale-per-request-token", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(
+            client
+                .get_auth_me_text("stale-per-request-token")
+                .await
+                .is_err()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        assert!(!format!("{client:?}").contains("legacy-default"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_requests_do_not_follow_redirects() {
+        let source = MockServer::start().await;
+        let target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/leak", target.uri())),
+            )
+            .expect(1)
+            .mount(&source)
+            .await;
+        let client = ThinClient::new(&source.uri(), None).unwrap();
+        let _ = client.get_auth_me_text("synthetic-secret").await;
+        assert!(target.received_requests().await.unwrap().is_empty());
+    }
 
     /// Override `sleep_between_attempts` to `ms` for the duration of a test,
     /// clearing the probe counter as it goes. Returns a guard that resets

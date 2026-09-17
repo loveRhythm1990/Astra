@@ -111,6 +111,16 @@ enum ModelCatalogEffect {
     Ready(Result<Vec<crate::cli::slash::slash_router::ModelCatalogEntry>, String>),
 }
 
+enum LoginEffect {
+    Discovered {
+        method: crate::cli::auth_flow::LoginMethod,
+        register: bool,
+    },
+    Completed {
+        uc: bool,
+    },
+}
+
 /// A completed read-only slash action. The payload stays structured until it
 /// reaches the workbench, so the UI decides how to present an empty result,
 /// a load failure, or an interactive view without parsing display strings.
@@ -5216,6 +5226,10 @@ pub(crate) async fn run_tui_session(
     no_instructions: bool,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<(), String> {
+    // Replace only this surface's transport at an explicit auth boundary.
+    // Previously cloned transports remain pinned to their old credentials.
+    let mut authenticated_api;
+    let mut api = api;
     use crate::cli::session::session_runtime::initialize_session_state;
     use crate::cli::session::session_startup::{SessionStartupArtifacts, complete_session_startup};
     use crate::cli::startup_trace::StartupTracer;
@@ -5397,6 +5411,10 @@ pub(crate) async fn run_tui_session(
     }
     let (model_catalog_tx, mut model_catalog_rx) = tokio::sync::mpsc::channel(2);
     let mut model_catalog_tasks = tokio::task::JoinSet::new();
+    let mut login_tasks = tokio::task::JoinSet::<Result<LoginEffect, String>>::new();
+    let (login_progress_tx, mut login_progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let login_phase = Arc::new(super::login_control::LoginControl::default());
+    let mut login_view_open = false;
     let mut model_catalog_loading = false;
     let mut model_catalog_cache = None;
     let (slash_background_read_tx, mut slash_background_read_rx) =
@@ -5555,14 +5573,14 @@ pub(crate) async fn run_tui_session(
     // Canonical Work remains the board's only authority. The observer performs
     // bounded reconciliation, while a just-acknowledged server receipt can
     // make that same authority visible before the next read returns.
-    let plan_task_observer = crate::tui::plan_task_observer::PlanTaskObserver::new(
+    let mut plan_task_observer = crate::tui::plan_task_observer::PlanTaskObserver::new(
         api.clone(),
         profile,
         state.session_id.as_deref(),
     );
     let mut board_expanded = false;
     let mut plan_task_projection_sequence = None;
-    let server_agent_observer = crate::tui::server_agent_observer::ServerAgentObserver::new(
+    let mut server_agent_observer = crate::tui::server_agent_observer::ServerAgentObserver::new(
         api.clone(),
         profile,
         state.session_id.as_deref(),
@@ -5635,6 +5653,112 @@ pub(crate) async fn run_tui_session(
         tokio::select! {
             _ = session_shutdown_token.cancelled() => {
                 break 'main Ok(());
+            }
+            Some(progress) = login_progress_rx.recv() => {
+                if login_tasks.is_empty() { continue; }
+                if let crate::cli::auth_flow::LoginProgress::OpenBrowser(url) = progress {
+                    chat_widget.commit_system(history_cell::system::SystemCell::response(
+                        "Complete sign-in in your browser. Esc cancels while waiting.",
+                    ));
+                    // The authorization link is an ephemeral view, never a
+                    // conversation transcript or model-context message.
+                    bottom_pane.push_view(Box::new(super::bottom_pane::info_view::InfoView::from_plain(
+                        "Browser sign-in", vec!["If the browser did not open, visit:".into(), url],
+                    )));
+                    login_view_open = true;
+                }
+                let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                flush_chat_widget(&mut guard, &mut chat_widget, width);
+                frame_requester.schedule_frame();
+            }
+            Some(result) = login_tasks.join_next(), if !login_tasks.is_empty() => {
+                use crate::cli::auth_flow::{self, LoginMethod, LoginProgress};
+                let result = result.map_err(|_| "Login task failed".to_string()).and_then(|result| result);
+                if login_view_open {
+                    bottom_pane.close_active_view();
+                    login_view_open = false;
+                }
+                match result {
+                    Ok(LoginEffect::Discovered { method: LoginMethod::Password, register }) => {
+                        use super::bottom_pane::login_view::{LoginMode, LoginView};
+                        bottom_pane.push_view(Box::new(LoginView::new(if register { LoginMode::Register } else { LoginMode::Login })));
+                    }
+                    Ok(LoginEffect::Discovered { method, .. }) => {
+                        // No model/tool work can start while the login task owns input.
+                        // Retire the old owner before the browser publishes credentials.
+                        auth_flow::begin_browser_session_login(&mut state).await;
+                        runtime_notification_turn_pending = false;
+                        runtime_notification_wake_at = None;
+                        let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                        flush_chat_widget(&mut guard, &mut chat_widget, width);
+                        chat_widget = chat_widget::ChatWidget::new(String::new());
+                        chat_widget.set_explain_verbose(matches!(state.explain, crate::ExplainMode::Verbose));
+                        chat_widget.set_explain_live_rows(state.runtime_config.explain.effective_live_rows());
+                        rebind_workbench_observers(None, &task_board, &server_agent_observer, &plan_task_observer, &mut board_user_pin);
+                        refresh_footer_from_state(&mut bottom_pane, &state);
+                        model_catalog_tasks.abort_all();
+                        while model_catalog_tasks.join_next().await.is_some() {}
+                        while model_catalog_rx.try_recv().is_ok() {}
+                        model_catalog_cache = None;
+                        model_catalog_loading = false;
+                        slash_background_read_tasks.abort_all();
+                        slash_background_read_count = 0;
+                        slash_background_read_generation = slash_background_read_generation.wrapping_add(1);
+                        let uc = matches!(method, LoginMethod::Uc(_));
+                        let api = api.clone();
+                        let profile = profile.map(str::to_owned);
+                        let tx = login_progress_tx.clone();
+                        let phase = login_phase.clone();
+                        login_tasks.spawn(async move {
+                            auth_flow::browser_login(&api, profile.as_deref(), method, Arc::new(move |progress| {
+                                match &progress {
+                                    LoginProgress::Completing => phase.begin_exchange()?,
+                                    LoginProgress::OpenBrowser(url) => crate::cli::auth_flow::open_login_url(url),
+                                }
+                                let _ = tx.send(progress);
+                                Ok(())
+                            }), false).await?;
+                            Ok(LoginEffect::Completed { uc })
+                        });
+                    }
+                    Ok(LoginEffect::Completed { uc }) => {
+                        // Keep the old, identity-pinned heartbeat during browser
+                        // waiting/cancellation, but join it before rebinding Edge.
+                        if let Some(task) = edge_heartbeat_task.take() {
+                            task.abort();
+                            let _ = task.await;
+                        }
+                        match auth_flow::finish_browser_session_login(api, profile, uc, &mut state).await {
+                            Ok((replacement, token)) => {
+                                authenticated_api = replacement;
+                                api = &authenticated_api;
+                                if crate::cli::edge_lifecycle::edge_cloud_registry_enabled() {
+                                    edge_heartbeat_task = crate::cli::edge_lifecycle::spawn_edge_heartbeat(
+                                        api.clone(), token.clone(), profile.map(str::to_owned),
+                                    );
+                                }
+                                server_agent_observer = crate::tui::server_agent_observer::ServerAgentObserver::new(api.clone(), profile, None);
+                                plan_task_observer = crate::tui::plan_task_observer::PlanTaskObserver::new(api.clone(), profile, None);
+                                server_agent_projection_sequence = None;
+                                plan_task_projection_sequence = None;
+                                chat_widget.commit_system(history_cell::system::SystemCell::response("Logged in. You can continue chatting."));
+                                let report = crate::post_auth_cloud_resync(profile, &mut state).await;
+                                if let Some(notice) = report.user_notice() {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::warning(notice));
+                                }
+                                if let Some(model) = sync_default_model_after_auth(api, &token, &mut state, &mut bottom_pane).await {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Default model: {model}")));
+                                }
+                            }
+                            Err(error) => chat_widget.commit_system(history_cell::system::SystemCell::error(error)),
+                        }
+                    }
+                    Err(error) => chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Login failed: {error}"))),
+                }
+                let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                flush_chat_widget(&mut guard, &mut chat_widget, width);
+                bottom_pane.sync_popups();
+                frame_requester.schedule_frame();
             }
             Some(completion) = turn_post_commit_completion_rx.recv() => {
                 let completed_session_id = completion.session_id.clone();
@@ -5775,6 +5899,28 @@ pub(crate) async fn run_tui_session(
                 };
                 match ev {
                     TuiEvent::Key(key) => {
+                        if !login_tasks.is_empty() {
+                            if key.code == crossterm::event::KeyCode::Esc
+                                || (key.code == crossterm::event::KeyCode::Char('c') && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL))
+                            {
+                                if !login_phase.cancel() {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::info("Completing sign-in; waiting for the credential exchange to finish."));
+                                } else {
+                                    login_tasks.abort_all();
+                                    while login_tasks.join_next().await.is_some() {}
+                                    while login_progress_rx.try_recv().is_ok() {}
+                                    if login_view_open {
+                                        bottom_pane.close_active_view();
+                                        login_view_open = false;
+                                    }
+                                    chat_widget.commit_system(history_cell::system::SystemCell::response("Login cancelled."));
+                                }
+                                let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                                flush_chat_widget(&mut guard, &mut chat_widget, width);
+                                frame_requester.schedule_frame();
+                            }
+                            continue;
+                        }
                         let runtime_notification_submission =
                             runtime_notification_event && runtime_notification_turn_pending;
                         if runtime_notification_event && !runtime_notification_submission {
@@ -6156,6 +6302,21 @@ pub(crate) async fn run_tui_session(
                                     match result {
                                         slash_dispatch::SlashResult::Handled => {}
                                         slash_dispatch::SlashResult::Deferred => {}
+                                        slash_dispatch::SlashResult::Authenticate { register } => {
+                                            if background_registry.running_count() > 0 || work_start_in_flight {
+                                                chat_widget.commit_system(history_cell::system::SystemCell::warning("Wait for or stop background tasks before changing authentication."));
+                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                continue;
+                                            }
+                                            login_phase.reset();
+                                            let api = api.clone();
+                                            let profile = profile.map(str::to_owned);
+                                            chat_widget.commit_system(history_cell::system::SystemCell::response("Discovering sign-in method…"));
+                                            login_tasks.spawn(async move {
+                                                let method = crate::cli::auth_flow::discover_login_method(&api, profile.as_deref()).await?;
+                                                Ok(LoginEffect::Discovered { method, register })
+                                            });
+                                        }
                                         slash_dispatch::SlashResult::OpenRootTranscript {
                                             session_id,
                                         } => {
@@ -9494,6 +9655,8 @@ pub(crate) async fn run_tui_session(
         tracing::debug!("aborted deferred turn-post-commit worker during TUI shutdown");
     }
     model_catalog_tasks.abort_all();
+    login_tasks.abort_all();
+    while login_tasks.join_next().await.is_some() {}
     while model_catalog_tasks.join_next().await.is_some() {}
     for task in startup_observation_tasks {
         task.abort();

@@ -621,38 +621,45 @@ async fn load_distributed_usage(
     tx: &mut Transaction<'_, MySql>,
     owner_user_id: &str,
 ) -> Result<(AdmissionWork, AdmissionWork), DistributedAdmissionError> {
-    // The gate row already serializes this transaction. Aggregate the bounded
-    // reservation set in MatrixOne so a thousand-session deployment transfers
-    // one row instead of materializing every active reservation into Rust for
-    // every admission attempt.
-    let row = sqlx::query(
+    // The gate row serializes both aggregates in the same transaction. Keep
+    // bind parameters in predicates: MatrixOne 4.1.2 loses the parameters in
+    // SUM(CASE WHEN owner_user_id = ? ...), rejecting COM_STMT_EXECUTE. Two
+    // bounded aggregate rows preserve the snapshot and avoid loading every
+    // reservation into the process or weakening the owner/global limits.
+    let global = load_distributed_usage_aggregate(tx, None).await?;
+    let owner = load_distributed_usage_aggregate(tx, Some(owner_user_id)).await?;
+    Ok((global, owner))
+}
+
+async fn load_distributed_usage_aggregate(
+    tx: &mut Transaction<'_, MySql>,
+    owner_user_id: Option<&str>,
+) -> Result<AdmissionWork, DistributedAdmissionError> {
+    let mut query = sqlx::QueryBuilder::<MySql>::new(
         "SELECT
-             CAST(COALESCE(SUM(resident_bytes), 0) AS CHAR) AS global_resident_bytes,
-             CAST(COALESCE(SUM(context_tokens), 0) AS CHAR) AS global_context_tokens,
-             CAST(COALESCE(SUM(provider_slots), 0) AS CHAR) AS global_provider_slots,
-             CAST(COALESCE(SUM(cpu_units), 0) AS CHAR) AS global_cpu_units,
-             CAST(COALESCE(SUM(io_bytes), 0) AS CHAR) AS global_io_bytes,
-             CAST(COALESCE(SUM(CASE WHEN BINARY owner_user_id = BINARY ? THEN resident_bytes ELSE 0 END), 0) AS CHAR) AS owner_resident_bytes,
-             CAST(COALESCE(SUM(CASE WHEN BINARY owner_user_id = BINARY ? THEN context_tokens ELSE 0 END), 0) AS CHAR) AS owner_context_tokens,
-             CAST(COALESCE(SUM(CASE WHEN BINARY owner_user_id = BINARY ? THEN provider_slots ELSE 0 END), 0) AS CHAR) AS owner_provider_slots,
-             CAST(COALESCE(SUM(CASE WHEN BINARY owner_user_id = BINARY ? THEN cpu_units ELSE 0 END), 0) AS CHAR) AS owner_cpu_units,
-             CAST(COALESCE(SUM(CASE WHEN BINARY owner_user_id = BINARY ? THEN io_bytes ELSE 0 END), 0) AS CHAR) AS owner_io_bytes,
+             CAST(COALESCE(SUM(CAST(resident_bytes AS DECIMAL(38, 0))), 0) AS CHAR) AS resident_bytes,
+             CAST(COALESCE(SUM(CAST(context_tokens AS DECIMAL(38, 0))), 0) AS CHAR) AS context_tokens,
+             CAST(COALESCE(SUM(CAST(provider_slots AS DECIMAL(38, 0))), 0) AS CHAR) AS provider_slots,
+             CAST(COALESCE(SUM(CAST(cpu_units AS DECIMAL(38, 0))), 0) AS CHAR) AS cpu_units,
+             CAST(COALESCE(SUM(CAST(io_bytes AS DECIMAL(38, 0))), 0) AS CHAR) AS io_bytes,
              CAST(COALESCE(SUM(CASE
                  WHEN resident_bytes < 0 OR context_tokens < 0 OR provider_slots < 0
                    OR provider_slots > 4294967295 OR cpu_units < 0 OR io_bytes < 0
                  THEN 1 ELSE 0 END), 0) AS SIGNED) AS invalid_rows
          FROM session_weighted_admission_reservations
-         WHERE scope_name = ?",
-    )
-    .bind(owner_user_id)
-    .bind(owner_user_id)
-    .bind(owner_user_id)
-    .bind(owner_user_id)
-    .bind(owner_user_id)
-    .bind(DISTRIBUTED_ADMISSION_SCOPE)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(|source| distributed_database_error("load_active_usage", source))?;
+         WHERE scope_name = ",
+    );
+    query.push_bind(DISTRIBUTED_ADMISSION_SCOPE);
+    if let Some(owner_user_id) = owner_user_id {
+        query
+            .push(" AND BINARY owner_user_id = BINARY ")
+            .push_bind(owner_user_id);
+    }
+    let row = query
+        .build()
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|source| distributed_database_error("load_active_usage", source))?;
     let invalid_rows: i64 = row
         .try_get("invalid_rows")
         .map_err(|source| distributed_database_error("decode_usage_invalid_rows", source))?;
@@ -661,9 +668,7 @@ async fn load_distributed_usage(
             "distributed admission contains {invalid_rows} invalid stored reservation rows"
         )));
     }
-    let global = decode_aggregate_admission_work(&row, "global_")?;
-    let owner = decode_aggregate_admission_work(&row, "owner_")?;
-    Ok((global, owner))
+    decode_aggregate_admission_work(&row)
 }
 
 async fn insert_distributed_reservation(
@@ -721,22 +726,19 @@ fn decode_admission_work(
 
 fn decode_aggregate_admission_work(
     row: &sqlx::mysql::MySqlRow,
-    prefix: &str,
 ) -> Result<AdmissionWork, DistributedAdmissionError> {
     Ok(AdmissionWork {
-        resident_bytes: aggregate_admission_u64(row, &format!("{prefix}resident_bytes"))?,
-        context_tokens: aggregate_admission_u64(row, &format!("{prefix}context_tokens"))?,
-        provider_slots: u32::try_from(aggregate_admission_u64(
-            row,
-            &format!("{prefix}provider_slots"),
-        )?)
-        .map_err(|_| {
-            DistributedAdmissionError::Invalid(
-                "aggregated distributed provider slots exceed u32".into(),
-            )
-        })?,
-        cpu_units: aggregate_admission_u64(row, &format!("{prefix}cpu_units"))?,
-        io_bytes: aggregate_admission_u64(row, &format!("{prefix}io_bytes"))?,
+        resident_bytes: aggregate_admission_u64(row, "resident_bytes")?,
+        context_tokens: aggregate_admission_u64(row, "context_tokens")?,
+        provider_slots: u32::try_from(aggregate_admission_u64(row, "provider_slots")?).map_err(
+            |_| {
+                DistributedAdmissionError::Invalid(
+                    "aggregated distributed provider slots exceed u32".into(),
+                )
+            },
+        )?,
+        cpu_units: aggregate_admission_u64(row, "cpu_units")?,
+        io_bytes: aggregate_admission_u64(row, "io_bytes")?,
     })
 }
 

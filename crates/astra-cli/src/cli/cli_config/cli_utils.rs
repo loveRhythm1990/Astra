@@ -39,6 +39,12 @@ pub(crate) fn load_credentials() -> CredentialsFile {
 
     static LAST_ERR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
+    match crate::cli::native_auth::projected_credentials() {
+        Ok(Some(credentials)) => return credentials,
+        Err(_) => return CredentialsFile::default(), // fail closed; never load legacy credentials
+        Ok(None) => (),
+    }
+
     match credential_store().load() {
         Ok(creds) => creds,
         Err(err) => {
@@ -72,6 +78,9 @@ where
 }
 
 pub(crate) fn profile_name(cli_profile: Option<&str>, data: &CredentialsFile) -> String {
+    if let Some(binding) = crate::cli::native_auth::active() {
+        return binding.profile_name();
+    }
     CredentialStore::resolve_profile_name(cli_profile, data.current_profile.as_deref())
 }
 
@@ -210,6 +219,10 @@ pub(crate) fn configure_cli_profile_identity(
     cli_profile: Option<&str>,
     admission: CliProfileIdentityAdmission,
 ) -> Result<(), String> {
+    if let Some(binding) = crate::cli::native_auth::active() {
+        let session = binding.snapshot()?;
+        return install_cli_profile_identity(binding.profile_name(), Some(session.astra_user_id));
+    }
     let creds = credential_store()
         .load()
         .map_err(|error| error.to_string())?;

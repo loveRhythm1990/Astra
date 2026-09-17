@@ -810,7 +810,9 @@ pub(crate) async fn complete_session_startup(
                 session_runtime::ServerDefaultModel::NoModels => {
                     state.model = Some("⚠ none".to_string());
                 }
-                session_runtime::ServerDefaultModel::Unavailable => {}
+                session_runtime::ServerDefaultModel::Unavailable(error) => {
+                    eprintln!("warning: {error}");
+                }
             }
         }
     }

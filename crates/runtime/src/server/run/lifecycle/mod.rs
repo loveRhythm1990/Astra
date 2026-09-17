@@ -3930,6 +3930,7 @@ fn apply_normalized_skill_allowlist(
 fn build_server_skill_executor(
     matrixone: &MatrixOneSettings,
     encryptor: &Arc<FernetTokenEncryptor>,
+    model_service: Option<Arc<dyn ModelService>>,
     shared_pool: Option<&SharedPool>,
     model_override: Option<&str>,
     admitted_model_execution: Option<&astra_services::AdmittedModelExecution>,
@@ -3976,6 +3977,7 @@ fn build_server_skill_executor(
         session_id.to_string(),
     )
     .with_pool(shared_pool.cloned())
+    .with_model_service(model_service)
     .with_default_model(model_override.map(String::from))
     .with_admitted_model_execution(admitted_model_execution.cloned())
     .with_edge_tools(edge_tools.to_vec())
@@ -6450,6 +6452,7 @@ impl AgenticRunLifecycleService {
                 .expect("invocation composition was validated before creating a spawner"),
         )
         .with_pool(self.shared_pool.clone())
+        .with_model_service(Some(self.model_service.clone()))
         .with_edge_connection_pool(self.edge_connection_pool.clone())
         .with_skill_service(self.skill_service.clone())
         .with_memory_extraction_service(self.memory_extraction_service.clone())
@@ -9857,46 +9860,22 @@ impl AgenticRunLifecycleService {
                     "model_selection_invalid",
                 ));
             }
-            let offerings = self
+            let catalog = self
                 .model_service
-                .list_models(user_id.to_string(), false)
+                .user_model_catalog(user_id.to_string())
                 .await?;
-            let allows_deployment = self
-                .model_service
-                .allows_deployment_models(user_id.to_string())
-                .await?;
-            let has_cloud_byok = !allows_deployment
-                || offerings.iter().any(|offering| {
-                    offering.access_kind == astra_services::ModelAccessKind::CloudByok
-                });
-            let mut declared = Vec::new();
-            if allows_deployment {
-                declared.push(astra_services::DeclaredModelAccess {
-                    id: "self-hosted".to_string(),
-                    kind: astra_services::ModelAccessKind::SelfHosted,
-                    label: "Self-hosted".to_string(),
-                    execution_placement: astra_services::ModelExecutionPlacement::Server,
-                    availability: astra_services::ModelAccessAvailability::Ready,
-                });
-            }
-            if has_cloud_byok {
-                declared.push(astra_services::DeclaredModelAccess {
-                    id: "cloud-byok".to_string(),
-                    kind: astra_services::ModelAccessKind::CloudByok,
-                    label: "Cloud BYOK".to_string(),
-                    execution_placement: astra_services::ModelExecutionPlacement::Server,
-                    availability: astra_services::ModelAccessAvailability::Ready,
-                });
-            }
-            let user_default = self
-                .model_service
-                .default_user_model_offering_id(user_id.to_string())
-                .await?
-                .map(|offering_id| astra_services::ModelDefaultCandidate {
+            let offerings = catalog.items;
+            let declared = astra_services::models::server_model_access_declarations(
+                catalog.allows_deployment,
+                offerings.iter().map(|item| item.access_kind),
+            );
+            let user_default = catalog.default_offering_id.map(|offering_id| {
+                astra_services::ModelDefaultCandidate {
                     offering_id,
                     source: astra_services::ModelDefaultSource::Astra,
                     scope: astra_services::ModelDefaultScope::EffectiveCatalog,
-                });
+                }
+            });
             let offering_views = offerings
                 .into_iter()
                 .filter(|offering| offering.is_active)
@@ -11784,6 +11763,7 @@ impl AgenticRunLifecycleService {
             session_id.to_string(),
         )
         .with_model(request.model.clone())
+        .with_model_service(Some(self.model_service.clone()))
         .with_admitted_execution_deadline(request.admitted_execution_deadline)
         .with_admitted_model_execution(request.admitted_model_execution.clone())
         .with_inference_owner_pod_id(self.run_engine.execution_owner_pod_id().map(str::to_string))
@@ -12241,6 +12221,7 @@ impl AgenticRunLifecycleService {
         let skill_executor = build_server_skill_executor(
             &self.matrixone,
             &self.encryptor,
+            Some(self.model_service.clone()),
             self.shared_pool.as_ref(),
             request.model.as_deref(),
             request.admitted_model_execution.as_ref(),
@@ -19927,6 +19908,7 @@ use crate::server::delegation::engine::{
 /// and observe-only harness path as delegated children. Spawn-specific
 /// semantics stay in `DynamicAgentSpawner` and `agent_tool`.
 pub struct ServerSpawnAgentExecutor {
+    model_service: Option<Arc<dyn ModelService>>,
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
     /// The session lifecycle's authoritative run engine. Dynamic sub-runs must
@@ -20014,12 +19996,17 @@ impl Drop for RuntimeContextPublicationCapability {
 }
 
 impl ServerSpawnAgentExecutor {
+    pub fn with_model_service(mut self, service: Option<Arc<dyn ModelService>>) -> Self {
+        self.model_service = service;
+        self
+    }
     pub fn new(
         matrixone: MatrixOneSettings,
         encryptor: Arc<FernetTokenEncryptor>,
         edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     ) -> Self {
         Self {
+            model_service: None,
             matrixone,
             encryptor,
             run_engine: None,
@@ -20569,6 +20556,7 @@ impl ServerSpawnAgentExecutor {
             executor = executor.with_memory_extraction_service(svc);
         }
         executor = executor
+            .with_model_service(self.model_service.clone())
             .with_admitted_model_execution(admitted_model_execution.cloned())
             .with_edge_tools(edge_tools)
             .with_reflect_service(Arc::clone(&self.reflect_service))
@@ -21691,6 +21679,7 @@ fn inherited_provider_run_owner(
 /// Creates a real agentic loop for each sub-run with the agent's system prompt,
 /// model, and tool configuration.
 pub struct ServerSubRunExecutor {
+    model_service: Option<Arc<dyn ModelService>>,
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
     /// Must be the lifecycle engine that created the parent run so owner leases,
@@ -21726,12 +21715,38 @@ pub struct ServerSubRunExecutor {
 }
 
 impl ServerSubRunExecutor {
+    async fn admit_offering(
+        &self,
+        user_id: &str,
+        offering_id: &str,
+    ) -> Result<astra_services::AdmittedModelExecution, String> {
+        if let Some(service) = &self.model_service {
+            return service
+                .admit_model_offering(user_id.into(), offering_id.into())
+                .await
+                .map_err(|(_, body)| body.0.detail);
+        }
+        astra_services::revalidate_admitted_model_execution(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            user_id,
+            offering_id,
+            self.shared_pool.as_ref().map(SharedPool::get),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+    pub fn with_model_service(mut self, service: Option<Arc<dyn ModelService>>) -> Self {
+        self.model_service = service;
+        self
+    }
     pub fn new(
         matrixone: MatrixOneSettings,
         encryptor: Arc<FernetTokenEncryptor>,
         edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     ) -> Self {
         Self {
+            model_service: None,
             matrixone,
             encryptor,
             run_engine: None,
@@ -22068,15 +22083,7 @@ impl ServerSubRunExecutor {
             }
             return Ok(Some(execution.clone()));
         }
-        let execution = astra_services::revalidate_admitted_model_execution(
-            &self.matrixone,
-            self.encryptor.as_ref(),
-            &config.user_id,
-            offering_id,
-            self.shared_pool.as_ref().map(SharedPool::get),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+        let execution = self.admit_offering(&config.user_id, offering_id).await?;
         if execution.model_name != expected_model_name {
             return Err(
                 "durable sub-run Offering changed after admission; refusing route drift"
@@ -22097,15 +22104,9 @@ impl ServerSubRunExecutor {
                 .or(self.admitted_model_execution.as_ref())
                 .cloned());
         };
-        let execution = astra_services::revalidate_admitted_model_execution(
-            &self.matrixone,
-            self.encryptor.as_ref(),
-            &config.user_id,
-            &selection.offering_id,
-            self.shared_pool.as_ref().map(SharedPool::get),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+        let execution = self
+            .admit_offering(&config.user_id, &selection.offering_id)
+            .await?;
         Ok(Some(execution))
     }
 
@@ -23033,6 +23034,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             config.session_id.clone(),
         )
         .with_model(child_model_name.clone())
+        .with_model_service(self.model_service.clone())
         .with_admitted_model_execution(admitted_model_execution)
         .with_inference_owner_pod_id(
             self.run_engine
