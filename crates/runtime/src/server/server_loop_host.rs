@@ -41167,7 +41167,7 @@ mod tests {
 
     #[cfg(feature = "e2e-hooks")]
     #[tokio::test]
-    async fn mock_history_hydration_never_enters_provider_wal_gate() {
+    async fn mock_llm_history_hydration_never_enters_provider_wal_gate() {
         for rounds in [Vec::new(), vec![json!({"text": "mock"})]] {
             let mut host = ServerAgenticLoopHostBuilder::new(
                 mock_matrixone(),
