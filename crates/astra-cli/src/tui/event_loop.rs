@@ -5368,7 +5368,7 @@ pub(crate) async fn run_tui_session(
     let (draw_tx, draw_rx) = tokio::sync::mpsc::channel(1);
     let frame_requester = FrameRequester::new(draw_tx);
     guard.set_history_drain_requester(frame_requester.clone());
-    let mut event_stream = TuiEventStream::new(draw_rx);
+    let mut event_stream = TuiEventStream::new(draw_rx, guard.resize_pending.clone());
     let (startup_effect_tx, mut startup_effect_rx) = tokio::sync::mpsc::channel(4);
     let mut startup_observation_tasks = Vec::with_capacity(3);
     {

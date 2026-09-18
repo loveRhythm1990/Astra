@@ -313,7 +313,7 @@ where
             .chunks(usize::from(self.viewport_area.width))
             .enumerate()
         {
-            let y = self.viewport_area.y + row as u16;
+            let y = self.viewport_area.y.saturating_add(row as u16);
             if y >= retained_bottom || y == self.last_known_cursor_pos.y {
                 continue;
             }
@@ -408,11 +408,9 @@ where
         F: FnOnce(&mut Frame) -> Result<(), E>,
         E: Into<io::Error>,
     {
-        // Only the input owner may advance the reconciled screen size. A
-        // resize racing a draw must still be handled by the next resize event.
-        if self.size()? != self.last_known_screen_size {
-            return Ok(());
-        }
+        // TerminalGuard checks size before clearing or flushing history. Once
+        // a frame starts, finish it instead of leaving a cleared viewport blank.
+        // The input owner's size watchdog also recovers missed resize signals.
 
         let mut frame = self.get_frame();
 

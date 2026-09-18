@@ -26,7 +26,7 @@ pub(crate) struct TerminalGuard {
     pub terminal: CustomTerminal,
     pending_history: VecDeque<PendingHistory>,
     is_zellij: bool,
-    resize_pending: bool,
+    pub(crate) resize_pending: Arc<AtomicBool>,
     clipped_reflow_below_cursor: Option<u16>,
     /// Scrollback is deliberately drained over several frames for very long
     /// replies. This keeps terminal writes from monopolising the same event
@@ -120,7 +120,7 @@ impl TerminalGuard {
             terminal,
             pending_history: VecDeque::new(),
             is_zellij,
-            resize_pending: false,
+            resize_pending: Arc::new(AtomicBool::new(false)),
             clipped_reflow_below_cursor: None,
             history_drain_requester: None,
         };
@@ -242,9 +242,13 @@ impl TerminalGuard {
         interrupted: bool,
     ) -> io::Result<()> {
         let size = self.terminal.size()?;
-        self.resize_pending =
-            interrupted || size.width != queried_size.0 || size.height != queried_size.1;
-        if self.resize_pending {
+        // Treat out-of-screen replies as missing, never as scroll distances.
+        let cursor = cursor.filter(|&(x, y)| x < queried_size.0 && y < queried_size.1);
+        self.resize_pending.store(
+            interrupted || size.width != queried_size.0 || size.height != queried_size.1,
+            Ordering::Release,
+        );
+        if self.resize_pending.load(Ordering::Acquire) {
             // xterm can discard the footer's newly wrapped rows below a
             // bottom-clamped cursor before a narrow/wide round trip settles.
             // The cursor retains that displacement even after the cells have
@@ -284,7 +288,8 @@ impl TerminalGuard {
             - i32::from(self.terminal.last_known_cursor_pos.y)
             - i32::from(reflow_rows);
         let mut area = self.terminal.viewport_area;
-        area.y = (i32::from(area.y) + offset).clamp(0, i32::from(u16::MAX)) as u16;
+        area.y =
+            (i32::from(area.y) + offset).clamp(0, i32::from(size.height.saturating_sub(1))) as u16;
         self.terminal.set_viewport_area(area);
         self.terminal.clear()?;
         self.terminal.resize(size)?;
@@ -305,9 +310,9 @@ impl TerminalGuard {
         // consumed. Preserve the old cursor anchor until the input owner has
         // queried its position in the resized terminal.
         if self.terminal.size()? != self.terminal.last_known_screen_size {
-            self.resize_pending = true;
+            self.resize_pending.store(true, Ordering::Release);
         }
-        if self.resize_pending {
+        if self.resize_pending.load(Ordering::Acquire) {
             return Ok(());
         }
         stdout().sync_update(|_| {
