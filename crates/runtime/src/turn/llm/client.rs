@@ -5701,7 +5701,13 @@ async fn call_llm_and_collect_with_total_budget(
             return Err(error);
         }
         last_model_gateway_error = None;
-        if status == 402 {
+        // A negotiated gateway route must retain its versioned error boundary;
+        // do not reinterpret a missing/mismatched contract as a provider error.
+        // Likewise, an unsolicited gateway header is not trusted on BYOK routes.
+        if status == 402
+            && !uses_moi_model_gateway_error_contract(header_overrides)
+            && model_gateway_error_contract.is_none()
+        {
             let error = payment_required_error(&text);
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
