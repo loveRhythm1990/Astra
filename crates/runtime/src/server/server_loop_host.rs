@@ -17450,6 +17450,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &mut self,
         state: &mut AgenticLoopState,
     ) -> Result<(), astra_core::ClassifiedError> {
+        // Mock rounds previously returned before the provider recovery gate.
+        // They do not own durable provider attempts, including after exhaustion.
+        #[cfg(feature = "e2e-hooks")]
+        if self.test_llm_rounds_wired {
+            return Ok(());
+        }
         self.hydrate_provider_canonical_transitions(state).await
     }
 
@@ -41157,6 +41163,26 @@ mod tests {
         assert_eq!(state.final_text.trim(), "Hello from server");
         assert_eq!(state.total_prompt, 100);
         assert_eq!(state.total_completion, 50);
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    #[tokio::test]
+    async fn mock_history_hydration_never_enters_provider_wal_gate() {
+        for rounds in [Vec::new(), vec![json!({"text": "mock"})]] {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u".into(),
+                "s".into(),
+            )
+            .with_test_llm_rounds(rounds)
+            .build();
+            let mut state = create_test_state();
+            host.hydrate_restored_history(&mut state).await.unwrap();
+            // Even the no-pool branch of the real WAL gate sets this flag.
+            assert!(!host.canonical_transition_hydrated);
+            assert!(state.provider_canonical_wal_base.is_none());
+        }
     }
 
     #[tokio::test]
