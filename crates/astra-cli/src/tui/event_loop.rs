@@ -5503,9 +5503,10 @@ pub(crate) async fn run_tui_session(
         }
         _ => chat_widget::ChatWidget::new(String::new()),
     };
-    chat_widget.set_explain_verbose(matches!(state.explain, crate::ExplainMode::Verbose));
-    chat_widget.set_explain_live_rows(state.runtime_config.explain.effective_live_rows());
-    chat_widget.set_explain_report_format(state.runtime_config.explain.effective_report_format());
+    chat_widget.restore_explain_preferences(
+        matches!(state.explain, crate::ExplainMode::Verbose),
+        &state.runtime_config.explain,
+    );
 
     if let Some(prompt) = state.perm_manager.workspace_trust_startup_prompt() {
         use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
@@ -5692,9 +5693,7 @@ pub(crate) async fn run_tui_session(
                         let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
                         flush_chat_widget(&mut guard, &mut chat_widget, width);
                         chat_widget = chat_widget::ChatWidget::new(String::new());
-                        chat_widget.set_explain_verbose(matches!(state.explain, crate::ExplainMode::Verbose));
-                        chat_widget.set_explain_live_rows(state.runtime_config.explain.effective_live_rows());
-                        chat_widget.set_explain_report_format(state.runtime_config.explain.effective_report_format());
+                        chat_widget.restore_explain_preferences(matches!(state.explain, crate::ExplainMode::Verbose), &state.runtime_config.explain);
                         rebind_workbench_observers(None, &task_board, &server_agent_observer, &plan_task_observer, &mut board_user_pin);
                         refresh_footer_from_state(&mut bottom_pane, &state);
                         model_catalog_tasks.abort_all();
@@ -6429,15 +6428,9 @@ pub(crate) async fn run_tui_session(
                                                 state.explain != crate::ExplainMode::Off,
                                             )
                                             .await;
-                                            chat_widget.set_explain_verbose(matches!(
-                                                state.explain,
-                                                crate::ExplainMode::Verbose
-                                            ));
-                                            chat_widget.set_explain_live_rows(
-                                                state.runtime_config.explain.effective_live_rows(),
-                                            );
-                                            chat_widget.set_explain_report_format(
-                                                state.runtime_config.explain.effective_report_format(),
+                                            chat_widget.restore_explain_preferences(
+                                                matches!(state.explain, crate::ExplainMode::Verbose),
+                                                &state.runtime_config.explain,
                                             );
                                             rebind_workbench_observers(
                                                 Some(new_sid),

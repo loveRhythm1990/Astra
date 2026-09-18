@@ -537,7 +537,7 @@ impl NativeStore {
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
                     loop {
                         match FileExt::try_lock_exclusive(&rotation) {
-                            Ok(()) => return Ok(rotation),
+                            Ok(()) => return Ok(std::sync::Arc::new(rotation)),
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                 if std::time::Instant::now() >= deadline {
                                     return Err("MOI credential refresh is busy".into());
@@ -565,7 +565,7 @@ impl NativeStore {
             return Err("previous token rotation was interrupted; run astra login".into());
         }
         let now = unix_now()?;
-        if current.expires_at <= now + 60 {
+        if let Some(rotation) = rotation.filter(|_| current.expires_at <= now + 60) {
             let client = http_client()?;
             let request = client
                 .post(&current.environment.token_endpoint)
@@ -577,7 +577,11 @@ impl NativeStore {
                 .build()
                 .map_err(|_| "cannot build token rotation request")?;
             let expected = current.clone();
+            let write_guard = rotation.clone();
             self.blocking(move |store| {
+                // spawn_blocking outlives cancellation of its awaiting task.
+                // Retain rotation ownership until the durable write finishes.
+                let _write_guard = write_guard;
                 store.update(&expected, |s| {
                     s.refresh_pending = true;
                     Ok(())
@@ -593,7 +597,9 @@ impl NativeStore {
                     // still held and update checks the login generation, so a
                     // concurrent logout/account switch cannot be resurrected.
                     let expected = current.clone();
+                    let write_guard = rotation.clone();
                     self.blocking(move |store| {
+                        let _write_guard = write_guard;
                         store.update(&expected, |s| {
                             s.refresh_pending = false;
                             Ok(())
@@ -628,8 +634,10 @@ impl NativeStore {
             let access_token = token.access_token.clone();
             let refresh_token = token.refresh_token.clone();
             let expires_in = token.expires_in;
+            let write_guard = rotation.clone();
             if let Err(error) = self
                 .blocking(move |store| {
+                    let _write_guard = write_guard;
                     store.update(&expected, |s| {
                         s.access_token = access_token;
                         s.refresh_token = refresh_token;
