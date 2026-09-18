@@ -17446,6 +17446,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .await;
     }
 
+    async fn hydrate_restored_history(
+        &mut self,
+        state: &mut AgenticLoopState,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        self.hydrate_provider_canonical_transitions(state).await
+    }
+
     async fn execute_turn(
         &mut self,
         state: &mut AgenticLoopState,
@@ -17505,16 +17512,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 });
             }
         }
-
-        // This is the single recovery gate shared by background and SSE run
-        // lifecycles: both have completed history restoration before the host
-        // can execute a real turn. The service first recovers expired
-        // pre-delivery owners and rejects every live or delivery-unknown old
-        // invocation. Run-generation fencing stops future old admissions, but
-        // only this delivery boundary prevents a duplicate after an already
-        // authorized HTTP request. Failure precedes model resolution,
-        // provider-attempt admission, and all new HTTP I/O.
-        self.hydrate_provider_canonical_transitions(state).await?;
 
         // Reconcile a fast semantic preflight before the primary request so
         // its typed optional capabilities (for example `agent_fanout`) are

@@ -623,6 +623,17 @@ pub trait AgenticLoopHost: Send {
         Some((session_id.to_string(), producer_id.to_string()))
     }
 
+    /// Reconcile host-owned durable history after lifecycle restoration and
+    /// before any first-round preparation may rewrite the admitted prefix.
+    /// Implementations must be idempotent because a resumed loop can re-enter
+    /// at an iteration boundary.
+    async fn hydrate_restored_history(
+        &mut self,
+        _state: &mut AgenticLoopState,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        Ok(())
+    }
+
     /// Execute one LLM turn: prepare payload → POST → consume SSE.
     ///
     /// The host is responsible for all CLI/server-specific logic:
@@ -4928,6 +4939,11 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             harness_pause_recovery_count: 0,
         };
     }
+    // Durable provider history must be reconciled before semantic admission,
+    // resume compaction, or any other first-round preparation can rewrite the
+    // admitted prefix. Hosts without a durable history ledger use the no-op
+    // default; durable hosts make this hook idempotent for handoff resumes.
+    host.hydrate_restored_history(state).await?;
     loop {
         let turn_index = state.loop_entry.iteration_index().ok_or_else(|| {
             astra_core::ClassifiedError::new(
@@ -6208,6 +6224,7 @@ pub(crate) mod tests {
         pub(crate) final_policy_snapshots: Vec<serde_json::Value>,
         pub(crate) terminal_tool_records: Vec<ToolCallRecord>,
         pub(crate) terminal_tool_batches: Vec<Vec<ToolCallRecord>>,
+        pub(crate) hydrated_history_snapshots: Vec<Vec<Value>>,
         pub(crate) executed_messages: Vec<Vec<Value>>,
         pub(crate) executed_volatile: Vec<Vec<VolatileInjection>>,
         pub(crate) text_only_turns: Vec<bool>,
@@ -6255,6 +6272,7 @@ pub(crate) mod tests {
                 final_policy_snapshots: Vec::new(),
                 terminal_tool_records: Vec::new(),
                 terminal_tool_batches: Vec::new(),
+                hydrated_history_snapshots: Vec::new(),
                 executed_messages: Vec::new(),
                 executed_volatile: Vec::new(),
                 text_only_turns: Vec::new(),
@@ -6383,6 +6401,14 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl AgenticLoopHost for MockHost {
+        async fn hydrate_restored_history(
+            &mut self,
+            state: &mut AgenticLoopState,
+        ) -> Result<(), astra_core::ClassifiedError> {
+            self.hydrated_history_snapshots.push(state.messages.clone());
+            Ok(())
+        }
+
         fn execution_handoff_requested(&self) -> bool {
             self.handoff_requested
         }
@@ -6666,6 +6692,43 @@ pub(crate) mod tests {
             edge_tool_round: Vec::new(),
             error_kind: None,
         }
+    }
+
+    #[tokio::test]
+    async fn restored_history_is_hydrated_before_first_round_compaction() {
+        let mut state = make_test_loop_state();
+        let long_text = "history ".repeat(256);
+        for index in 0..6 {
+            state.messages.push(json!({
+                "role": "user",
+                "content": format!("old request {index}: {long_text}"),
+            }));
+            state.messages.push(json!({
+                "role": "assistant",
+                "content": format!("old answer {index}: {long_text}"),
+            }));
+        }
+        state.message = "fresh follow-up".to_string();
+        state.user_intent = state.message.clone();
+        state
+            .messages
+            .push(json!({"role": "user", "content": state.message}));
+        state.max_turn_input_tokens = 128;
+        state.max_turns = 1;
+        state.remaining_turns = 1;
+        let admitted_history = state.messages.clone();
+        let mut host = MockHost::new(vec![text_result("done", 1, 1, Some(1))]);
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .expect("the restored turn should execute");
+
+        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
+        assert_eq!(host.hydrated_history_snapshots, vec![admitted_history]);
+        assert!(
+            state.context_compression_triggered,
+            "the fixture must exercise first-round resume compaction"
+        );
     }
 
     pub(crate) fn edge_tool_result(
