@@ -5694,6 +5694,7 @@ pub(crate) async fn run_tui_session(
                         chat_widget = chat_widget::ChatWidget::new(String::new());
                         chat_widget.set_explain_verbose(matches!(state.explain, crate::ExplainMode::Verbose));
                         chat_widget.set_explain_live_rows(state.runtime_config.explain.effective_live_rows());
+                        chat_widget.set_explain_report_format(state.runtime_config.explain.effective_report_format());
                         rebind_workbench_observers(None, &task_board, &server_agent_observer, &plan_task_observer, &mut board_user_pin);
                         refresh_footer_from_state(&mut bottom_pane, &state);
                         model_catalog_tasks.abort_all();

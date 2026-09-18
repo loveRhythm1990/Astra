@@ -29,7 +29,8 @@ local session replaces the previous session. MOI bootstrap runs first so that
 the product account mapping exists before Astra reads the shared model policy;
 this does not wait for workspace provisioning or selection.
 
-- `astra auth status --json` shows non-secret session state.
+- `astra auth status` shows a readable sign-in and workspace summary;
+  `astra auth status --json` emits the versioned non-secret session state for tools.
 - `astra auth workspace` chooses a workspace; `--clear` removes the local choice.
 - `astra model list` lists the server-governed model offerings.
 - `astra logout` revokes this native session and removes local authorization.
@@ -55,7 +56,11 @@ and login generation; an account switch cannot silently redirect an in-flight
 operation. An uncertain refresh rotation requires a new login, not refresh replay.
 
 A refused/DNS connection before the refresh request is sent remains retryable;
-an interrupted response or rejected rotation does not. `MOI_AUTH_DIR` must come
+an interrupted response or rejected rotation does not. This includes HTTP 5xx:
+a proxy failure or an issuer error after committing rotation does not prove the
+old refresh token is reusable. Fresh-token requests only read shared state;
+only expired or pending sessions wait for the rotation lock. Credential I/O and
+filesystem lock waits run off the async runtime. `MOI_AUTH_DIR` must come
 from the launching shell, not a workspace `.env`. Normal commands stop before
 using credentials if loading `.env` changes that selection.
 

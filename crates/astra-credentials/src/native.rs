@@ -499,12 +499,24 @@ pub async fn bounded_json<T: serde::de::DeserializeOwned>(
 }
 
 impl NativeStore {
+    // Credential reads and transactions take filesystem locks. Keep those off
+    // the async runtime, including the ordinary per-request fresh-token path.
+    async fn blocking<R: Send + 'static>(
+        &self,
+        operation: impl FnOnce(Self) -> Result<R, String> + Send + 'static,
+    ) -> Result<R, String> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || operation(store))
+            .await
+            .map_err(|_| "native credential operation interrupted".to_string())?
+    }
+
     pub async fn credential(
         &self,
         target: &str,
         expected_generation: Option<&str>,
     ) -> Result<Credential, String> {
-        let frozen = self.current()?;
+        let frozen = self.blocking(|store| store.current()).await?;
         frozen.environment.validate()?;
         if expected_generation.is_some_and(|v| v != frozen.generation) {
             return Err("MOI account changed during operation".into());
@@ -514,26 +526,38 @@ impl NativeStore {
         }
         // A separate per-environment lock serializes rotation without blocking
         // logout/account changes on the short global state transaction.
-        let rotation = private_open(
-            &self
-                .root
-                .join(format!("refresh-{}.lock", frozen.environment.key())),
-            true,
-        )?;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-        loop {
-            match FileExt::try_lock_exclusive(&rotation) {
-                Ok(()) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err("MOI credential refresh is busy".into());
+        // Fresh credentials need only a shared state read, not the rotation
+        // lock. Pending intent still has to wait for its in-flight owner.
+        let rotation = if frozen.expires_at <= unix_now()? + 60 || frozen.refresh_pending {
+            let key = frozen.environment.key();
+            Some(
+                self.blocking(move |store| {
+                    let rotation =
+                        private_open(&store.root.join(format!("refresh-{key}.lock")), true)?;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                    loop {
+                        match FileExt::try_lock_exclusive(&rotation) {
+                            Ok(()) => return Ok(rotation),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                if std::time::Instant::now() >= deadline {
+                                    return Err("MOI credential refresh is busy".into());
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(25));
+                            }
+                            Err(_) => return Err("cannot lock native credential refresh".into()),
+                        }
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                }
-                Err(_) => return Err("cannot lock native credential refresh".into()),
-            }
-        }
-        let mut current = self.current()?;
+                })
+                .await?,
+            )
+        } else {
+            None
+        };
+        let mut current = if rotation.is_some() {
+            self.blocking(|store| store.current()).await?
+        } else {
+            frozen.clone()
+        };
         if current.generation != frozen.generation {
             return Err("MOI account changed during operation".into());
         }
@@ -552,10 +576,14 @@ impl NativeStore {
                 ])
                 .build()
                 .map_err(|_| "cannot build token rotation request")?;
-            self.update(&current, |s| {
-                s.refresh_pending = true;
-                Ok(())
-            })?;
+            let expected = current.clone();
+            self.blocking(move |store| {
+                store.update(&expected, |s| {
+                    s.refresh_pending = true;
+                    Ok(())
+                })
+            })
+            .await?;
             // After sending, any failure may hide a successful rotation. Keep
             // the intent; never automatically replay the previous refresh token.
             let response = match client.execute(request).await {
@@ -564,10 +592,14 @@ impl NativeStore {
                     // No HTTP request reached the issuer. The rotation lock is
                     // still held and update checks the login generation, so a
                     // concurrent logout/account switch cannot be resurrected.
-                    self.update(&current, |s| {
-                        s.refresh_pending = false;
-                        Ok(())
-                    })?;
+                    let expected = current.clone();
+                    self.blocking(move |store| {
+                        store.update(&expected, |s| {
+                            s.refresh_pending = false;
+                            Ok(())
+                        })
+                    })
+                    .await?;
                     return Err("cannot connect to token service; retry when available".into());
                 }
                 Err(_) => {
@@ -575,6 +607,8 @@ impl NativeStore {
                 }
             };
             if !response.status().is_success() {
+                // Even a 5xx can be generated by a proxy or after the issuer
+                // committed rotation. HTTP status is not proof of non-consumption.
                 return Err("token rotation rejected; run astra login".into());
             }
             let token: TokenResponse = bounded_json(response).await?;
@@ -590,17 +624,26 @@ impl NativeStore {
                 let _ = revoke(&current.environment, &token.refresh_token).await;
                 return Err(error);
             }
-            if let Err(error) = self.update(&current, |s| {
-                s.access_token = token.access_token.clone();
-                s.refresh_token = token.refresh_token.clone();
-                s.expires_at = unix_now()? + token.expires_in;
-                s.refresh_pending = false;
-                Ok(())
-            }) {
+            let expected = current.clone();
+            let access_token = token.access_token.clone();
+            let refresh_token = token.refresh_token.clone();
+            let expires_in = token.expires_in;
+            if let Err(error) = self
+                .blocking(move |store| {
+                    store.update(&expected, |s| {
+                        s.access_token = access_token;
+                        s.refresh_token = refresh_token;
+                        s.expires_at = unix_now()? + expires_in;
+                        s.refresh_pending = false;
+                        Ok(())
+                    })
+                })
+                .await
+            {
                 let _ = revoke(&current.environment, &token.refresh_token).await;
                 return Err(error);
             }
-            current = self.current()?;
+            current = self.blocking(|store| store.current()).await?;
         }
         if current.generation != frozen.generation {
             return Err("MOI account changed during operation".into());
@@ -1054,6 +1097,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_credentials_do_not_wait_for_rotation_lock() {
+        let (_directory, store) = store();
+        let (published, _) = store.publish(session("A")).unwrap();
+        let rotation = private_open(
+            &store
+                .root
+                .join(format!("refresh-{}.lock", published.environment.key())),
+            true,
+        )
+        .unwrap();
+        FileExt::lock_exclusive(&rotation).unwrap();
+        let credentials = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(
+                store.credential("astra", None),
+                store.credential("moi", None)
+            )
+        })
+        .await
+        .expect("fresh credentials must not acquire the rotation lock");
+        assert_eq!(credentials.0.unwrap().access_token, published.access_token);
+        assert_eq!(credentials.1.unwrap().access_token, published.access_token);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn credential_state_lock_does_not_block_async_runtime() {
+        let (_directory, store) = store();
+        store.publish(session("A")).unwrap();
+        let lock = private_open(&store.root.join("auth.lock"), true).unwrap();
+        FileExt::lock_exclusive(&lock).unwrap();
+        let (released, observed) = std::sync::mpsc::channel();
+        // Bound even a regressed blocking implementation so this test cannot
+        // hang the suite. A responsive runtime releases this lock immediately.
+        let watchdog = std::thread::spawn(move || {
+            let prompted = observed
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok();
+            drop(lock);
+            prompted
+        });
+        let clone = store.clone();
+        let request = tokio::spawn(async move { clone.credential("astra", None).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = released.send(());
+        assert!(request.await.unwrap().is_ok());
+        assert!(
+            watchdog.join().unwrap(),
+            "filesystem locking stalled the async runtime"
+        );
+    }
+
+    #[tokio::test]
     async fn connection_failure_does_not_poison_refresh() {
         let mut fixture = rotation_fixture("A").await;
         let (_directory, store) = store();
@@ -1079,6 +1173,16 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_rotation_preserves_intent_and_is_not_replayed() {
+        for status in [
+            "400 Bad Request",
+            "502 Bad Gateway",
+            "503 Service Unavailable",
+        ] {
+            assert_rejected_rotation_is_not_replayed(status).await;
+        }
+    }
+
+    async fn assert_rejected_rotation_is_not_replayed(status: &'static str) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -1090,7 +1194,7 @@ mod tests {
                 String::from_utf8_lossy(&input[..len])
                     .starts_with("POST /realms/moi/protocol/openid-connect/token ")
             );
-            stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 25\r\nConnection: close\r\n\r\n{\"error\":\"invalid_grant\"}").await.unwrap();
+            stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 25\r\nConnection: close\r\n\r\n{{\"error\":\"invalid_grant\"}}").as_bytes()).await.unwrap();
         });
         let (_directory, store) = store();
         let mut expiring = session("A");

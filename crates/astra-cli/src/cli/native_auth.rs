@@ -186,7 +186,7 @@ pub(crate) async fn command(command: &NativeAuthCommand) -> Result<(), String> {
             }
             super::auth_flow::uc::choose_workspace(&store, &session, bootstrap, id.as_deref())
         }
-        NativeAuthCommand::Status { json: _ } => {
+        NativeAuthCommand::Status { json } => {
             let configured = store.configured()?;
             let status = if !configured {
                 serde_json::json!({"version": 1, "state": "not_configured"})
@@ -205,7 +205,7 @@ pub(crate) async fn command(command: &NativeAuthCommand) -> Result<(), String> {
                     Err(error) => return Err(error),
                 }
             };
-            super::stream::output_sink::write_stdout_line(&status.to_string())
+            super::stream::output_sink::write_stdout_line(&render_status(&status, *json))
                 .map_err(|_| "cannot write native authentication status")?;
             Ok(())
         }
@@ -220,6 +220,30 @@ pub(crate) async fn command(command: &NativeAuthCommand) -> Result<(), String> {
             pipe.flush()
                 .map_err(|_| "cannot flush credential pipe".into())
         }
+    }
+}
+
+fn render_status(status: &serde_json::Value, json: bool) -> String {
+    if json {
+        return status.to_string();
+    }
+    match status["state"].as_str() {
+        Some("signed_in" | "reauthentication_required") => {
+            let heading = if status["state"] == "signed_in" {
+                "Signed in to MOI."
+            } else {
+                "Sign-in needs to be renewed. Run astra login."
+            };
+            format!(
+                "{heading}\nAccount: {}\nAstra: {}\nMOI: {}\nWorkspace: {}",
+                status["subject"].as_str().unwrap_or(""),
+                status["astra_url"].as_str().unwrap_or(""),
+                status["moi_url"].as_str().unwrap_or(""),
+                status["workspace_id"].as_str().unwrap_or("not selected"),
+            )
+        }
+        Some("signed_out") => "Signed out of MOI. Run astra login to sign in.".into(),
+        _ => "MOI sign-in is not configured. Run astra login to get started.".into(),
     }
 }
 
@@ -263,6 +287,33 @@ pub(crate) async fn logout() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_respects_json_and_renders_all_human_states_without_credentials() {
+        for (state, expected) in [
+            ("not_configured", "not configured"),
+            ("signed_out", "Signed out"),
+            ("signed_in", "Signed in"),
+            ("reauthentication_required", "needs to be renewed"),
+        ] {
+            let status = serde_json::json!({
+                "version": 1, "state": state, "subject": "account-a",
+                "astra_url": "https://astra.example.test", "moi_url": "https://moi.example.test",
+                "workspace_id": null
+            });
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&render_status(&status, true)).unwrap(),
+                status
+            );
+            let human = render_status(&status, false);
+            assert!(human.contains(expected), "{human}");
+            assert!(!human.starts_with('{'));
+            if matches!(state, "signed_in" | "reauthentication_required") {
+                assert!(human.contains("Workspace: not selected"));
+                assert!(human.contains("Account: account-a"));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn login_rebinding_does_not_retarget_existing_bearer_provider() {
