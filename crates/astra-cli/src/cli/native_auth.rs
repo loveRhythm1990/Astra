@@ -19,6 +19,10 @@ pub(crate) fn active() -> Option<Arc<Binding>> {
 }
 
 impl Binding {
+    pub(crate) fn endpoint(&self) -> &str {
+        &self.session.environment.astra_url
+    }
+
     pub(crate) fn profile_name(&self) -> String {
         format!(
             "moi-{}-{}",
@@ -359,5 +363,120 @@ mod tests {
         assert!(old.access_token().await.is_err());
         assert_eq!(new.access_token().await.unwrap(), "test-access-b");
         assert_ne!(old.profile_name(), new.profile_name());
+    }
+
+    #[tokio::test]
+    async fn cloud_sync_native_credentials_remain_bound_to_the_selected_origin() {
+        // Native process authority is global. Exercise it in a fresh process so
+        // unrelated legacy tests never observe this synthetic login.
+        const CHILD: &str = "ASTRA_NATIVE_CLOUD_BINDING_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cli::native_auth::tests::cloud_sync_native_credentials_remain_bound_to_the_selected_origin", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, path},
+        };
+        let selected = MockServer::start().await;
+        let foreign = MockServer::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::test_utils::HomeGuard::temp();
+        // This child runs exactly one test and restores no shared parent state.
+        unsafe {
+            std::env::set_var("MOI_AUTH_DIR", root.path().join("auth"));
+            std::env::set_var("ASTRA_API_URL", foreign.uri());
+        }
+        let _legacy_token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let issuer = "https://uc.example.test/realms/moi";
+        let store = NativeStore::new().unwrap();
+        let (session, _) = store
+            .publish(native::NativeSession {
+                environment: native::Environment {
+                    issuer: issuer.into(),
+                    astra_url: selected.uri(),
+                    moi_url: "https://moi.example.test/newmoi".into(),
+                    authorization_endpoint: format!("{issuer}/protocol/openid-connect/auth"),
+                    token_endpoint: format!("{issuer}/protocol/openid-connect/token"),
+                    revocation_endpoint: format!("{issuer}/protocol/openid-connect/revoke"),
+                    jwks_uri: format!("{issuer}/protocol/openid-connect/certs"),
+                },
+                generation: String::new(),
+                subject: "account-a".into(),
+                session_id: "session-a".into(),
+                astra_user_id: "astra-a".into(),
+                moi_principal_id: "moi-a".into(),
+                catalog_user_id: "catalog-a".into(),
+                access_token: "synthetic-access".into(),
+                refresh_token: "synthetic-refresh".into(),
+                expires_at: native::unix_now().unwrap() + 3600,
+                workspace_id: None,
+                role_id: None,
+                refresh_pending: false,
+            })
+            .unwrap();
+        let mut base = selected.uri();
+        let binding = bind_process(&mut base, true, None, false).unwrap().unwrap();
+        crate::cli::cli_config::cli_utils::install_cli_profile_identity(
+            binding.profile_name(),
+            Some(session.astra_user_id.clone()),
+        )
+        .unwrap();
+        Mock::given(path("/preferences"))
+            .and(header("Authorization", "Bearer synthetic-access"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"preferences":[]})),
+            )
+            .expect(2)
+            .mount(&selected)
+            .await;
+        assert!(
+            crate::cli::cloud_sync::try_cloud_pull(&binding.profile_name())
+                .await
+                .cloud_reachable
+        );
+        let snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        assert_eq!(
+            snapshot.native_binding.as_ref().unwrap().endpoint(),
+            selected.uri()
+        );
+        assert!(snapshot.access_token.is_none());
+        let _no_env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_API_URL");
+        assert!(
+            crate::cli::cloud_sync::try_cloud_pull(&binding.profile_name())
+                .await
+                .cloud_reachable
+        );
+        assert!(
+            crate::cli::preferences_client::pull_all_preferences(
+                &foreign.uri(),
+                Some("synthetic-access")
+            )
+            .await
+            .is_err()
+        );
+        store.logout().unwrap();
+        assert!(
+            snapshot
+                .native_binding
+                .unwrap()
+                .access_token()
+                .await
+                .is_err()
+        );
+        assert!(
+            !crate::cli::cloud_sync::try_cloud_pull(&binding.profile_name())
+                .await
+                .cloud_reachable
+        );
+        assert!(foreign.received_requests().await.unwrap().is_empty());
     }
 }

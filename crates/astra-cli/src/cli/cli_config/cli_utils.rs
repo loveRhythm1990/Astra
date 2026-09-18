@@ -103,6 +103,7 @@ pub(crate) struct CliProfileIdentity {
 pub(crate) struct CliOwnerAuthSnapshot {
     pub(crate) owner_scope: astra_services::OwnerScope,
     pub(crate) access_token: Option<String>,
+    pub(crate) native_binding: Option<std::sync::Arc<crate::cli::native_auth::Binding>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,10 +166,23 @@ pub(crate) fn cli_owner_auth_snapshot() -> CliOwnerAuthSnapshot {
         return CliOwnerAuthSnapshot {
             owner_scope: astra_services::local_owner_scope(),
             access_token: None,
+            native_binding: None,
         };
     };
     let owner_scope = astra_services::OwnerScope::user(identity.local_owner_id.clone())
         .expect("installed CLI owner identity is valid");
+    let native_binding = crate::cli::native_auth::active();
+    if let Some(binding) = &native_binding {
+        let matches_owner = binding.profile_name() == identity.profile_name
+            && binding
+                .snapshot()
+                .is_ok_and(|session| Some(session.astra_user_id) == identity.account_id);
+        return CliOwnerAuthSnapshot {
+            owner_scope,
+            access_token: None,
+            native_binding: matches_owner.then(|| binding.clone()),
+        };
+    }
     let access_token = load_credentials()
         .profiles
         .get(&identity.profile_name)
@@ -178,6 +192,7 @@ pub(crate) fn cli_owner_auth_snapshot() -> CliOwnerAuthSnapshot {
     CliOwnerAuthSnapshot {
         owner_scope,
         access_token,
+        native_binding: None,
     }
 }
 

@@ -46,6 +46,9 @@ pub(crate) fn create_tui_pipeline_modules(
 /// Resolve the astra server base URL. Returns `None` when no server
 /// is configured (offline mode).
 pub(crate) fn resolve_cloud_base() -> Option<String> {
+    if let Some(binding) = crate::cli::native_auth::active() {
+        return Some(binding.endpoint().to_owned());
+    }
     std::env::var("ASTRA_API_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())

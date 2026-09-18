@@ -9,6 +9,7 @@ pub(crate) async fn login_with_observer(
     observer: super::LoginObserver,
     terminal_workspace_prompt: bool,
 ) -> Result<(), String> {
+    let store = NativeStore::new()?;
     native::secure_url(&api.api_origin())?;
     native::secure_url(&discovery.issuer)?;
     native::secure_url(&discovery.moi_api_url)?;
@@ -101,25 +102,11 @@ pub(crate) async fn login_with_observer(
             .ok()
         });
         let Some(callback) = callback else {
-            super::write_callback_response(
-                &mut stream,
-                "400 Bad Request",
-                None,
-                "Invalid login callback",
-                deadline,
-            )
-            .await;
+            super::browser_code::write_result(&mut stream, false, deadline).await;
             continue;
         };
         let Callback::Code(code) = callback else {
-            super::write_callback_response(
-                &mut stream,
-                "200 OK",
-                None,
-                "Login was not completed. Return to Astra.",
-                deadline,
-            )
-            .await;
+            super::browser_code::write_result(&mut stream, false, deadline).await;
             return Err(
                 "UC authorization was denied or cancelled; no local session was changed".into(),
             );
@@ -139,28 +126,23 @@ pub(crate) async fn login_with_observer(
             ),
         )
         .await
-        .map_err(|_| "UC login timed out")?;
-        super::write_callback_response(
+        .map_err(|_| "UC login timed out".to_string())
+        .and_then(|result| result);
+        let result = match result {
+            Ok((session, bootstrap)) => publish_prepared_login(&store, session, bootstrap).await,
+            Err(error) => Err(error),
+        };
+        super::browser_code::write_result(
             &mut stream,
-            if result.is_ok() {
-                "200 OK"
-            } else {
-                "502 Bad Gateway"
-            },
-            None,
-            if result.is_ok() {
-                r#"{"status":"signed_in","message":"Return to Astra."}"#
-            } else {
-                "Login preparation failed. Return to the terminal."
-            },
-            deadline,
+            result.is_ok(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
         )
         .await;
         let (session, bootstrap) = result?;
         // Login is already committed. Workspace selection is optional, and a
         // queue/list/prompt failure cannot undo authentication success.
         if terminal_workspace_prompt
-            && let Err(error) = choose_workspace(&NativeStore::new()?, &session, bootstrap, None)
+            && let Err(error) = choose_workspace(&store, &session, bootstrap, None)
         {
             eprintln!("Workspace not selected: {error}. Use `astra auth workspace` later.");
         }
@@ -291,13 +273,32 @@ async fn prepare(
         role_id: None,
         refresh_pending: false,
     };
-    let (published, old) = NativeStore::new()?.publish(session)?;
+    Ok((session, moi))
+}
+
+async fn publish_prepared_login(
+    store: &NativeStore,
+    session: NativeSession,
+    bootstrap: MoiBootstrap,
+) -> Result<(NativeSession, MoiBootstrap), String> {
+    // The browser deadline has ended. Publication is the success boundary;
+    // neither revocation nor result-page delivery may reverse it.
+    let (published, old) = store.publish(session)?;
     if let Some(old) = old {
-        if let Err(error) = native::revoke(&old.environment, &old.refresh_token).await {
-            tracing::warn!(error = %error, "previous UC session revocation failed");
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            native::revoke(&old.environment, &old.refresh_token),
+        )
+        .await
+        {
+            Ok(Ok(())) => (),
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "previous UC session revocation failed")
+            }
+            Err(_) => tracing::warn!("previous UC session revocation timed out"),
         }
     }
-    Ok((published, moi))
+    Ok((published, bootstrap))
 }
 
 #[derive(Deserialize)]
@@ -487,6 +488,67 @@ pub(crate) fn choose_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn committed_login_survives_slow_previous_revocation_after_browser_deadline() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeStore::with_directory(root.path().join("auth"));
+        let original = NativeSession {
+            environment: Environment {
+                issuer: issuer.clone(),
+                astra_url: server.uri(),
+                moi_url: format!("{issuer}/newmoi"),
+                authorization_endpoint: format!("{issuer}/authorize"),
+                token_endpoint: format!("{issuer}/protocol/openid-connect/token"),
+                revocation_endpoint: format!("{issuer}/protocol/openid-connect/revoke"),
+                jwks_uri: format!("{issuer}/protocol/openid-connect/certs"),
+            },
+            generation: String::new(),
+            subject: "user".into(),
+            session_id: "old-session".into(),
+            astra_user_id: "astra-user".into(),
+            moi_principal_id: "moi-user".into(),
+            catalog_user_id: "catalog-user".into(),
+            access_token: "old-access".into(),
+            refresh_token: "old-refresh".into(),
+            expires_at: native::unix_now().unwrap() + 3600,
+            workspace_id: None,
+            role_id: None,
+            refresh_pending: false,
+        };
+        let (old, _) = store.publish(original.clone()).unwrap();
+        Mock::given(path("/protocol/openid-connect/revoke"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(3)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut prepared = original;
+        prepared.session_id = "new-session".into();
+        prepared.access_token = "new-access".into();
+        prepared.refresh_token = "new-refresh".into();
+        let bootstrap = serde_json::from_value(serde_json::json!({
+            "issuer":issuer, "subject":"user", "session_id":"new-session", "principal_id":"moi-user",
+            "catalog_user_id":"catalog-user", "workspaces":[], "workspace_initialization":{"status":"pending"}
+        })).unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
+        let (published, _) = publish_prepared_login(&store, prepared, bootstrap)
+            .await
+            .unwrap();
+        assert!(tokio::time::Instant::now() > deadline);
+        assert_ne!(published.generation, old.generation);
+        assert_eq!(store.current().unwrap().generation, published.generation);
+        assert_eq!(
+            store
+                .credential("astra", Some(&published.generation))
+                .await
+                .unwrap()
+                .access_token,
+            "new-access"
+        );
+    }
 
     #[tokio::test]
     async fn native_bootstrap_prepares_moi_before_astra_without_waiting_for_workspace() {

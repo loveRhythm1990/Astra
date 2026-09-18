@@ -55,6 +55,18 @@ set `MOI_ASTRA_BINARY` to its absolute path. Commands freeze account, environmen
 and login generation; an account switch cannot silently redirect an in-flight
 operation. An uncertain refresh rotation requires a new login, not refresh replay.
 
+Cloud preference, outbox and resume traffic use the same selected native
+endpoint and generation-bound refreshing credential as chat. A conflicting
+`ASTRA_API_URL` cannot redirect that credential, and omitting the environment
+variable does not disable native cloud synchronization. Legacy profiles retain
+their existing endpoint selection.
+
+The browser callback renders a self-contained result page rather than raw JSON.
+Login preparation has a five-minute deadline; after credentials are durably
+published, browser delivery or bounded revocation of the superseded session
+cannot turn the successful login into a timeout. Failed old-session revocation
+is logged and that session remains subject to UC's normal expiration policy.
+
 A refused/DNS connection before the refresh request is sent remains retryable;
 an interrupted response or rejected rotation does not. This includes HTTP 5xx:
 a proxy failure or an issuer error after committing rotation does not prove the

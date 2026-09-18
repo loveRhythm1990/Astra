@@ -188,7 +188,9 @@ async fn uc_browser_denial_returns_to_tui_without_token_exchange() {
     let mut discovery: astra_services::auth::uc::UcDiscovery =
         serde_json::from_value(uc()).unwrap();
     discovery.issuer = origin;
-    let observer: LoginObserver = std::sync::Arc::new(|progress| {
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    let response_tx = std::sync::Mutex::new(Some(response_tx));
+    let observer: LoginObserver = std::sync::Arc::new(move |progress| {
         match progress {
             LoginProgress::OpenBrowser(url) => {
                 let url = url::Url::parse(&url).unwrap();
@@ -200,14 +202,22 @@ async fn uc_browser_denial_returns_to_tui_without_token_exchange() {
                     .append_pair("state", &params["state"])
                     .append_pair("iss", &url.origin().ascii_serialization())
                     .append_pair("error", "access_denied");
+                let response_tx = response_tx.lock().unwrap().take().unwrap();
                 tokio::spawn(async move {
-                    reqwest::Client::builder()
+                    let response = reqwest::Client::builder()
                         .no_proxy()
                         .build()
                         .unwrap()
                         .get(callback)
                         .send()
                         .await
+                        .unwrap();
+                    let content_type = response.headers()["content-type"]
+                        .to_str()
+                        .unwrap()
+                        .to_owned();
+                    response_tx
+                        .send((content_type, response.text().await.unwrap()))
                         .unwrap();
                 });
             }
@@ -222,4 +232,8 @@ async fn uc_browser_denial_returns_to_tui_without_token_exchange() {
     .await
     .unwrap();
     assert!(result.unwrap_err().contains("denied or cancelled"));
+    let (content_type, body) = response_rx.await.unwrap();
+    assert_eq!(content_type, "text/html; charset=utf-8");
+    assert!(body.contains("Couldn’t complete sign-in"));
+    assert!(!body.contains("access_denied"));
 }
