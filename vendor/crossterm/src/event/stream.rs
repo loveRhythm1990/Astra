@@ -44,6 +44,11 @@ impl Default for EventStream {
         thread::spawn(move || {
             while let Ok(task) = receiver.recv() {
                 loop {
+                    // A dropped stream may still have a queued wake task. Do
+                    // not let that task reacquire the reader after a handoff.
+                    if task.stream_wake_task_should_shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
                     if let Ok(true) = poll_internal(None, &EventFilter) {
                         break;
                     }

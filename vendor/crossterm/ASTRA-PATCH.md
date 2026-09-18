@@ -105,3 +105,15 @@ inside the real 300 ms product budget on a loaded hosted runner. The assertion
 uses the recorded parent timestamps to prove that the delay actually occurred.
 It intentionally does not use wall-clock scheduling to test behavior close to
 the timeout boundary.
+
+## Bounded cursor queries during resize
+
+`query_cursor_position(timeout)` uses the same Unix reader after Astra pauses
+its EventStream. It discards stale CPR replies, issues DSR, and retains keyboard
+and paste events in FIFO order. Missing replies are bounded by the supplied
+budget (150 ms in Astra); no second terminal reader is opened. A dropped stream's
+queued wake task checks its shutdown flag before polling, so it cannot reclaim
+the reader during this handoff. Replies carry the dimensions sampled at query
+time. A resize arriving during the query leaves its event queued and interrupts
+the result, so Astra retries before painting with an obsolete cursor anchor. The startup PTY suite covers resize replies and
+timeouts on both reader backends. No new public Event variants are introduced.

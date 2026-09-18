@@ -11,7 +11,11 @@ use tokio_stream::wrappers::ReceiverStream;
 pub(crate) enum TuiEvent {
     Key(KeyEvent),
     Paste(String),
-    Resize,
+    Resize {
+        cursor: Option<(u16, u16)>,
+        size: (u16, u16),
+        interrupted: bool,
+    },
     Draw,
     /// Internal wake that asks the idle loop to reconcile queued runtime
     /// facts at a model boundary. This must stay typed: injecting magic text
@@ -22,7 +26,7 @@ pub(crate) enum TuiEvent {
 
 pub(crate) struct TuiEventStream {
     pending: VecDeque<TuiEvent>,
-    crossterm_stream: EventStream,
+    crossterm_stream: Option<EventStream>,
     draw_stream: ReceiverStream<()>,
     poll_draw_first: bool,
 }
@@ -31,7 +35,7 @@ impl TuiEventStream {
     pub(crate) fn new(draw_rx: mpsc::Receiver<()>) -> Self {
         Self {
             pending: VecDeque::new(),
-            crossterm_stream: EventStream::new(),
+            crossterm_stream: Some(EventStream::new()),
             draw_stream: ReceiverStream::new(draw_rx),
             poll_draw_first: false,
         }
@@ -43,7 +47,8 @@ impl TuiEventStream {
 
     fn poll_crossterm_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
         loop {
-            let event = Pin::new(&mut self.crossterm_stream).poll_next(cx);
+            let event = Pin::new(self.crossterm_stream.as_mut().expect("input stream active"))
+                .poll_next(cx);
             #[cfg(unix)]
             if let Some(params) = crossterm::event::cached_primary_device_attributes() {
                 astra_tools::display_sixel::set_sixel_supported(
@@ -52,6 +57,30 @@ impl TuiEventStream {
             }
             match event {
                 Poll::Ready(Some(Ok(event))) => {
+                    if let Event::Resize(width, height) = event {
+                        let size = crossterm::terminal::size().unwrap_or((width, height));
+                        // Pause the async waker before querying the same crossterm
+                        // reader. Keyboard/paste events received with CPR stay queued.
+                        drop(self.crossterm_stream.take());
+                        #[cfg(unix)]
+                        let result = crossterm::event::query_cursor_position(
+                            std::time::Duration::from_millis(150),
+                        )
+                        .map(|report| (report.size, report.position, report.interrupted));
+                        #[cfg(windows)]
+                        let result =
+                            crossterm::cursor::position().map(|cursor| (size, Some(cursor), false));
+                        self.crossterm_stream = Some(EventStream::new());
+                        let (size, cursor, interrupted) = match result {
+                            Ok(report) => report,
+                            Err(_) => (size, None, false),
+                        };
+                        return Poll::Ready(Some(TuiEvent::Resize {
+                            cursor,
+                            size,
+                            interrupted,
+                        }));
+                    }
                     if let Some(mapped) = map_crossterm_event(event) {
                         return Poll::Ready(Some(mapped));
                     }
@@ -83,7 +112,11 @@ fn map_crossterm_event(event: Event) -> Option<TuiEvent> {
             Some(TuiEvent::Key(normalize_key_event(key_event)))
         }
         Event::Key(_) => None,
-        Event::Resize(_, _) => Some(TuiEvent::Resize),
+        Event::Resize(width, height) => Some(TuiEvent::Resize {
+            cursor: None,
+            size: (width, height),
+            interrupted: false,
+        }),
         Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
         Event::FocusGained | Event::FocusLost => Some(TuiEvent::Draw),
         _ => None,

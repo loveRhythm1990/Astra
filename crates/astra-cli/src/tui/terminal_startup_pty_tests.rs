@@ -191,6 +191,11 @@ fn probe_child() {
                     events.push(format!("key:{:?}:{:?}", key.code, key.modifiers))
                 }
                 crate::tui::event::TuiEvent::Paste(text) => events.push(format!("paste:{text}")),
+                crate::tui::event::TuiEvent::Resize { cursor, .. }
+                    if case.starts_with("resize_") =>
+                {
+                    events.push(format!("resize:{cursor:?}"));
+                }
                 _ => {}
             }
         }
@@ -230,6 +235,15 @@ fn expected_events(case: &str) -> Vec<String> {
             "key:Esc:KeyModifiers(0x0)".to_string(),
             "key:Char('f'):KeyModifiers(0x0)".to_string(),
         ],
+        "resize_reply" | "resize_fragmented" | "resize_timeout" => vec![
+            if case != "resize_timeout" {
+                "resize:Some((2, 4))".to_string()
+            } else {
+                "resize:None".to_string()
+            },
+            "key:Char('a'):KeyModifiers(0x0)".to_string(),
+            "paste:resize paste".to_string(),
+        ],
         "arrow" => vec!["key:Up:KeyModifiers(0x0)".to_string()],
         "alt" => vec!["key:Char('f'):KeyModifiers(ALT)".to_string()],
         _ => vec![
@@ -244,6 +258,9 @@ fn special_input(case: &str) -> bool {
     matches!(
         case,
         "escape"
+            | "resize_reply"
+            | "resize_fragmented"
+            | "resize_timeout"
             | "poll_escape"
             | "escape_then_f"
             | "arrow"
@@ -323,7 +340,7 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
     let mut output = Vec::new();
     let mut replied = false;
     let mut sent_input = false;
-    let mut cursor_replied = false;
+    let mut cursor_replies = 0;
     loop {
         if Instant::now() > deadline {
             child.kill().ok();
@@ -446,6 +463,19 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
                     std::thread::sleep(Duration::from_millis(20));
                     master.write_all(b"f").unwrap();
                 }
+                "resize_reply" | "resize_fragmented" | "resize_timeout" => {
+                    let size = Winsize {
+                        ws_row: 20,
+                        ws_col: 60,
+                        ws_xpixel: 0,
+                        ws_ypixel: 0,
+                    };
+                    // SAFETY: valid PTY and window-size pointer.
+                    assert_eq!(
+                        unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+                        0
+                    );
+                }
                 "arrow" => master.write_all(b"\x1b[A").unwrap(),
                 "alt" => master.write_all(b"\x1bf").unwrap(),
                 // SAFETY: this is the live test child we just spawned.
@@ -467,9 +497,28 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
                 _ => unreachable!(),
             }
         }
-        if !cursor_replied && output.windows(4).any(|bytes| bytes == b"\x1b[6n") {
-            master.write_all(b"\x1b[8;1R").unwrap();
-            cursor_replied = true;
+        let queries = output
+            .windows(4)
+            .filter(|bytes| *bytes == b"\x1b[6n")
+            .count();
+        if queries > cursor_replies {
+            cursor_replies += 1;
+            if cursor_replies == 1 {
+                master.write_all(b"\x1b[8;1R").unwrap();
+            } else if case.starts_with("resize_") {
+                // User input received during DSR must survive in FIFO order.
+                master.write_all(b"a").unwrap();
+                if case != "resize_timeout" {
+                    if case == "resize_fragmented" {
+                        master.write_all(b"\x1b").unwrap();
+                        std::thread::sleep(Duration::from_millis(5));
+                        master.write_all(b"[5;3R").unwrap();
+                    } else {
+                        master.write_all(b"\x1b[5;3R").unwrap();
+                    }
+                }
+                master.write_all(b"\x1b[200~resize paste\x1b[201~").unwrap();
+            }
         }
         if child.try_wait().unwrap().is_some() {
             // Read remaining output on the next poll; the slave closes at exit.
@@ -652,4 +701,11 @@ fn pty_sixel_waits_for_da1_and_records_negative_evidence() {
     );
     let (value, _) = run_case("no_sixel");
     assert_eq!(value["sixel_before"], false, "no_sixel: {value}");
+}
+
+#[test]
+fn pty_resize_cursor_query_preserves_input_and_handles_missing_reply() {
+    for case in ["resize_reply", "resize_fragmented", "resize_timeout"] {
+        run_case(case);
+    }
 }

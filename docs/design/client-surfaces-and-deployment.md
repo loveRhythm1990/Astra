@@ -64,6 +64,16 @@ CLI/TUI owns local interactive ergonomics but not separate agent semantics. It s
 - local diagnostics;
 - reconnect/resume.
 
+Inline terminal resize reconciles the viewport with the terminal's cursor
+position before clearing and repainting. The existing crossterm input owner
+pauses its event stream for a bounded cursor query and preserves unrelated
+input. Cursor replies are associated with the queried dimensions; intervening
+resizes invalidate them. Scheduled frames wait for this reconciliation and
+cannot advance the remembered screen size; viewport growth erases
+transient UI before scrolling. Resize must preserve native history and must
+not purge scrollback. Terminals that do not answer cursor queries fall back to
+height-clamping corrections; width-reflow recovery requires a cursor reply.
+
 ## UI projection rules
 
 - UI displays durable projection, not private local cache as truth.
