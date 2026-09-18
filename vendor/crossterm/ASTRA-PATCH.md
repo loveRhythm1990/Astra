@@ -119,3 +119,9 @@ same stream without spawning another wake thread. Replies carry the dimensions s
 time. A resize arriving during the query leaves its event queued and interrupts
 the result, so Astra retries before painting with an obsolete cursor anchor. The startup PTY suite covers resize replies and
 timeouts on both reader backends. No new public Event variants are introduced.
+
+The resize PTY fixture splits CPR inside a recognized CSI without sleeping
+after a bare ESC. A hosted runner can overshoot that ambiguous ESC's 40 ms
+lookahead window; every CPR split boundary is instead covered directly by the
+parser unit test. The PTY assertion still rejects all extra keyboard/paste
+events and reports both the unexpected event and the collected input.

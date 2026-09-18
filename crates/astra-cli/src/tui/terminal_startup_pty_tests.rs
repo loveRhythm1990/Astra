@@ -235,21 +235,22 @@ fn probe_child() {
             }
         }
         // A late OSC reply must not become a fourth keyboard event.
-        assert!(
-            tokio::time::timeout(Duration::from_millis(40), async {
-                loop {
-                    match stream.next().await {
-                        Some(
-                            crate::tui::event::TuiEvent::Key(_)
-                            | crate::tui::event::TuiEvent::Paste(_),
-                        ) => break,
-                        None => panic!("input stream ended"),
-                        _ => {} // Resize notifications may be duplicated/coalesced by the OS.
-                    }
+        let extra_input = tokio::time::timeout(Duration::from_millis(40), async {
+            loop {
+                match stream.next().await {
+                    Some(
+                        event @ (crate::tui::event::TuiEvent::Key(_)
+                        | crate::tui::event::TuiEvent::Paste(_)),
+                    ) => break event,
+                    None => panic!("input stream ended"),
+                    _ => {} // Resize notifications may be duplicated/coalesced by the OS.
                 }
-            })
-            .await
-            .is_err()
+            }
+        })
+        .await;
+        assert!(
+            extra_input.is_err(),
+            "unexpected input {extra_input:?}; collected={events:?}"
         );
         events
     });
@@ -564,9 +565,12 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
                 }
                 if case != "resize_timeout" {
                     if case == "resize_fragmented" {
-                        master.write_all(b"\x1b").unwrap();
-                        std::thread::sleep(Duration::from_millis(5));
-                        master.write_all(b"[5;3R").unwrap();
+                        // Split inside a recognized CSI, not after a bare ESC:
+                        // hosted-runner scheduling can exceed the 40 ms Escape
+                        // ambiguity window even for a requested 5 ms sleep.
+                        // Parser unit tests cover every CPR byte boundary.
+                        master.write_all(b"\x1b[5;").unwrap();
+                        master.write_all(b"3R").unwrap();
                     } else if case == "resize_invalid" {
                         master.write_all(b"\x1b[65535;65535R").unwrap();
                     } else {
