@@ -23,6 +23,10 @@ impl LoginControl {
             .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     }
+
+    pub(super) fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == 2
+    }
 }
 
 #[cfg(test)]
@@ -33,8 +37,10 @@ mod tests {
     fn cancelled_browser_cannot_start_credential_exchange() {
         let control = LoginControl::default();
         assert!(control.cancel());
+        assert!(control.is_cancelled());
         assert!(control.begin_exchange().is_err());
         control.reset();
+        assert!(!control.is_cancelled());
         assert!(control.begin_exchange().is_ok());
     }
 
@@ -43,6 +49,7 @@ mod tests {
         let control = LoginControl::default();
         assert!(control.begin_exchange().is_ok());
         assert!(!control.cancel());
+        assert!(!control.is_cancelled());
     }
 
     #[test]

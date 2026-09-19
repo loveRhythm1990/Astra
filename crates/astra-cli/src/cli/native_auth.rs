@@ -449,7 +449,43 @@ mod tests {
             selected.uri()
         );
         assert!(snapshot.access_token.is_none());
+        Mock::given(path("/memory/health"))
+            .and(header("Authorization", "Bearer synthetic-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("memory ready"))
+            .expect(2)
+            .mount(&selected)
+            .await;
+        assert_eq!(
+            crate::edge_tools::memoria::memoria_health().await.unwrap(),
+            "memory ready"
+        );
         let _no_env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_API_URL");
+        assert_eq!(
+            crate::edge_tools::memoria::memoria_health().await.unwrap(),
+            "memory ready"
+        );
+        // Native memory requests must not follow even a same-origin redirect.
+        Mock::given(path("/memory/snapshots"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/memory/redirected", selected.uri())),
+            )
+            .expect(1)
+            .mount(&selected)
+            .await;
+        assert!(
+            crate::edge_tools::memoria::memoria_snapshots_list()
+                .await
+                .is_err()
+        );
+        assert!(
+            !selected
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.url.path() == "/memory/redirected")
+        );
         assert!(
             crate::cli::cloud_sync::try_cloud_pull(&binding.profile_name())
                 .await
@@ -464,6 +500,7 @@ mod tests {
             .is_err()
         );
         store.logout().unwrap();
+        assert!(crate::edge_tools::memoria::memoria_health().await.is_err());
         assert!(
             snapshot
                 .native_binding

@@ -138,6 +138,12 @@ also replaces the remote skill registry and its private cache, restarts external
 discovery, and attaches both the workbench and runtime to the new registry.
 Same-account re-login still replaces these clients because the credential
 generation changed; previously created transports remain generation-pinned.
+Cancelling browser waiting restores the previous identity's memory service and
+external discovery through the same completion path as an unsuccessful login.
+Native CLI memory proxy operations use the selected environment's endpoint and
+refreshing generation-bound credential together, ignoring conflicting legacy
+URL configuration and refusing HTTP redirects. Legacy memory proxy routing is
+unchanged when no native identity is bound.
 
 Browser login URLs require HTTPS except for explicit loopback development addresses. Windows passes the URL as child-process environment data, not shell source.
 
