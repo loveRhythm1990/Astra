@@ -2,7 +2,9 @@ use super::*;
 use serde_json::json;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
 
-#[tokio::test]
+// Login completion rebuilds the production Skill/MCP pipeline, whose root
+// initialization uses block_in_place on the CLI's multi-thread runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn browser_login_completion_requires_registered_checkout_before_runtime_ready() {
     let _credentials = crate::tests::isolate_credentials();
