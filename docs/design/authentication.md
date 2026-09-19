@@ -131,6 +131,14 @@ not initialize a ready runtime. Existing transports retain their old generation
 binding; they cannot silently adopt another account. Authentication
 changes are refused while local background tasks are running.
 
+At browser re-login the CLI drains and retires its old session-memory service
+before credential publication. Successful completion rebuilds that service with
+the authenticated identity, including when the process started signed out. It
+also replaces the remote skill registry and its private cache, restarts external
+discovery, and attaches both the workbench and runtime to the new registry.
+Same-account re-login still replaces these clients because the credential
+generation changed; previously created transports remain generation-pinned.
+
 Browser login URLs require HTTPS except for explicit loopback development addresses. Windows passes the URL as child-process environment data, not shell source.
 
 ### Browser-delivered local authorization codes

@@ -6475,7 +6475,7 @@ pub(crate) async fn run_tui_session(
         ) => result?,
     };
     let SessionStartupArtifacts {
-        pipeline_modules,
+        mut pipeline_modules,
         mut edge_heartbeat_task,
         shutdown_signal_rx,
         ..
@@ -6534,9 +6534,9 @@ pub(crate) async fn run_tui_session(
     // Local and bundled skills are already available. External providers
     // converge in a supervised task after startup so DB/MCP latency cannot
     // delay the first interactive frame.
-    let skill_registry = Arc::clone(&state.unified_skill_registry);
+    let mut skill_registry = Arc::clone(&state.unified_skill_registry);
     let discovery_registry = Arc::clone(&skill_registry);
-    let mcp_manager = Arc::clone(&state.mcp_manager);
+    let mut mcp_manager = Arc::clone(&state.mcp_manager);
     let discovery_mcp_manager = Arc::clone(&mcp_manager);
     let mut external_skill_discovery = tokio::spawn(async move {
         crate::cli::session::session_runtime::discover_external_pipeline_capabilities(
@@ -6914,6 +6914,11 @@ pub(crate) async fn run_tui_session(
                         // No model/tool work can start while the login task owns input.
                         // Retire the old owner before the browser publishes credentials.
                         auth_flow::begin_browser_session_login(&mut state).await;
+                        if external_skill_discovery_pending {
+                            external_skill_discovery.abort();
+                            let _ = (&mut external_skill_discovery).await;
+                            external_skill_discovery_pending = false;
+                        }
                         runtime_notification_turn_pending = false;
                         runtime_notification_wake_at = None;
                         let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
@@ -6955,7 +6960,17 @@ pub(crate) async fn run_tui_session(
                             let _ = task.await;
                         }
                         match auth_flow::finish_browser_session_login(api, profile, uc, &mut state).await {
-                            Ok((replacement, token)) => {
+                            Ok((replacement, token, modules)) => {
+                                pipeline_modules = modules;
+                                skill_registry = Arc::clone(&state.unified_skill_registry);
+                                mcp_manager = Arc::clone(&state.mcp_manager);
+                                refresh_skill_popup(&skill_registry, &mut bottom_pane);
+                                external_skill_discovery = tokio::spawn(
+                                    crate::cli::session::session_runtime::discover_external_pipeline_capabilities(
+                                        skill_registry.clone(), mcp_manager.clone(),
+                                    ),
+                                );
+                                external_skill_discovery_pending = true;
                                 authenticated_api = replacement;
                                 api = &authenticated_api;
                                 if crate::cli::edge_lifecycle::edge_cloud_registry_enabled() {
@@ -6979,7 +6994,23 @@ pub(crate) async fn run_tui_session(
                             Err(error) => chat_widget.commit_system(history_cell::system::SystemCell::error(error)),
                         }
                     }
-                    Err(error) => chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Login failed: {error}"))),
+                    Err(error) => {
+                        // Cancellation before publication retains the old identity.
+                        // Recreate its retired memory service using the still-pinned
+                        // API; a committed account change cannot reuse this client.
+                        if state.session_memory_extractor.is_none() {
+                            state.session_memory_extractor = crate::cli::session::session_startup::build_cli_session_memory_extractor(api, profile).await;
+                        }
+                        if !external_skill_discovery_pending {
+                            external_skill_discovery = tokio::spawn(
+                                crate::cli::session::session_runtime::discover_external_pipeline_capabilities(
+                                    skill_registry.clone(), mcp_manager.clone(),
+                                ),
+                            );
+                            external_skill_discovery_pending = true;
+                        }
+                        chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Login failed: {error}")));
+                    }
                 }
                 let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
                 flush_chat_widget(&mut guard, &mut chat_widget, width);

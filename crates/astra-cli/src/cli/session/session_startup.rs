@@ -628,7 +628,7 @@ fn build_cli_session_memory_event_sink() -> std::sync::Arc<SessionMemoryEventSin
     )
 }
 
-async fn build_cli_session_memory_extractor(
+pub(crate) async fn build_cli_session_memory_extractor(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> Option<std::sync::Arc<astra_runtime::session_memory::MemoryExtractionService>> {
