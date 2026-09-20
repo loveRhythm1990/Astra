@@ -180,6 +180,13 @@ their existing limits. Exceeding the catalog budget returns HTTP 504 with
 `genesis_timeout`; inference revalidation retains the server error code instead
 of reducing dependency failures to an unknown model-resolution error. These
 bounds do not introduce authorization caching or make a slow database healthy.
+The aggregate deadline is an end-to-end ceiling, not the sum of per-hop limits:
+slow preparation reduces the time remaining for model pages. The page timeout
+only overrides the shorter UC client default; the aggregate deadline wins.
+Genesis HTTP 408/504 maps to `genesis_timeout`; 403 to `genesis_access_denied`;
+401 to 503 / `genesis_credential_rejected` because it concerns the server-held
+PAT, not the user's UC session. Other upstream failures remain `genesis_not_ready`.
+Upstream response bodies never become public error messages.
 
 Native UC login validates or creates its private credential directory before
 opening the browser. Existing insecure directories are rejected without changing

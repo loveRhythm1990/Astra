@@ -730,12 +730,16 @@ pub fn classify_llm_error_message(message: &str) -> ErrorKind {
 #[must_use]
 pub fn classify_model_resolution_error_message(message: &str) -> ErrorKind {
     let lower = message.to_ascii_lowercase();
+    if lower.contains("[genesis_access_denied]") {
+        return ErrorKind::PolicyDenied;
+    }
     // These are server-authored dependency errors, not an invalid selection or
     // a missing user credential. Preserve the stable code across the legacy
     // string-based resolution boundary rather than matching human prose.
     if [
         "[genesis_timeout]",
         "[genesis_not_ready]",
+        "[genesis_credential_rejected]",
         "[moi_model_policy_unavailable]",
         "[uc_unavailable]",
     ]
@@ -1377,6 +1381,14 @@ mod tests {
     #[test]
     fn classify_model_resolution_error_message_cases() {
         let cases: &[(&str, ErrorKind)] = &[
+            (
+                "[genesis_access_denied] Access denied.",
+                ErrorKind::PolicyDenied,
+            ),
+            (
+                "[genesis_credential_rejected] Authorization unavailable.",
+                ErrorKind::ServerError,
+            ),
             (
                 "Model resolution failed: [genesis_timeout] Model access took too long.",
                 ErrorKind::ServerError,
