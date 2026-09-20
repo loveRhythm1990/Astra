@@ -730,6 +730,20 @@ pub fn classify_llm_error_message(message: &str) -> ErrorKind {
 #[must_use]
 pub fn classify_model_resolution_error_message(message: &str) -> ErrorKind {
     let lower = message.to_ascii_lowercase();
+    // These are server-authored dependency errors, not an invalid selection or
+    // a missing user credential. Preserve the stable code across the legacy
+    // string-based resolution boundary rather than matching human prose.
+    if [
+        "[genesis_timeout]",
+        "[genesis_not_ready]",
+        "[moi_model_policy_unavailable]",
+        "[uc_unavailable]",
+    ]
+    .iter()
+    .any(|code| lower.contains(code))
+    {
+        return ErrorKind::ServerError;
+    }
     if lower.contains("model selection is required")
         || lower.contains("missing model selection")
         || lower.contains("no concrete model was selected")
@@ -1363,6 +1377,18 @@ mod tests {
     #[test]
     fn classify_model_resolution_error_message_cases() {
         let cases: &[(&str, ErrorKind)] = &[
+            (
+                "Model resolution failed: [genesis_timeout] Model access took too long.",
+                ErrorKind::ServerError,
+            ),
+            (
+                "Model resolution failed: [genesis_not_ready] Model access is unavailable.",
+                ErrorKind::ServerError,
+            ),
+            (
+                "Model resolution failed: [moi_model_policy_unavailable] Policy unavailable.",
+                ErrorKind::ServerError,
+            ),
             (
                 "Model resolution failed: DB query: error communicating with database: expected to read 4 bytes, got 0 bytes at EOF",
                 ErrorKind::DatabaseError,

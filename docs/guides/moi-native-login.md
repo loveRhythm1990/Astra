@@ -171,6 +171,21 @@ unselected Genesis model with an invalid context size cannot block the product
 catalog. Selected models still require valid metadata; missing values are not
 replaced with defaults. Pagination and response decoding remain strict.
 
+The PAT, product policy and all Genesis pages share a 20-second catalog budget.
+The model-page request may use that budget rather than the UC client's general
+10-second request limit. CLI catalog requests wait up to 30 seconds, and native
+Astra bootstrap up to 40 seconds, so dependency failures can reach the client
+before its own HTTP deadline. Token refresh and unrelated UC requests retain
+their existing limits. Exceeding the catalog budget returns HTTP 504 with
+`genesis_timeout`; inference revalidation retains the server error code instead
+of reducing dependency failures to an unknown model-resolution error. These
+bounds do not introduce authorization caching or make a slow database healthy.
+
+Native UC login validates or creates its private credential directory before
+opening the browser. Existing insecure directories are rejected without changing
+their permissions or contents; use the MOI installer to prepare an owned
+directory. Legacy Memoria and local login paths do not run this UC preflight.
+
 Removing a model blocks its next admission, including an old session's saved Offering;
 changing the default affects subsequent default resolution, not an explicitly
 selected model. An unavailable, cleared or malformed policy never falls back to

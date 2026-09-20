@@ -53,6 +53,25 @@ fn unavailable() -> (StatusCode, Json<ErrorResponse>) {
     )
 }
 
+fn transport_failure(
+    stage: &'static str,
+    error: reqwest::Error,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let timed_out = error.is_timeout();
+    tracing::warn!(component = "genesis", operation = "model_catalog", stage, timed_out, error = %error.without_url(), "model access dependency request failed");
+    if timed_out {
+        error_response_coded(
+            StatusCode::GATEWAY_TIMEOUT,
+            "Model access took too long. Please try again.",
+            "genesis_timeout",
+        )
+    } else if stage == "product_policy" {
+        policy_unavailable()
+    } else {
+        unavailable()
+    }
+}
+
 pub(super) fn offering_id(issuer: &str, subject: &str, id: &str) -> String {
     let mut hash = Sha256::new();
     for part in [issuer, subject, id] {
@@ -86,6 +105,32 @@ impl DatabaseModelService {
         &self,
         subject: &str,
     ) -> Result<GenesisCatalog, (StatusCode, Json<ErrorResponse>)> {
+        // One budget covers PAT, product policy and all catalog pages. Do not
+        // multiply the allowed wait by the number of pages or retry stale grants.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            self.genesis_catalog_inner(subject),
+        )
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                component = "genesis",
+                operation = "model_catalog",
+                code = "genesis_timeout",
+                "model catalog lookup exceeded its deadline"
+            );
+            error_response_coded(
+                StatusCode::GATEWAY_TIMEOUT,
+                "Model access took too long. Please try again.",
+                "genesis_timeout",
+            )
+        })?
+    }
+
+    async fn genesis_catalog_inner(
+        &self,
+        subject: &str,
+    ) -> Result<GenesisCatalog, (StatusCode, Json<ErrorResponse>)> {
         let provider = self.uc_provider.as_ref().ok_or_else(unavailable)?;
         let mut url = crate::auth::uc::validate_uc_url(&provider.settings.adapter_url)
             .map_err(|_| unavailable())?;
@@ -108,7 +153,7 @@ impl DatabaseModelService {
             .bearer_auth(provider.service_bearer().await?)
             .send()
             .await
-            .map_err(|_| unavailable())?;
+            .map_err(|error| transport_failure("runtime_pat", error))?;
         let pat: RuntimePAT = UcNativeProvider::json(response)
             .await
             .map_err(|_| unavailable())?;
@@ -132,7 +177,7 @@ impl DatabaseModelService {
             .header("X-API-Key", &pat.api_key)
             .send()
             .await
-            .map_err(|_| policy_unavailable())?;
+            .map_err(|error| transport_failure("product_policy", error))?;
         let envelope: PolicyEnvelope = UcNativeProvider::json_bounded(response, 1024 * 1024)
             .await
             .map_err(|_| policy_unavailable())?;
@@ -159,6 +204,7 @@ impl DatabaseModelService {
                     provider.settings.genesis_url
                 ))
                 .bearer_auth(&pat.api_key)
+                .timeout(std::time::Duration::from_secs(20))
                 .query(&[
                     ("type", "chat"),
                     ("status", "enabled"),
@@ -167,7 +213,10 @@ impl DatabaseModelService {
                 ])
                 .send()
                 .await
-                .map_err(|_| unavailable())?;
+                .map_err(|error| transport_failure("model_offerings", error))?;
+            if !response.status().is_success() {
+                tracing::warn!(component = "genesis", operation = "model_catalog", stage = "model_offerings", status = %response.status(), "model access dependency rejected catalog request");
+            }
             let page: GenesisPage = UcNativeProvider::json_bounded(response, 1024 * 1024)
                 .await
                 .map_err(|_| unavailable())?;
@@ -286,6 +335,7 @@ mod tests {
         unavailable: Arc<Mutex<Option<&'static str>>>,
         policy: Arc<Mutex<serde_json::Value>>,
         policy_status: Arc<Mutex<StatusCode>>,
+        delay: Arc<Mutex<std::time::Duration>>,
     }
 
     struct Server(tokio::task::JoinHandle<()>);
@@ -321,6 +371,8 @@ mod tests {
             }))
             .route("/api/v1/taas/llm/model-offerings", get(|State(state): State<Fixture>, headers: HeaderMap, Query(query): Query<HashMap<String,String>>| async move {
                 state.requests.fetch_add(1, Ordering::SeqCst);
+                let delay = *state.delay.lock().unwrap();
+                tokio::time::sleep(delay).await;
                 assert!(!headers.contains_key("x-api-key"));
                 assert!(headers["authorization"].to_str().unwrap().starts_with("Bearer synthetic-pat-"));
                 assert_eq!(query.get("type").unwrap(), "chat");
@@ -352,6 +404,22 @@ mod tests {
         )
         .with_uc_native(Some(provider));
         (service, state, server)
+    }
+
+    #[tokio::test]
+    async fn genesis_catalog_slow_pages_share_one_deadline() {
+        let (service, state, _server) = fixture().await;
+        *state.delay.lock().unwrap() = std::time::Duration::from_secs(11);
+        let started = std::time::Instant::now();
+        let result = service.genesis_catalog("account-A").await;
+        let (status, body) = match result {
+            Err(error) => error,
+            Ok(_) => panic!("slow pagination must exceed the aggregate deadline"),
+        };
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(body.0.error_code.as_deref(), Some("genesis_timeout"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(25));
+        assert_eq!(state.requests.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
