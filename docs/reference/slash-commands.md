@@ -31,6 +31,14 @@ current model, `/model clear` to clear the selection, or `/model <name>` to
 switch directly. `/model list` remains accepted as an alias for the picker,
 but the bare command is the suggested form.
 
+Without an explicit model, Astra loads the server's configured default. Model
+catalog requests allow up to 30 seconds per page. If that lookup fails, the turn
+reports the lookup failure before model or tool execution; it does not report
+that you forgot to select a model. After sign-in, a model lookup failure leaves
+the completed login intact. Retry your message or use `/model` to choose a model
+once the service is available. `missing_model_selection` is reserved for a
+successful lookup with no usable default and no explicit selection.
+
 ## Sessions
 
 | Command | What it does |

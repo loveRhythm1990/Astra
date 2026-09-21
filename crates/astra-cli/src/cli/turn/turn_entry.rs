@@ -212,7 +212,15 @@ impl TurnUsage {
 
 async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
     let TurnExecutionRequest { state, input } = request;
-    ensure_default_turn_model(state, input.api, input.token).await;
+    if let Err(error) = ensure_default_turn_model(state, input.api, input.token).await {
+        return TurnAttempt::Completed(Box::new(Err(crate::TurnFailure {
+            error,
+            partial: crate::PartialTurnData {
+                session_id: Some(input.session_id.to_string()),
+                ..Default::default()
+            },
+        })));
+    }
     if let Some(failure) = model_selection_preflight_failure(
         state.model.as_deref(),
         Some(input.session_id),
@@ -249,10 +257,10 @@ async fn ensure_default_turn_model(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
     token: &str,
-) {
+) -> Result<(), String> {
     let had_model =
         astra_core::model_override::normalize_model_override(state.model.as_deref()).is_some();
-    if let Some(model) = session_runtime::ensure_state_default_model(api, token, state).await
+    if let Some(model) = session_runtime::ensure_state_default_model(api, token, state).await?
         && !had_model
     {
         tracing::info!(
@@ -261,6 +269,7 @@ async fn ensure_default_turn_model(
             "selected default model from server model list for CLI turn"
         );
     }
+    Ok(())
 }
 
 fn model_selection_preflight_failure(
@@ -938,6 +947,95 @@ mod tests {
             .is_none(),
             "thinking selectors are concrete model choices and must reach payload assembly"
         );
+    }
+
+    #[tokio::test]
+    async fn default_model_lookup_failure_stops_turn_without_reporting_missing_selection() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Exercise the actual interactive turn entry: a failed lookup must not
+        // reach turn adaptation, inference, or tools. A valid empty projection
+        // still has the existing missing-selection behavior.
+        let empty = serde_json::json!({
+            "accesses": [], "offerings": [], "default_offering_id": null,
+            "default_resolution": {"state": "missing"},
+            "next_cursor": null, "limit": 50, "total": 0,
+            "catalog_revision": "sha256:empty", "observed_at": "2026-09-21T00:00:00Z"
+        });
+        use astra_core::ErrorKind;
+        for (response, expected, kind) in [
+            (
+                ResponseTemplate::new(503).set_body_string("private upstream diagnostic"),
+                "503",
+                ErrorKind::ServerError,
+            ),
+            (ResponseTemplate::new(401), "401", ErrorKind::Auth),
+            (
+                ResponseTemplate::new(200).set_body_string("not-json"),
+                "not valid JSON",
+                ErrorKind::ContractViolation,
+            ),
+            (
+                ResponseTemplate::new(200).set_delay(
+                    astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT
+                        + std::time::Duration::from_secs(1),
+                ),
+                "timed out",
+                ErrorKind::Network,
+            ),
+            (
+                ResponseTemplate::new(200).set_body_json(empty),
+                "missing_model_selection",
+                ErrorKind::MissingModelSelection,
+            ),
+        ] {
+            let mock = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/model-access"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&mock)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+            let mut state = SessionState::default();
+            let result = super::run_chat_turn(super::TurnExecutionRequest {
+                state: &mut state,
+                input: super::TurnExecutionInput {
+                    api: &api,
+                    profile: None,
+                    token: "test-token",
+                    message: "hello",
+                    user_intent: "hello",
+                    input_runtime_required_texts: &[],
+                    input_active_system_skills: &[],
+                    input_runtime_volatile_texts: &[],
+                    session_id: "catalog-failure-session",
+                    semantic_query_override: None,
+                    explain_analyze_terminal_degraded: None,
+                },
+            })
+            .await;
+            let super::TurnAttempt::Completed(result) = result else {
+                panic!("catalog lookup must complete with a preflight failure");
+            };
+            let Err(failure) = *result else {
+                panic!("lookup must not admit a model call")
+            };
+            assert!(failure.error.contains(expected), "{}", failure.error);
+            assert_eq!(
+                astra_core::ClassifiedError::from(failure.error.clone()).kind,
+                kind
+            );
+            assert!(!failure.error.contains("private upstream diagnostic"));
+            assert_eq!(
+                failure.partial.session_id.as_deref(),
+                Some("catalog-failure-session")
+            );
+            assert!(state.model.is_none());
+            assert!(state.history.is_empty());
+            assert_eq!(mock.received_requests().await.unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]

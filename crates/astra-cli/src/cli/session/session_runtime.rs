@@ -446,6 +446,22 @@ pub(crate) async fn load_server_model_catalog_json(
     .map_err(|error| format!("failed to render complete model catalog: {error}"))
 }
 
+fn model_catalog_http_error(status: reqwest::StatusCode) -> String {
+    use astra_core::ErrorKind;
+    let kind = match status.as_u16() {
+        401 | 403 => ErrorKind::Auth,
+        402 => ErrorKind::PaymentRequired,
+        408 => ErrorKind::Network,
+        429 => ErrorKind::RateLimit,
+        400..=499 => ErrorKind::InvalidRequest,
+        _ => ErrorKind::ServerError,
+    };
+    astra_core::ClassifiedError::new(
+        kind,
+        format!("Model catalog request failed with status {status}. Check model service access and try again."),
+    ).to_string()
+}
+
 async fn load_server_model_access(
     api: &astra_thin_client::ThinClient,
     token: &str,
@@ -471,21 +487,56 @@ async fn load_server_model_access(
         let response = api
             .get_model_access_page_response_timeout(
                 token,
-                std::time::Duration::from_secs(3),
+                astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT,
                 cursor_tuple,
             )
             .await
-            .map_err(|error| format!("failed to load Model Access projection: {error}"))?;
+            .map_err(|error| {
+                let timed_out = matches!(&error, astra_thin_client::ThinClientError::Http(error) if error.is_timeout());
+                tracing::warn!(
+                    target: "astra_cli::model_selection",
+                    operation = "model_access", stage = "request", timed_out,
+                    error = ?error, "model catalog request failed"
+                );
+                let (kind, message) = match &error {
+                    astra_thin_client::ThinClientError::Api { status, .. } => return model_catalog_http_error(*status),
+                    astra_thin_client::ThinClientError::InvalidAuthHeader => (
+                        astra_core::ErrorKind::Auth,
+                        "Could not authenticate the model catalog request. Sign in again.",
+                    ),
+                    astra_thin_client::ThinClientError::Http(_) => (astra_core::ErrorKind::Network, if timed_out {
+                        "Model catalog request timed out. Try again, or check the model service if this persists."
+                    } else {
+                        "Could not reach the model catalog. Check your connection and try again."
+                    }),
+                    _ => (
+                        astra_core::ClassifiedError::from(error.to_string()).kind,
+                        "Could not prepare the model catalog request. Check your sign-in and client configuration.",
+                    ),
+                };
+                astra_core::ClassifiedError::new(kind, message).to_string()
+            })?;
         if !response.status().is_success() {
-            return Err(format!(
-                "Model Access projection request failed with status {}",
-                response.status()
-            ));
+            return Err(model_catalog_http_error(response.status()));
         }
         let page: ModelAccessProjectionResponse = response
             .json()
             .await
-            .map_err(|error| format!("Model Access projection was not valid JSON: {error}"))?;
+            .map_err(|error| {
+                tracing::warn!(
+                    target: "astra_cli::model_selection",
+                    operation = "model_access", stage = "response_body",
+                    error = ?error, "model catalog response could not be decoded"
+                );
+                let (kind, message) = if error.is_timeout() {
+                    (astra_core::ErrorKind::Network, "Model catalog response timed out. Try again.")
+                } else if error.is_decode() {
+                    (astra_core::ErrorKind::ContractViolation, "Model catalog response was not valid JSON. Check the model service and try again.")
+                } else {
+                    (astra_core::ErrorKind::Network, "Model catalog response could not be read. Check your connection and try again.")
+                };
+                astra_core::ClassifiedError::new(kind, message).to_string()
+            })?;
         if page.limit == 0 || page.limit > 200 {
             return Err("Model Access projection returned an invalid page limit".to_string());
         }
@@ -769,7 +820,7 @@ pub(crate) async fn ensure_state_default_model(
     api: &astra_thin_client::ThinClient,
     token: &str,
     state: &mut SessionState,
-) -> Option<String> {
+) -> Result<Option<String>, String> {
     if let Some(model) = normalize_model_override(state.model.as_deref()).map(str::to_string) {
         match resolve_server_model_selection(
             api,
@@ -801,7 +852,7 @@ pub(crate) async fn ensure_state_default_model(
                 eprintln!("warning: {error}; keeping current context budget");
             }
         }
-        return Some(model);
+        return Ok(Some(model));
     }
     match resolve_server_default_model(api, token).await {
         ServerDefaultModel::Selected(selection) => {
@@ -827,13 +878,10 @@ pub(crate) async fn ensure_state_default_model(
                     selection.name
                 );
             }
-            Some(selection.name)
+            Ok(Some(selection.name))
         }
-        ServerDefaultModel::NoModels => None,
-        ServerDefaultModel::Unavailable(error) => {
-            eprintln!("warning: {error}");
-            None
-        }
+        ServerDefaultModel::NoModels => Ok(None),
+        ServerDefaultModel::Unavailable(error) => Err(error),
     }
 }
 
@@ -2423,7 +2471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_default_resolution_uses_model_access_default() {
+    async fn server_default_resolution_accepts_slow_model_access_default() {
         let mock = MockServer::start().await;
         let projection = access_projection(
             vec![
@@ -2434,21 +2482,24 @@ mod tests {
         );
         Mock::given(method("GET"))
             .and(path("/model-access"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(projection))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(projection)
+                    .set_delay(std::time::Duration::from_secs(4)),
+            )
+            .expect(1)
             .mount(&mock)
             .await;
         let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
 
-        let resolved = resolve_server_default_model(&api, "token").await;
+        let mut state = SessionState::default();
+        let resolved = ensure_state_default_model(&api, "token", &mut state)
+            .await
+            .expect("a healthy catalog may take longer than the old three-second timeout");
 
-        assert_eq!(
-            resolved,
-            ServerDefaultModel::Selected(super::ServerModelSelection {
-                name: "beta-model".to_string(),
-                context_window: Some(128_000),
-                offering_id: "offer-beta".to_string(),
-            })
-        );
+        assert_eq!(resolved, Some("beta-model".to_string()));
+        assert_eq!(state.model.as_deref(), Some("beta-model"));
+        assert_eq!(state.context_budget.model_limit, 128_000);
     }
 
     #[tokio::test]
@@ -2496,7 +2547,9 @@ mod tests {
             ..SessionState::default()
         };
 
-        let selected = ensure_state_default_model(&api, "token", &mut state).await;
+        let selected = ensure_state_default_model(&api, "token", &mut state)
+            .await
+            .expect("explicit model resolution");
 
         assert_eq!(
             selected.as_deref(),
