@@ -39,6 +39,14 @@ the completed login intact. Retry your message or use `/model` to choose a model
 once the service is available. `missing_model_selection` is reserved for a
 successful lookup with no usable default and no explicit selection.
 
+A model-catalog HTTP 401 can enter the existing session refresh-and-retry path
+when refresh credentials are available. HTTP 403 and provider authentication
+failures do not trigger that session refresh. Inconsistent catalog pagination
+or default-selection data is reported as `contract_violation`, not as a missing
+model selection.
+UC native credentials continue to rotate through their bearer provider before
+dispatch; a rejected native token never falls back to legacy profile refresh.
+
 ## Sessions
 
 | Command | What it does |

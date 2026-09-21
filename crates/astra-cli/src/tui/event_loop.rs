@@ -2481,7 +2481,8 @@ async fn sync_default_model_after_auth(
             Err(error) => {
                 // Login has already committed. A catalog failure is a separate,
                 // recoverable warning, not a reason to undo authentication.
-                chat_widget.commit_system(history_cell::system::SystemCell::warning(error));
+                chat_widget
+                    .commit_system(history_cell::system::SystemCell::warning(error.to_string()));
                 return None;
             }
         };

@@ -213,13 +213,10 @@ impl TurnUsage {
 async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
     let TurnExecutionRequest { state, input } = request;
     if let Err(error) = ensure_default_turn_model(state, input.api, input.token).await {
-        return TurnAttempt::Completed(Box::new(Err(crate::TurnFailure {
+        return TurnAttempt::Completed(Box::new(Err(session_runtime::model_catalog_turn_failure(
             error,
-            partial: crate::PartialTurnData {
-                session_id: Some(input.session_id.to_string()),
-                ..Default::default()
-            },
-        })));
+            Some(input.session_id),
+        ))));
     }
     if let Some(failure) = model_selection_preflight_failure(
         state.model.as_deref(),
@@ -257,7 +254,7 @@ async fn ensure_default_turn_model(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
     token: &str,
-) -> Result<(), String> {
+) -> Result<(), astra_core::ClassifiedError> {
     let had_model =
         astra_core::model_override::normalize_model_override(state.model.as_deref()).is_some();
     if let Some(model) = session_runtime::ensure_state_default_model(api, token, state).await?
@@ -971,6 +968,7 @@ mod tests {
                 ErrorKind::ServerError,
             ),
             (ResponseTemplate::new(401), "401", ErrorKind::Auth),
+            (ResponseTemplate::new(403), "403", ErrorKind::Auth),
             (
                 ResponseTemplate::new(200).set_body_string("not-json"),
                 "not valid JSON",
@@ -999,7 +997,7 @@ mod tests {
                 .await;
             let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
             let mut state = SessionState::default();
-            let result = super::run_chat_turn(super::TurnExecutionRequest {
+            let turn = super::run_chat_turn(super::TurnExecutionRequest {
                 state: &mut state,
                 input: super::TurnExecutionInput {
                     api: &api,
@@ -1014,8 +1012,33 @@ mod tests {
                     semantic_query_override: None,
                     explain_analyze_terminal_degraded: None,
                 },
-            })
-            .await;
+            });
+            let result = if expected == "timed out" {
+                let expire_request = async {
+                    // Complete real socket I/O before pausing the client clock.
+                    // Exercise the production 30s deadline without exceeding
+                    // nextest's 30s per-test wall-clock budget.
+                    while mock.received_requests().await.unwrap().is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                    tokio::time::pause();
+                    let started = tokio::time::Instant::now();
+                    tokio::time::advance(astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT).await;
+                    started
+                };
+                let (result, started) = tokio::join!(turn, expire_request);
+                let elapsed = started.elapsed();
+                tokio::time::resume();
+                assert!(
+                    elapsed
+                        <= astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT
+                            + std::time::Duration::from_secs(1),
+                    "request exceeded the model catalog deadline: {elapsed:?}"
+                );
+                result
+            } else {
+                turn.await
+            };
             let super::TurnAttempt::Completed(result) = result else {
                 panic!("catalog lookup must complete with a preflight failure");
             };
@@ -1026,6 +1049,12 @@ mod tests {
             assert_eq!(
                 astra_core::ClassifiedError::from(failure.error.clone()).kind,
                 kind
+            );
+            assert_eq!(
+                super::super::turn_auth_retry::should_retry_after_auth_refresh(&failure),
+                expected == "401",
+                "only a catalog session 401 should refresh: {}",
+                failure.error,
             );
             assert!(!failure.error.contains("private upstream diagnostic"));
             assert_eq!(
