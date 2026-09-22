@@ -1636,12 +1636,13 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
             );
             // The interruption alone does not stop the tool loop. Close
             // execution authority so the next provider response cannot run
-            // another upload through the already-consumed window.
+            // another upload through the already-consumed window. Leave
+            // `budget_wrapup_injected` unset: when this writer consumed the
+            // last round, prepare_turn_iteration reserves one text-only turn
+            // itself. Setting the flag here skips that reservation and lets
+            // budget exhaustion replace this explanation.
             state.hooks.completion_settlement.text_only = true;
             state.hooks.completion_settlement.work_settlement_only = false;
-            state.budget_wrapup_injected = true;
-            state.hooks.completion_settlement.wrapup_origin =
-                Some(super::host::BudgetWrapupOrigin::RoundSlice);
             state.push_volatile_payload(
                 super::host::VolatileKind::FinalAnswerSettlement,
                 serde_json::json!({
@@ -1832,6 +1833,17 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
 
 /// Project current settlement authority without changing its budget or outcome.
 pub(crate) fn project_completion_action_text_settlement(state: &mut AgenticLoopState) {
+    // FinalAnswerSettlement is a singleton. A closer that already explained
+    // why tools are closed — for example an unverified external write — must
+    // keep that instruction when the text-only round is reserved.
+    let already_closed = state.volatile_pending.iter().any(|entry| {
+        entry.kind == super::host::VolatileKind::FinalAnswerSettlement
+            && entry.payload["mode"] == "text_only"
+            && entry.payload["execution_authority"] == "none"
+    });
+    if already_closed {
+        return;
+    }
     state.push_volatile_payload(
         super::host::VolatileKind::FinalAnswerSettlement,
         serde_json::json!({
@@ -6361,11 +6373,15 @@ fn pathless_executed_bash(record: &astra_services::session_journal::ToolCallReco
     record.was_executed()
         && record.name == "bash"
         && external_effect_scope_from_record(record).is_none()
+        && !executed_external_vehicle_is_proven_read_only(record)
 }
 
 /// The external obligation is still open, and at least one Bash already ran
-/// without an accepted file-path contract. A different record's unused
-/// `external_state_paths` must not reopen a write for that call.
+/// without an accepted file-path contract and without a classifier proof that
+/// the command is read-only. A listing does not veto the first external
+/// mutation or a later file-contract observation. A different record's unused
+/// `external_state_paths` must not reopen a write for a pathless side-effecting
+/// call. Missing or unparseable arguments stay fail-closed.
 pub(crate) fn external_effect_replay_forbidden(state: &AgenticLoopState) -> bool {
     requires_external_effect_completion(state)
         && !has_concrete_external_effect(state)
@@ -6438,8 +6454,9 @@ const EXTERNAL_EFFECT_LEDGER_PROJECTION_CAP: usize = 8;
 const EXTERNAL_EFFECT_LEDGER_OMITTED_IDENTITY_CAP: usize = 32;
 
 struct ExternalEffectProjectionRow {
-    /// Lower ranks are kept first: authoritative receipts, then declared file
-    /// roots, then other successful Bash or memory calls.
+    /// Lower ranks are kept first: authoritative receipts, then declared
+    /// roots, ambiguous failures, and successful side-effecting calls, then
+    /// proven read-only probes.
     class_rank: u8,
     ledger_index: usize,
     full: serde_json::Value,
@@ -6450,8 +6467,9 @@ struct ExternalEffectProjectionRow {
 ///
 /// Compaction deletes messages and does not read this ledger. The projection
 /// is rebuilt at prompt assembly and is not a second completion authority.
-/// Full rows prefer receipts and the newest calls. Omitted rows keep a
-/// redacted operation identity so an earlier upload is still identifiable.
+/// Full rows and omitted identities prefer receipts, then side-effecting or
+/// declared-root calls, then proven read-only probes. A pathless upload is
+/// not dropped to keep an older listing.
 pub(crate) fn external_effect_ledger_projection(
     state: &AgenticLoopState,
 ) -> Option<serde_json::Value> {
@@ -6480,18 +6498,31 @@ pub(crate) fn external_effect_ledger_projection(
         .take(EXTERNAL_EFFECT_LEDGER_PROJECTION_CAP)
         .collect();
     let mut calls = Vec::new();
-    let mut omitted = Vec::new();
     for (position, row) in rows.iter().enumerate() {
         if kept.contains(&position) {
             calls.push(row.full.clone());
-        } else {
-            omitted.push(row.compact.clone());
         }
     }
-    let omitted_not_listed = omitted
+    let mut omitted_positions: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(position, _)| (!kept.contains(&position)).then_some(position))
+        .collect();
+    omitted_positions.sort_by_key(|&position| {
+        (
+            rows[position].class_rank,
+            std::cmp::Reverse(rows[position].ledger_index),
+        )
+    });
+    let omitted_not_listed = omitted_positions
         .len()
         .saturating_sub(EXTERNAL_EFFECT_LEDGER_OMITTED_IDENTITY_CAP);
-    omitted.truncate(EXTERNAL_EFFECT_LEDGER_OMITTED_IDENTITY_CAP);
+    omitted_positions.truncate(EXTERNAL_EFFECT_LEDGER_OMITTED_IDENTITY_CAP);
+    omitted_positions.sort_by_key(|&position| rows[position].ledger_index);
+    let omitted: Vec<_> = omitted_positions
+        .iter()
+        .map(|&position| rows[position].compact.clone())
+        .collect();
     Some(serde_json::json!({
         "schema": "external_effect_ledger_projection.v1",
         "calls": calls,
@@ -6526,9 +6557,10 @@ fn external_effect_projection_row(
         return None;
     }
     let roots = external_effect_scope_from_record(record);
+    let proven_read_only = executed_external_vehicle_is_proven_read_only(record);
     let class_rank = if confirmed {
         0
-    } else if roots.is_some() || !record.ok {
+    } else if roots.is_some() || !record.ok || !proven_read_only {
         1
     } else {
         2
@@ -12008,6 +12040,19 @@ mod tests {
         }
     }
 
+    fn executed_command_bash(call_id: &str, command: &str, ok: bool) -> ToolCallRecord {
+        let args = serde_json::json!({ "command": command }).to_string();
+        ToolCallRecord {
+            name: "bash".into(),
+            ok,
+            tool_call_id: Some(call_id.into()),
+            args_full: Some(args.clone()),
+            runtime_args_full: Some(args),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn pathless_bash_external_completion_closes_without_replay() {
         use astra_config::user_profile::MutationCompletionScope;
@@ -12049,6 +12094,186 @@ mod tests {
                 .as_ref()
                 .and_then(|record| record.error_detail.as_deref())
                 .is_some_and(|detail| detail.contains("do not replay"))
+        );
+    }
+
+    #[test]
+    fn read_only_probe_does_not_forbid_the_first_external_action() {
+        use astra_config::user_profile::MutationCompletionScope;
+
+        for ok in [true, false] {
+            let mut state = make_state();
+            external_must_mutate(&mut state, MutationCompletionScope::External);
+            state.final_text = "listed the directory".into();
+            state.stall.tool_call_records.push(executed_command_bash(
+                "probe-ls",
+                "ls /etc/app",
+                ok,
+            ));
+
+            assert!(
+                !external_effect_replay_forbidden(&state),
+                "a proven read-only Bash call is not an unverified write"
+            );
+            assert!(enforce_workspace_completion_before_text_completion(
+                &mut state
+            ));
+            assert_eq!(state.hooks.completion_settlement.external_effect_retries, 1);
+            assert!(state.final_text.is_empty());
+            assert!(state.interruption.is_none());
+            assert!(
+                state
+                    .hooks
+                    .completion_settlement
+                    .completion_action_window
+                    .is_none(),
+                "no file contract means the first mutation is not a bound observation"
+            );
+            let payload = state
+                .volatile_pending
+                .iter()
+                .find(|entry| entry.payload["signal"] == "required_external_effect_missing")
+                .expect("the first external mutation is still owed");
+            assert!(payload.payload.get("bound_external_state_paths").is_none());
+            let first_mutation = serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": r#"{"command":"install-unit","external_state_paths":["/etc/app/config"]}"#
+                }
+            });
+            let replay = serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": r#"{"command":"moi upload"}"#
+                }
+            });
+            assert!(completion_action_matches_tool_call(
+                &state,
+                &CompletionAction::RequiredExternalEffect,
+                &first_mutation,
+            ));
+            assert!(!completion_action_matches_tool_call(
+                &state,
+                &CompletionAction::RequiredExternalEffect,
+                &replay,
+            ));
+        }
+    }
+
+    #[test]
+    fn read_only_probe_before_file_contract_still_requests_one_observation() {
+        use astra_config::user_profile::MutationCompletionScope;
+
+        let mut state = make_state();
+        external_must_mutate(&mut state, MutationCompletionScope::External);
+        state.final_text = "changed the host file".into();
+        state
+            .stall
+            .tool_call_records
+            .push(executed_command_bash("probe-ls", "ls /etc/app", true));
+        let args = serde_json::json!({
+            "command": "install-unit",
+            "external_state_paths": ["/etc/app/config"],
+        })
+        .to_string();
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            tool_call_id: Some("file-1".into()),
+            args_full: Some(args.clone()),
+            runtime_args_full: Some(args),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+
+        assert!(!external_effect_replay_forbidden(&state));
+        assert!(enforce_workspace_completion_before_text_completion(
+            &mut state
+        ));
+        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 1);
+        let payload = state
+            .volatile_pending
+            .iter()
+            .find(|entry| entry.payload["signal"] == "required_external_effect_missing")
+            .expect("the listing must not block the file contract");
+        assert_eq!(
+            payload.payload["bound_external_state_paths"],
+            serde_json::json!(["/etc/app/config"])
+        );
+        let omitted = serde_json::json!({
+            "id": "file-retry",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"install-unit"}"#
+            }
+        });
+        let admitted = apply_completion_action_admission(
+            &mut state,
+            ToolCallAdmission {
+                admitted: ordinary_admitted([omitted.clone()]),
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+            std::slice::from_ref(&omitted),
+        );
+        assert_eq!(admitted.admitted.len(), 1);
+        crate::turn::agentic::tool_interception::validate_tool_call_admission_partition(
+            std::slice::from_ref(&omitted),
+            &admitted,
+        )
+        .expect("inherited roots must not rewrite the provider call");
+        let mut execution_args = astra_turn_core::tool::args::shape::parse_tool_call_arguments(
+            admitted.admitted[0].logical_target_call(),
+        )
+        .expect("original arguments");
+        assert!(
+            crate::turn::headless_tool_pipeline::inherit_external_effect_recovery_scope(
+                "bash",
+                &mut execution_args,
+                state
+                    .hooks
+                    .completion_settlement
+                    .external_effect_recovery_paths
+                    .as_deref(),
+            )
+        );
+        assert_eq!(
+            execution_args[astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD],
+            serde_json::json!(["/etc/app/config"])
+        );
+    }
+
+    #[test]
+    fn read_only_probe_does_not_excuse_a_later_pathless_upload() {
+        use astra_config::user_profile::MutationCompletionScope;
+
+        let mut state = make_state();
+        external_must_mutate(&mut state, MutationCompletionScope::External);
+        state.final_text = "uploaded file_id=abc".into();
+        state
+            .stall
+            .tool_call_records
+            .push(executed_command_bash("probe-ls", "ls /tmp", true));
+        state
+            .stall
+            .tool_call_records
+            .push(pathless_upload_bash("upload-1"));
+
+        assert!(external_effect_replay_forbidden(&state));
+        assert!(!enforce_workspace_completion_before_text_completion(
+            &mut state
+        ));
+        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 0);
+        assert_eq!(state.final_text, "uploaded file_id=abc");
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .is_none()
         );
     }
 
@@ -12222,6 +12447,36 @@ mod tests {
         );
     }
 
+    async fn reject_text_only_tool_call(
+        host: &mut MockHost,
+        state: &mut AgenticLoopState,
+        call: serde_json::Value,
+    ) -> Result<super::super::tool_phase::TurnToolPhaseControl, String> {
+        super::super::tool_phase::execute_tool_phase(
+            host,
+            state,
+            1,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+            TurnExecutionPhase {
+                llm_wall_start: Instant::now(),
+                turn_result: HostTurnResult {
+                    accum: ChatTurnSseAccum {
+                        tool_calls: vec![call],
+                        has_tool_calls: true,
+                        ..ChatTurnSseAccum::default()
+                    },
+                    ttft_ms: None,
+                    edge_tool_round: Vec::new(),
+                    error_kind: None,
+                },
+            },
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn unverified_remote_does_not_waive_mixed_workspace_receipt() {
         use astra_config::user_profile::MutationCompletionScope;
@@ -12309,16 +12564,63 @@ mod tests {
                 .all(|entry| { entry.payload["allowed_action"] != "required_external_effect" })
         );
         assert!(state.hooks.completion_settlement.text_only);
-        assert!(state.budget_wrapup_injected);
+        assert!(
+            !state.budget_wrapup_injected,
+            "the closer leaves the text reservation to the next prepare step"
+        );
+        let no_replay = |state: &AgenticLoopState| {
+            state.interruption.as_ref().is_some_and(|record| {
+                record.kind == InterruptionKind::ExecutionIncomplete
+                    && record
+                        .error_detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("do not replay"))
+            })
+        };
+        assert!(no_replay(&state));
         assert!(state.volatile_pending.iter().any(|entry| {
             entry.payload["signal"] == "agentic_execution_slice_complete"
                 && entry.payload["mode"] == "text_only"
                 && entry.payload["execution_authority"] == "none"
+                && entry.payload["instruction"]
+                    .as_str()
+                    .is_some_and(|instruction| instruction.contains("non-idempotent write"))
+        }));
+
+        state.remaining_turns = 0;
+        let max_turns_before_prepare = state.max_turns;
+        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["bash"]);
+        let prepared = super::super::lifecycle::prepare_turn_iteration(&mut host, &mut state, 1)
+            .await
+            .expect("the exhausted writer round reserves one text-only turn");
+        assert!(
+            matches!(
+                prepared,
+                super::super::lifecycle::PreparedTurnIteration::Ready(_)
+            ),
+            "budget exhaustion must not replace the unverified-write close"
+        );
+        assert_eq!(state.max_turns, max_turns_before_prepare + 1);
+        assert_eq!(
+            state.remaining_turns, 0,
+            "prepare charges the reserved text-only turn"
+        );
+        assert!(state.budget_wrapup_injected);
+        assert!(state.hooks.completion_settlement.text_only);
+        assert!(no_replay(&state));
+        assert_ne!(
+            state.interruption.as_ref().map(|record| record.kind),
+            Some(InterruptionKind::BudgetExhausted)
+        );
+        assert!(state.volatile_pending.iter().any(|entry| {
+            entry.payload["signal"] == "agentic_execution_slice_complete"
+                && entry.payload["instruction"]
+                    .as_str()
+                    .is_some_and(|instruction| instruction.contains("non-idempotent write"))
         }));
 
         let records_before_replay = state.stall.tool_call_records.len();
         state.step_recorder.begin_turn(1);
-        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["bash"]);
         let replay = serde_json::json!({
             "id": "upload-2",
             "type": "function",
@@ -12327,30 +12629,9 @@ mod tests {
                 "arguments": r#"{"command":"moi upload"}"#
             }
         });
-        let outcome = super::super::tool_phase::execute_tool_phase(
-            &mut host,
-            &mut state,
-            1,
-            TurnIterationPrep {
-                quiet: true,
-                turn_start_time: Instant::now(),
-            },
-            TurnExecutionPhase {
-                llm_wall_start: Instant::now(),
-                turn_result: HostTurnResult {
-                    accum: ChatTurnSseAccum {
-                        tool_calls: vec![replay],
-                        has_tool_calls: true,
-                        ..ChatTurnSseAccum::default()
-                    },
-                    ttft_ms: None,
-                    edge_tool_round: Vec::new(),
-                    error_kind: None,
-                },
-            },
-        )
-        .await
-        .expect("text-only boundary rejects the replay");
+        let outcome = reject_text_only_tool_call(&mut host, &mut state, replay)
+            .await
+            .expect("text-only boundary rejects the replay");
         assert!(matches!(
             outcome,
             super::super::tool_phase::TurnToolPhaseControl::ContinueLoop
@@ -12368,6 +12649,47 @@ mod tests {
                     .as_deref()
                     .is_some_and(|result| result.contains("text_only_settlement_tool_call"))
         }));
+        assert!(no_replay(&state));
+
+        state.remaining_turns = 0;
+        let max_turns_before_retry = state.max_turns;
+        let retried = super::super::lifecycle::prepare_turn_iteration(&mut host, &mut state, 2)
+            .await
+            .expect("one ignored tool response still does not exhaust the explanation");
+        assert!(matches!(
+            retried,
+            super::super::lifecycle::PreparedTurnIteration::Ready(_)
+        ));
+        assert_eq!(state.max_turns, max_turns_before_retry + 1);
+        assert!(no_replay(&state));
+        assert_ne!(
+            state.interruption.as_ref().map(|record| record.kind),
+            Some(InterruptionKind::BudgetExhausted)
+        );
+        let second = serde_json::json!({
+            "id": "upload-3",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"moi upload"}"#
+            }
+        });
+        let second_outcome = reject_text_only_tool_call(&mut host, &mut state, second)
+            .await
+            .expect("the second tool response ends the turn without executing");
+        assert!(matches!(
+            second_outcome,
+            super::super::tool_phase::TurnToolPhaseControl::Return(_)
+        ));
+        assert!(
+            state
+                .stall
+                .tool_call_records
+                .iter()
+                .all(|record| record.tool_call_id.as_deref() != Some("upload-3")
+                    || !record.was_executed())
+        );
+        assert!(no_replay(&state));
     }
 
     #[test]

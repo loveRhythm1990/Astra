@@ -3635,6 +3635,165 @@ mod context_cache_contract_tests {
     }
 
     #[test]
+    fn external_effect_ledger_keeps_upload_between_read_only_probe_caps() {
+        let mut state = external_effect_projection_state();
+        for index in 0..32 {
+            push_projection_bash(
+                &mut state,
+                &format!("old-{index}"),
+                &format!("ls /tmp/old-{index}"),
+                true,
+            );
+        }
+        push_projection_bash(&mut state, "upload-middle", "moi upload ./spec.pdf", true);
+        for index in 0..8 {
+            push_projection_bash(
+                &mut state,
+                &format!("new-{index}"),
+                &format!("ls /tmp/new-{index}"),
+                true,
+            );
+        }
+
+        let payload = projected_external_effect_ledger(&mut state);
+        let calls = payload["calls"].as_array().expect("projected calls");
+        assert!(
+            calls.iter().any(|call| {
+                call["tool_call_id"] == "upload-middle"
+                    && call["operation_preview"] == "moi upload ./spec.pdf"
+                    && call["replay"] == "forbidden"
+                    && call["executor_confirmation"] == "executed_unconfirmed"
+            }),
+            "a pathless upload outranks newer listings for a full row"
+        );
+        let omitted = payload["coverage"]["omitted_identities"]
+            .as_array()
+            .expect("omitted identities");
+        assert!(
+            omitted
+                .iter()
+                .all(|call| call["tool_call_id"] != "upload-middle")
+        );
+        assert!(payload["coverage"]["omitted_identities_truncated"] == json!(true));
+        assert!(
+            omitted.iter().any(|call| call["tool_call_id"] == "old-1"),
+            "an older listing fills the identity overflow after the upload is kept"
+        );
+    }
+
+    #[test]
+    fn external_effect_ledger_keeps_overflow_upload_ahead_of_probes() {
+        let mut state = external_effect_projection_state();
+        push_projection_bash(&mut state, "upload-old", "moi upload ./old.pdf", true);
+        for index in 0..40 {
+            push_projection_bash(
+                &mut state,
+                &format!("probe-{index}"),
+                &format!("ls /tmp/probe-{index}"),
+                true,
+            );
+        }
+        for index in 0..8 {
+            push_projection_bash(
+                &mut state,
+                &format!("upload-new-{index}"),
+                &format!("moi upload ./new-{index}.pdf"),
+                true,
+            );
+        }
+
+        let payload = projected_external_effect_ledger(&mut state);
+        let calls = payload["calls"].as_array().expect("projected calls");
+        assert!(calls.iter().all(|call| {
+            call["tool_call_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("upload-new-"))
+        }));
+        let omitted = payload["coverage"]["omitted_identities"]
+            .as_array()
+            .expect("omitted identities");
+        assert!(
+            omitted
+                .iter()
+                .any(|call| call["tool_call_id"] == "upload-old"
+                    && call["operation_preview"] == "moi upload ./old.pdf")
+        );
+        assert!(payload["coverage"]["omitted_identities_truncated"] == json!(true));
+        assert!(
+            omitted
+                .iter()
+                .filter(|call| {
+                    call["tool_call_id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("upload-"))
+                })
+                .count()
+                >= 1
+        );
+    }
+
+    fn external_effect_projection_state() -> crate::turn::agentic_loop::host::AgenticLoopState {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                true,
+                false,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_workspace_mutation(
+                    astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
+                )
+                .with_mutation_completion_scope(
+                    astra_config::user_profile::MutationCompletionScope::External,
+                ),
+        );
+        state
+    }
+
+    fn push_projection_bash(
+        state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
+        id: &str,
+        command: &str,
+        ok: bool,
+    ) {
+        use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
+
+        let args = serde_json::json!({ "command": command }).to_string();
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok,
+            tool_call_id: Some(id.to_string()),
+            args_full: Some(args.clone()),
+            runtime_args_full: Some(args),
+            args_preview: Some(command.to_string()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+    }
+
+    fn projected_external_effect_ledger(
+        state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
+    ) -> serde_json::Value {
+        state.messages = vec![json!({
+            "role": "system",
+            "content": "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"
+        })];
+        enqueue_external_effect_ledger(state);
+        state
+            .volatile_pending
+            .iter()
+            .find(|injection| {
+                injection.kind
+                    == crate::turn::agentic_loop::host::VolatileKind::ExternalEffectLedger
+            })
+            .expect("ledger projection")
+            .payload
+            .clone()
+    }
+
+    #[test]
     fn external_effect_ledger_keeps_a_failed_upload_after_compaction() {
         use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
 
