@@ -266,23 +266,6 @@ impl CanonicalToolInvocation {
         }
     }
 
-    /// Mutable logical arguments. Direct calls share one JSON value with the
-    /// provider record; deferred and runtime-control calls keep the physical
-    /// carrier unchanged.
-    pub fn logical_target_call_mut(&mut self) -> &mut Value {
-        match &mut self.target {
-            InvocationTarget::Direct => &mut self.physical_provider_call,
-            InvocationTarget::Deferred {
-                logical_target_call,
-                ..
-            } => logical_target_call,
-            InvocationTarget::RuntimeControl {
-                logical_target_call,
-                ..
-            } => logical_target_call,
-        }
-    }
-
     #[must_use]
     pub fn activation(&self) -> Option<&DeferredToolActivation> {
         match &self.target {

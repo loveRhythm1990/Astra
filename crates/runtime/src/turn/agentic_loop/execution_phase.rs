@@ -1634,6 +1634,27 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
                 "external mutation has no executor-owned receipt and no continuable file observation contract; do not replay the same write",
                 "The external change is unverified: a tool ran, but the executor has no authoritative external receipt and no file observation contract it can continue. Do not repeat the same non-idempotent write.",
             );
+            // The interruption alone does not stop the tool loop. Close
+            // execution authority so the next provider response cannot run
+            // another upload through the already-consumed window.
+            state.hooks.completion_settlement.text_only = true;
+            state.hooks.completion_settlement.work_settlement_only = false;
+            state.budget_wrapup_injected = true;
+            state.hooks.completion_settlement.wrapup_origin =
+                Some(super::host::BudgetWrapupOrigin::RoundSlice);
+            state.push_volatile_payload(
+                super::host::VolatileKind::FinalAnswerSettlement,
+                serde_json::json!({
+                    "schema": "completion_settlement.v2",
+                    "signal": "agentic_execution_slice_complete",
+                    "mode": "text_only",
+                    "allowed_action": serde_json::Value::Null,
+                    "attempts_remaining": 0,
+                    "execution_authority": "none",
+                    "instruction": "The external change is unverified. Answer from the evidence already gathered and do not request another tool. Do not repeat the same non-idempotent write.",
+                    "authority": "runtime_bounded_settlement",
+                }),
+            );
             return;
         }
         if active_work_attempt
@@ -6384,71 +6405,30 @@ fn bash_matches_continuable_external_roots(
     })
 }
 
-/// Copy the frozen recovery roots onto a foreground Bash call that omitted
-/// `external_state_paths`. Admission and execution then see one argument
-/// object. An explicit path set is left unchanged, so a different root still
-/// fails the matcher.
-fn canonicalize_inherited_external_roots(state: &AgenticLoopState, call: &mut serde_json::Value) {
-    let Some(paths) = external_effect_recovery_scope(state) else {
-        return;
-    };
-    if let Some(expected) = latest_continuable_external_file_roots(state)
-        && normalized_external_roots(&paths) != normalized_external_roots(&expected)
-    {
-        return;
-    }
-    if astra_turn_core::tool::args::shape::tool_call_name(call) != Some("bash") {
-        return;
-    }
-    let Ok(mut args) = astra_turn_core::tool::args::shape::parse_tool_call_arguments(call) else {
-        return;
-    };
+/// A foreground Bash call that omitted `external_state_paths` matches the
+/// frozen recovery set. The provider record stays unchanged; the executor
+/// inherits the same set later.
+fn omitted_bash_inherits_bound_external_roots(
+    state: &AgenticLoopState,
+    args: &serde_json::Value,
+) -> bool {
     if args
         .get("run_in_background")
         .and_then(serde_json::Value::as_bool)
         == Some(true)
+        || args
+            .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
+            .is_some()
     {
-        return;
+        return false;
     }
-    if args
-        .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
-        .is_some()
-    {
-        return;
-    }
-    {
-        let Some(object) = args.as_object_mut() else {
-            return;
-        };
-        object.insert(
-            astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD.to_string(),
-            serde_json::Value::Array(
-                paths
-                    .iter()
-                    .cloned()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    let Some(function) = call
-        .get_mut("function")
-        .and_then(|value| value.as_object_mut())
-    else {
-        return;
+    let Some(frozen) = external_effect_recovery_scope(state) else {
+        return false;
     };
-    let Some(slot) = function.get_mut("arguments") else {
-        return;
+    let Some(expected) = latest_continuable_external_file_roots(state) else {
+        return false;
     };
-    match slot {
-        serde_json::Value::String(_) => {
-            if let Ok(encoded) = serde_json::to_string(&args) {
-                *slot = serde_json::Value::String(encoded);
-            }
-        }
-        serde_json::Value::Object(_) => *slot = args,
-        _ => {}
-    }
+    normalized_external_roots(&frozen) == normalized_external_roots(&expected)
 }
 
 const EXTERNAL_EFFECT_LEDGER_PROJECTION_CAP: usize = 8;
@@ -7735,11 +7715,12 @@ pub(crate) fn completion_action_match_label(
                     args.get("run_in_background")
                         .and_then(serde_json::Value::as_bool)
                         != Some(true)
-                        && args
+                        && ((args
                             .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
                             .and_then(serde_json::Value::as_array)
                             .is_some_and(|paths| !paths.is_empty())
-                        && bash_matches_continuable_external_roots(state, args)
+                            && bash_matches_continuable_external_roots(state, args))
+                            || omitted_bash_inherits_bound_external_roots(state, args))
                 });
             let typed_memory_mutation = typed_memory_external_effect_is_in_scope(state)
                 && name == "memory"
@@ -8014,12 +7995,6 @@ pub(crate) fn apply_completion_action_admission(
             "The external change is unverified: a tool ran, but the executor has no authoritative external receipt and no file observation contract it can continue. Do not repeat the same non-idempotent write.",
         );
         return admission;
-    }
-
-    if matches!(action, CompletionAction::RequiredExternalEffect) {
-        for call in &mut admission.admitted {
-            canonicalize_inherited_external_roots(state, call.logical_target_call_mut());
-        }
     }
 
     let is_explicit_verification = matches!(&action, CompletionAction::ExplicitVerification { .. });
@@ -12151,16 +12126,43 @@ mod tests {
                 rejected: Vec::new(),
                 completion_action_applied: false,
             },
-            &[omitted],
+            std::slice::from_ref(&omitted),
         );
         assert_eq!(admitted.admitted.len(), 1);
         assert!(admitted.rejected.is_empty());
-        let executed_args = astra_turn_core::tool::args::shape::parse_tool_call_arguments(
+        crate::turn::agentic::tool_interception::validate_tool_call_admission_partition(
+            std::slice::from_ref(&omitted),
+            &admitted,
+        )
+        .expect("inherited roots must not rewrite the provider call");
+        assert_eq!(
+            admitted.admitted[0].physical_provider_call(),
+            &omitted,
+            "the original omitted-field request stays the provider record"
+        );
+        let provider_args = astra_turn_core::tool::args::shape::parse_tool_call_arguments(
             admitted.admitted[0].logical_target_call(),
         )
-        .expect("canonical arguments");
+        .expect("original arguments");
+        assert!(
+            provider_args
+                .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
+                .is_none()
+        );
+        let mut execution_args = provider_args;
+        assert!(
+            crate::turn::headless_tool_pipeline::inherit_external_effect_recovery_scope(
+                "bash",
+                &mut execution_args,
+                state
+                    .hooks
+                    .completion_settlement
+                    .external_effect_recovery_paths
+                    .as_deref(),
+            )
+        );
         assert_eq!(
-            executed_args["external_state_paths"],
+            execution_args[astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD],
             serde_json::json!(["/etc/app/config"])
         );
     }
@@ -12211,8 +12213,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unverified_remote_does_not_waive_mixed_workspace_receipt() {
+    #[tokio::test]
+    async fn unverified_remote_does_not_waive_mixed_workspace_receipt() {
         use astra_config::user_profile::MutationCompletionScope;
 
         let mut state = make_state();
@@ -12297,6 +12299,66 @@ mod tests {
                 .iter()
                 .all(|entry| { entry.payload["allowed_action"] != "required_external_effect" })
         );
+        assert!(state.hooks.completion_settlement.text_only);
+        assert!(state.budget_wrapup_injected);
+        assert!(state.volatile_pending.iter().any(|entry| {
+            entry.payload["signal"] == "agentic_execution_slice_complete"
+                && entry.payload["mode"] == "text_only"
+                && entry.payload["execution_authority"] == "none"
+        }));
+
+        let records_before_replay = state.stall.tool_call_records.len();
+        state.step_recorder.begin_turn(1);
+        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["bash"]);
+        let replay = serde_json::json!({
+            "id": "upload-2",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"moi upload"}"#
+            }
+        });
+        let outcome = super::super::tool_phase::execute_tool_phase(
+            &mut host,
+            &mut state,
+            1,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+            TurnExecutionPhase {
+                llm_wall_start: Instant::now(),
+                turn_result: HostTurnResult {
+                    accum: ChatTurnSseAccum {
+                        tool_calls: vec![replay],
+                        has_tool_calls: true,
+                        ..ChatTurnSseAccum::default()
+                    },
+                    ttft_ms: None,
+                    edge_tool_round: Vec::new(),
+                    error_kind: None,
+                },
+            },
+        )
+        .await
+        .expect("text-only boundary rejects the replay");
+        assert!(matches!(
+            outcome,
+            super::super::tool_phase::TurnToolPhaseControl::ContinueLoop
+        ));
+        assert!(
+            state.stall.tool_call_records[records_before_replay..]
+                .iter()
+                .all(|record| !record.was_executed()),
+            "a later upload must not execute after the external replay was closed"
+        );
+        assert!(state.stall.tool_call_records.iter().any(|record| {
+            record.tool_call_id.as_deref() == Some("upload-2")
+                && record
+                    .result_full
+                    .as_deref()
+                    .is_some_and(|result| result.contains("text_only_settlement_tool_call"))
+        }));
     }
 
     #[test]
