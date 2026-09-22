@@ -1623,6 +1623,19 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
                 )))
         && completion_action_window_is_batchable(state, &next_action)
     {
+        if matches!(next_action, CompletionAction::RequiredExternalEffect)
+            && external_effect_replay_forbidden(state)
+        {
+            // The workspace half of a Mixed turn may already have matched.
+            // That does not reopen an external write after a pathless Bash
+            // has executed. Leave the consumed workspace window in place.
+            mark_workspace_completion_incomplete(
+                state,
+                "external mutation has no executor-owned receipt and no continuable file observation contract; do not replay the same write",
+                "The external change is unverified: a tool ran, but the executor has no authoritative external receipt and no file observation contract it can continue. Do not repeat the same non-idempotent write.",
+            );
+            return;
+        }
         if active_work_attempt
             || matches!(window.action, CompletionAction::PostMutationRepair)
             || matches!(next_action, CompletionAction::PostMutationObservation)
@@ -6371,6 +6384,73 @@ fn bash_matches_continuable_external_roots(
     })
 }
 
+/// Copy the frozen recovery roots onto a foreground Bash call that omitted
+/// `external_state_paths`. Admission and execution then see one argument
+/// object. An explicit path set is left unchanged, so a different root still
+/// fails the matcher.
+fn canonicalize_inherited_external_roots(state: &AgenticLoopState, call: &mut serde_json::Value) {
+    let Some(paths) = external_effect_recovery_scope(state) else {
+        return;
+    };
+    if let Some(expected) = latest_continuable_external_file_roots(state)
+        && normalized_external_roots(&paths) != normalized_external_roots(&expected)
+    {
+        return;
+    }
+    if astra_turn_core::tool::args::shape::tool_call_name(call) != Some("bash") {
+        return;
+    }
+    let Ok(mut args) = astra_turn_core::tool::args::shape::parse_tool_call_arguments(call) else {
+        return;
+    };
+    if args
+        .get("run_in_background")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return;
+    }
+    if args
+        .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
+        .is_some()
+    {
+        return;
+    }
+    {
+        let Some(object) = args.as_object_mut() else {
+            return;
+        };
+        object.insert(
+            astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD.to_string(),
+            serde_json::Value::Array(
+                paths
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    let Some(function) = call
+        .get_mut("function")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    let Some(slot) = function.get_mut("arguments") else {
+        return;
+    };
+    match slot {
+        serde_json::Value::String(_) => {
+            if let Ok(encoded) = serde_json::to_string(&args) {
+                *slot = serde_json::Value::String(encoded);
+            }
+        }
+        serde_json::Value::Object(_) => *slot = args,
+        _ => {}
+    }
+}
+
 const EXTERNAL_EFFECT_LEDGER_PROJECTION_CAP: usize = 8;
 const EXTERNAL_EFFECT_LEDGER_OMITTED_IDENTITY_CAP: usize = 32;
 
@@ -6452,15 +6532,20 @@ fn external_effect_projection_row(
         return None;
     }
     let confirmed = record_has_concrete_external_effect(state, record);
-    let unconfirmed_vehicle =
-        record.ok && matches!(record.name.as_str(), "bash" | "memory") && !confirmed;
+    let external_vehicle = matches!(record.name.as_str(), "bash" | "memory");
+    // `ok == false` is not a read-only lookup. A foreground upload can reach
+    // the remote service and still exit nonzero. Keep that ambiguous write.
+    // Drop only executions the existing effect classifier proves read-only.
+    let ambiguous_failure =
+        !record.ok && external_vehicle && !executed_external_vehicle_is_proven_read_only(record);
+    let unconfirmed_vehicle = external_vehicle && !confirmed && (record.ok || ambiguous_failure);
     if !confirmed && !unconfirmed_vehicle {
         return None;
     }
     let roots = external_effect_scope_from_record(record);
     let class_rank = if confirmed {
         0
-    } else if roots.is_some() {
+    } else if roots.is_some() || !record.ok {
         1
     } else {
         2
@@ -6545,6 +6630,21 @@ fn redacted_operation_identity(
         crate::turn::headless_tool_pipeline::record::safe_args_preview(&record.name, &args)
     });
     (Some(digest), preview)
+}
+
+fn executed_external_vehicle_is_proven_read_only(
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> bool {
+    if !matches!(record.name.as_str(), "bash" | "memory") {
+        return false;
+    }
+    let Some(raw) = record.authoritative_args_full() else {
+        return false;
+    };
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    !crate::turn::tool_side_effects::tool_call_may_mutate_any_state(&record.name, Some(&args))
 }
 
 fn external_effect_receipt_target_identifiers(receipt: &serde_json::Value) -> serde_json::Value {
@@ -7880,6 +7980,46 @@ pub(crate) fn apply_completion_action_admission(
 
     if raw_tool_calls.is_empty() {
         return admission;
+    }
+
+    if matches!(action, CompletionAction::RequiredExternalEffect)
+        && external_effect_replay_forbidden(state)
+    {
+        for call in admission.admitted.drain(..) {
+            admission.rejected.push(RejectedToolCall {
+                invocation: call,
+                result: serde_json::json!({
+                    "status": "rejected",
+                    "error_kind": "external_effect_replay_forbidden",
+                    "retryable": false,
+                    "allowed_action": action.clone(),
+                    "error": "An executed Bash call has no continuable external file contract. Do not issue another external write.",
+                })
+                .to_string(),
+            });
+        }
+        if let Some(window) = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_mut()
+        {
+            window.consumed = true;
+            window.attempts_remaining = 0;
+            window.matched = false;
+        }
+        mark_workspace_completion_incomplete(
+            state,
+            "external mutation has no executor-owned receipt and no continuable file observation contract; do not replay the same write",
+            "The external change is unverified: a tool ran, but the executor has no authoritative external receipt and no file observation contract it can continue. Do not repeat the same non-idempotent write.",
+        );
+        return admission;
+    }
+
+    if matches!(action, CompletionAction::RequiredExternalEffect) {
+        for call in &mut admission.admitted {
+            canonicalize_inherited_external_roots(state, call.logical_target_call_mut());
+        }
     }
 
     let is_explicit_verification = matches!(&action, CompletionAction::ExplicitVerification { .. });
@@ -11996,6 +12136,33 @@ mod tests {
             &CompletionAction::RequiredExternalEffect,
             &other_roots,
         ));
+        let omitted = serde_json::json!({
+            "id": "file-retry",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"install-unit"}"#
+            }
+        });
+        let admitted = apply_completion_action_admission(
+            &mut state,
+            ToolCallAdmission {
+                admitted: ordinary_admitted([omitted.clone()]),
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+            &[omitted],
+        );
+        assert_eq!(admitted.admitted.len(), 1);
+        assert!(admitted.rejected.is_empty());
+        let executed_args = astra_turn_core::tool::args::shape::parse_tool_call_arguments(
+            admitted.admitted[0].logical_target_call(),
+        )
+        .expect("canonical arguments");
+        assert_eq!(
+            executed_args["external_state_paths"],
+            serde_json::json!(["/etc/app/config"])
+        );
     }
 
     #[test]
@@ -12072,6 +12239,63 @@ mod tests {
                 .volatile_pending
                 .iter()
                 .all(|entry| entry.payload["signal"] != "required_external_effect_missing")
+        );
+
+        let window = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .expect("mixed scope still owes the workspace half");
+        assert_eq!(window.action, CompletionAction::RequiredWorkspaceMutation);
+        let writer = serde_json::json!({
+            "id": "workspace-writer",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": r#"{"path":"/remote/app/result.txt","content":"done\n"}"#
+            }
+        });
+        let writer_admission = apply_completion_action_admission(
+            &mut state,
+            ToolCallAdmission {
+                admitted: ordinary_admitted([writer.clone()]),
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+            &[writer],
+        );
+        assert_eq!(writer_admission.admitted.len(), 1);
+        let records_before = state.stall.tool_call_records.len();
+        state.stall.tool_call_records.push(executed_record(
+            "write_file",
+            true,
+            Some(r#"{"path":"/remote/app/result.txt","content":"done\n"}"#),
+        ));
+        let turns_before = (state.max_turns, state.remaining_turns);
+        advance_completion_action_window_after_tool_round_from_record_index(
+            &mut state,
+            records_before,
+            None,
+        );
+        let window = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .expect("workspace window stays consumed");
+        assert_eq!(window.action, CompletionAction::RequiredWorkspaceMutation);
+        assert!(window.consumed);
+        assert_eq!((state.max_turns, state.remaining_turns), turns_before);
+        assert_eq!(
+            state.interruption.as_ref().map(|record| record.kind),
+            Some(InterruptionKind::ExecutionIncomplete)
+        );
+        assert!(
+            state
+                .volatile_pending
+                .iter()
+                .all(|entry| { entry.payload["allowed_action"] != "required_external_effect" })
         );
     }
 

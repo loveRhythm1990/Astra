@@ -3460,8 +3460,8 @@ mod context_cache_contract_tests {
             name: "bash".into(),
             ok: false,
             tool_call_id: Some("lookup-12".into()),
-            args_full: Some(r#"{"command":"moi files list"}"#.into()),
-            runtime_args_full: Some(r#"{"command":"moi files list"}"#.into()),
+            args_full: Some(r#"{"command":"ls /tmp"}"#.into()),
+            runtime_args_full: Some(r#"{"command":"ls /tmp"}"#.into()),
             disposition: Some(ToolCallDisposition::Executed),
             ..Default::default()
         });
@@ -3631,6 +3631,85 @@ mod context_cache_contract_tests {
                 .messages
                 .iter()
                 .any(|message| message.to_string().contains("upload-11"))
+        );
+    }
+
+    #[test]
+    fn external_effect_ledger_keeps_a_failed_upload_after_compaction() {
+        use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
+
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                true,
+                false,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_workspace_mutation(
+                    astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
+                )
+                .with_mutation_completion_scope(
+                    astra_config::user_profile::MutationCompletionScope::External,
+                ),
+        );
+        for index in 0..8 {
+            let args = format!(r#"{{"command":"ls /tmp/probe-{index}"}}"#);
+            state.stall.tool_call_records.push(ToolCallRecord {
+                name: "bash".into(),
+                ok: true,
+                tool_call_id: Some(format!("probe-{index}")),
+                args_full: Some(args.clone()),
+                runtime_args_full: Some(args),
+                args_preview: Some(format!("ls /tmp/probe-{index}")),
+                disposition: Some(ToolCallDisposition::Executed),
+                ..Default::default()
+            });
+        }
+        let upload_args = r#"{"command":"moi upload ./spec.pdf"}"#;
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: false,
+            tool_call_id: Some("upload-failed".into()),
+            args_full: Some(upload_args.into()),
+            runtime_args_full: Some(upload_args.into()),
+            args_preview: Some("moi upload ./spec.pdf".into()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        state.messages = vec![json!({
+            "role": "system",
+            "content": "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"
+        })];
+
+        enqueue_external_effect_ledger(&mut state);
+
+        let payload = &state
+            .volatile_pending
+            .iter()
+            .find(|injection| {
+                injection.kind
+                    == crate::turn::agentic_loop::host::VolatileKind::ExternalEffectLedger
+            })
+            .expect("ledger projection")
+            .payload;
+        let calls = payload["calls"].as_array().expect("projected calls");
+        assert!(calls.iter().any(|call| {
+            call["tool_call_id"] == "upload-failed"
+                && call["ok"] == json!(false)
+                && call["operation_preview"] == "moi upload ./spec.pdf"
+                && call["operation_digest"].is_string()
+                && call["executor_confirmation"] == "executed_unconfirmed"
+                && call["replay"] == "forbidden"
+                && call["authoritative_external_receipt"] == json!(false)
+                && call["target"].is_null()
+        }));
+        assert!(
+            !state
+                .messages
+                .iter()
+                .any(|message| message.to_string().contains("upload-failed"))
         );
     }
 
