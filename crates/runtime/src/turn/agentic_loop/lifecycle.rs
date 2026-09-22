@@ -2780,6 +2780,7 @@ fn begin_budget_settlement_for_work_state(
     if let Some(action) = pending
         && super::execution_phase::completion_action_window_is_batchable(state, &action)
         && !matches!(action, super::host::CompletionAction::CompletionTaskAction)
+        && !super::execution_phase::external_effect_replay_forbidden(state)
     {
         let tool_outcome_evidence = settlement_tool_outcome_evidence(state);
         // Reserve exactly one matching completion action and one closing
@@ -5712,6 +5713,168 @@ mod tests {
             payload.payload["execution_authority"],
             "one_matching_action"
         );
+    }
+
+    #[test]
+    fn exhausted_budget_does_not_reissue_unreceipted_external_bash() {
+        use astra_services::session_journal::ToolCallDisposition;
+
+        let mut state = make_state();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                true,
+                false,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        state.turn_intent = Some(
+            TurnIntent::default()
+                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
+                .with_mutation_completion_scope(
+                    astra_config::user_profile::MutationCompletionScope::External,
+                ),
+        );
+        state.max_turns = 2;
+        state.remaining_turns = 0;
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            tool_call_id: Some("upload-1".into()),
+            args_full: Some(r#"{"command":"moi upload"}"#.into()),
+            runtime_args_full: Some(r#"{"command":"moi upload"}"#.into()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+
+        assert!(begin_budget_settlement(&mut state));
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .is_none()
+        );
+        assert!(state.hooks.completion_settlement.text_only);
+        assert_eq!(state.max_turns, 3);
+        assert_eq!(state.remaining_turns, 1);
+        assert_eq!(state.stall.tool_call_records.len(), 1);
+        let payload = state
+            .volatile_pending
+            .iter()
+            .find(|entry| entry.payload["signal"] == "agentic_execution_slice_complete")
+            .expect("text-only settlement");
+        assert_eq!(payload.payload["execution_authority"], "none");
+        assert!(
+            state
+                .volatile_pending
+                .iter()
+                .all(|entry| entry.payload["signal"] != "typed_completion_action_available")
+        );
+    }
+
+    #[test]
+    fn exhausted_budget_still_reserves_an_accepted_external_file_contract() {
+        use astra_services::session_journal::ToolCallDisposition;
+
+        let mut state = make_state();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                true,
+                false,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        state.turn_intent = Some(
+            TurnIntent::default()
+                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
+                .with_mutation_completion_scope(
+                    astra_config::user_profile::MutationCompletionScope::External,
+                ),
+        );
+        state.max_turns = 2;
+        state.remaining_turns = 0;
+        let args = serde_json::json!({
+            "command": "install-unit",
+            "external_state_paths": ["/etc/app/config"],
+        })
+        .to_string();
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(args.clone()),
+            runtime_args_full: Some(args),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+
+        assert!(begin_budget_settlement(&mut state));
+        let window = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .expect("an accepted file contract can still be observed");
+        assert_eq!(
+            window.action,
+            super::super::host::CompletionAction::RequiredExternalEffect
+        );
+        assert_eq!(state.max_turns, 4);
+        assert_eq!(state.remaining_turns, 2);
+        assert!(!state.hooks.completion_settlement.text_only);
+    }
+
+    #[test]
+    fn exhausted_budget_does_not_let_an_old_file_contract_reissue_a_pathless_upload() {
+        use astra_services::session_journal::ToolCallDisposition;
+
+        let mut state = make_state();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                true,
+                false,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        state.turn_intent = Some(
+            TurnIntent::default()
+                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
+                .with_mutation_completion_scope(
+                    astra_config::user_profile::MutationCompletionScope::External,
+                ),
+        );
+        state.max_turns = 2;
+        state.remaining_turns = 0;
+        let probe = serde_json::json!({
+            "command": "ls /etc/app",
+            "external_state_paths": ["/etc/app"],
+        })
+        .to_string();
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            tool_call_id: Some("probe-1".into()),
+            args_full: Some(probe.clone()),
+            runtime_args_full: Some(probe),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            tool_call_id: Some("upload-1".into()),
+            args_full: Some(r#"{"command":"moi upload"}"#.into()),
+            runtime_args_full: Some(r#"{"command":"moi upload"}"#.into()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+
+        assert!(begin_budget_settlement(&mut state));
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .is_none()
+        );
+        assert!(state.hooks.completion_settlement.text_only);
+        assert_eq!(state.max_turns, 3);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::{Duration, Instant};
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
@@ -1886,7 +1886,13 @@ fn enforce_workspace_completion_before_text_completion_with_disposition(
         return false;
     }
     let external_effect = has_concrete_external_effect(state);
-    if requires_external_effect_completion(state) && !external_effect {
+    let external_owed = requires_external_effect_completion(state) && !external_effect;
+    // A Bash call that already ran without an accepted external file contract
+    // cannot be repaired by reissuing the write. Filesystem recovery stays
+    // available only while the executor still has an accepted, incomplete
+    // `external_state_paths` observation, or while no Bash has executed yet.
+    let unverified_remote_without_file_contract = external_effect_replay_forbidden(state);
+    if external_owed && !unverified_remote_without_file_contract {
         if state.hooks.completion_settlement.external_effect_retries > 0 {
             mark_workspace_completion_incomplete(
                 state,
@@ -1896,10 +1902,6 @@ fn enforce_workspace_completion_before_text_completion_with_disposition(
             return false;
         }
         state.hooks.completion_settlement.external_effect_retries = 1;
-        state
-            .hooks
-            .completion_settlement
-            .external_effect_recovery_paths = None;
         state.hooks.completion_settlement.text_only = false;
         state.hooks.completion_settlement.work_settlement_only = false;
         state.hooks.completion_settlement.wrapup_origin = None;
@@ -1907,16 +1909,39 @@ fn enforce_workspace_completion_before_text_completion_with_disposition(
         state.final_text.clear();
         state.max_turns = state.max_turns.saturating_add(1);
         state.remaining_turns = state.remaining_turns.saturating_add(1);
-        state.push_volatile_payload(
-            super::host::VolatileKind::FinalAnswerSettlement,
-            serde_json::json!({
-                "schema": "external_completion_required.v1",
-                "signal": "required_external_effect_missing",
-                "evidence": { "authoritative_external_effect_receipts": 0 },
-                "instruction": "The requested state is outside the bound workspace, but no authoritative external delta was observed. Continue with one foreground action that performs the required external mutation and, on that same Bash call, uses the structured external_state_paths field to list only the smallest absolute external roots that must change. A later read-only probe cannot establish the receipt. The executor, not your prose or the command exit status, will compare their pre/post state. If no safe bounded root can be observed, report that blocker precisely.",
-                "authority": "typed_turn_intent_and_executor_effect_ledger",
-            }),
-        );
+        let bound_roots = latest_continuable_external_file_roots(state);
+        state
+            .hooks
+            .completion_settlement
+            .external_effect_recovery_paths = bound_roots.clone();
+        if bound_roots.is_some() {
+            // The one recovery call is admitted only when it repeats this
+            // exact root set. An older, unrelated path declaration must not
+            // authorize a different write.
+            state.hooks.completion_settlement.completion_action_window =
+                Some(super::host::CompletionActionWindow {
+                    action: CompletionAction::RequiredExternalEffect,
+                    attempts_remaining: 1,
+                    mismatch_corrections_remaining: 1,
+                    consumed: false,
+                    matched: false,
+                });
+        }
+        let mut payload = serde_json::json!({
+            "schema": "external_completion_required.v1",
+            "signal": "required_external_effect_missing",
+            "evidence": { "authoritative_external_effect_receipts": 0 },
+            "instruction": if bound_roots.is_some() {
+                "The executor still has one incomplete external file observation. Repeat one foreground Bash whose external_state_paths are exactly bound_external_state_paths, so the executor can compare that same set. A different root does not match. Do not repeat a Bash call that already ran without this path contract. A later read-only probe cannot establish the receipt."
+            } else {
+                "The requested state is outside the bound workspace, but no authoritative external delta was observed. Continue with one foreground action that performs the required external mutation and, on that same Bash call, uses the structured external_state_paths field to list only the smallest absolute external roots that must change. A later read-only probe cannot establish the receipt. The executor, not your prose or the command exit status, will compare their pre/post state. If no safe bounded root can be observed, report that blocker precisely."
+            },
+            "authority": "typed_turn_intent_and_executor_effect_ledger",
+        });
+        if let Some(roots) = bound_roots {
+            payload["bound_external_state_paths"] = serde_json::json!(roots);
+        }
+        state.push_volatile_payload(super::host::VolatileKind::FinalAnswerSettlement, payload);
         return true;
     }
 
@@ -2047,6 +2072,16 @@ fn enforce_workspace_completion_before_text_completion_with_disposition(
             state,
             "workspace mutation was not followed by a trusted observation after the bounded recovery",
             "The requested workspace change remains unverified: the mutation was recorded, but no trusted post-mutation observation completed after the bounded recovery attempt. The result is preserved as an unverified partial.",
+        );
+    }
+
+    if unverified_remote_without_file_contract && state.interruption.is_none() {
+        // Mixed workspace settlement already ran above. This close does not
+        // grant another external write and does not discard tool-grounded text.
+        mark_workspace_completion_incomplete(
+            state,
+            "external mutation has no executor-owned receipt and no continuable file observation contract; do not replay the same write",
+            "The external change is unverified: a tool ran, but the executor has no authoritative external receipt and no file observation contract it can continue. Do not repeat the same non-idempotent write.",
         );
     }
 
@@ -6218,52 +6253,314 @@ pub(crate) fn has_concrete_external_effect(state: &AgenticLoopState) -> bool {
         .stall
         .tool_call_records
         .iter()
-        .filter(|record| record.was_executed() && record.ok)
-        .any(|record| {
-            if record.external_effect_observed != Some(true)
-                || record.external_effect_scope.as_deref()
-                    != Some(astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE)
-            {
-                return false;
+        .any(|record| record_has_concrete_external_effect(state, record))
+}
+
+fn record_has_concrete_external_effect(
+    state: &AgenticLoopState,
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> bool {
+    if !record.was_executed() || !record.ok {
+        return false;
+    }
+    if record.external_effect_observed != Some(true)
+        || record.external_effect_scope.as_deref()
+            != Some(astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE)
+    {
+        return false;
+    }
+    let Some(receipt) = record.external_effect_receipt.as_ref() else {
+        return false;
+    };
+    if !astra_tools::workspace_observation::is_authoritative_external_effect_receipt(receipt) {
+        return false;
+    }
+    // A typed service receipt must remain bound to the canonical
+    // record and its action.  Do not let an MCP/provider payload or a
+    // copied metadata field satisfy an unrelated external obligation.
+    if receipt.get("source").and_then(serde_json::Value::as_str) == Some("typed_external_tool") {
+        let Some(args) = super::lifecycle::extract_tool_args(record.authoritative_args_full())
+        else {
+            return false;
+        };
+        let expected_digest = format!(
+            "{:x}",
+            Sha256::digest(astra_core::canonical_json_string(&args))
+        );
+        return typed_memory_external_effect_is_in_scope(state)
+            && record.name == "memory"
+            && receipt.get("action").and_then(serde_json::Value::as_str)
+                == args.get("action").and_then(serde_json::Value::as_str)
+            && receipt
+                .get("operation_digest")
+                .and_then(serde_json::Value::as_str)
+                == Some(expected_digest.as_str())
+            && matches!(
+                args.get("action").and_then(serde_json::Value::as_str),
+                Some("remember" | "forget" | "update" | "feedback")
+            );
+    }
+    true
+}
+
+/// Latest executed foreground Bash that declared external roots and still has
+/// no authoritative receipt. An older declaration does not stay active after
+/// a newer one, and a pathless call is not a file contract.
+fn latest_continuable_external_file_roots(state: &AgenticLoopState) -> Option<Vec<String>> {
+    state
+        .stall
+        .tool_call_records
+        .iter()
+        .rev()
+        .find_map(|record| {
+            if record_has_concrete_external_effect(state, record) {
+                return None;
             }
-            let Some(receipt) = record.external_effect_receipt.as_ref() else {
-                return false;
-            };
-            if !astra_tools::workspace_observation::is_authoritative_external_effect_receipt(
-                receipt,
-            ) {
-                return false;
-            }
-            // A typed service receipt must remain bound to the canonical
-            // record and its action.  Do not let an MCP/provider payload or a
-            // copied metadata field satisfy an unrelated external obligation.
-            if receipt.get("source").and_then(serde_json::Value::as_str)
-                == Some("typed_external_tool")
-            {
-                let Some(args) =
-                    super::lifecycle::extract_tool_args(record.authoritative_args_full())
-                else {
-                    return false;
-                };
-                let expected_digest = format!(
-                    "{:x}",
-                    Sha256::digest(astra_core::canonical_json_string(&args))
-                );
-                return typed_memory_external_effect_is_in_scope(state)
-                    && record.name == "memory"
-                    && receipt.get("action").and_then(serde_json::Value::as_str)
-                        == args.get("action").and_then(serde_json::Value::as_str)
-                    && receipt
-                        .get("operation_digest")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(expected_digest.as_str())
-                    && matches!(
-                        args.get("action").and_then(serde_json::Value::as_str),
-                        Some("remember" | "forget" | "update" | "feedback")
-                    );
-            }
-            true
+            external_effect_scope_from_record(record)
         })
+}
+
+fn pathless_executed_bash(record: &astra_services::session_journal::ToolCallRecord) -> bool {
+    record.was_executed()
+        && record.name == "bash"
+        && external_effect_scope_from_record(record).is_none()
+}
+
+/// The external obligation is still open, and at least one Bash already ran
+/// without an accepted file-path contract. A different record's unused
+/// `external_state_paths` must not reopen a write for that call.
+pub(crate) fn external_effect_replay_forbidden(state: &AgenticLoopState) -> bool {
+    requires_external_effect_completion(state)
+        && !has_concrete_external_effect(state)
+        && state
+            .stall
+            .tool_call_records
+            .iter()
+            .any(pathless_executed_bash)
+}
+
+fn normalized_external_roots(paths: &[String]) -> BTreeSet<String> {
+    paths
+        .iter()
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+        .collect()
+}
+
+fn external_roots_from_args(args: &serde_json::Value) -> Option<Vec<String>> {
+    let paths = args
+        .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
+        .and_then(serde_json::Value::as_array)?;
+    let paths = paths
+        .iter()
+        .map(serde_json::Value::as_str)
+        .map(|path| path.map(str::trim).filter(|path| !path.is_empty()))
+        .collect::<Option<Vec<_>>>()?;
+    (!paths.is_empty()).then(|| paths.into_iter().map(ToString::to_string).collect())
+}
+
+fn bash_matches_continuable_external_roots(
+    state: &AgenticLoopState,
+    args: &serde_json::Value,
+) -> bool {
+    let Some(expected) = latest_continuable_external_file_roots(state) else {
+        return true;
+    };
+    external_roots_from_args(args).is_some_and(|actual| {
+        normalized_external_roots(&actual) == normalized_external_roots(&expected)
+    })
+}
+
+const EXTERNAL_EFFECT_LEDGER_PROJECTION_CAP: usize = 8;
+const EXTERNAL_EFFECT_LEDGER_OMITTED_IDENTITY_CAP: usize = 32;
+
+struct ExternalEffectProjectionRow {
+    /// Lower ranks are kept first: authoritative receipts, then declared file
+    /// roots, then other successful Bash or memory calls.
+    class_rank: u8,
+    ledger_index: usize,
+    full: serde_json::Value,
+    compact: serde_json::Value,
+}
+
+/// Project external-effect facts from the tool ledger for the next prompt.
+///
+/// Compaction deletes messages and does not read this ledger. The projection
+/// is rebuilt at prompt assembly and is not a second completion authority.
+/// Full rows prefer receipts and the newest calls. Omitted rows keep a
+/// redacted operation identity so an earlier upload is still identifiable.
+pub(crate) fn external_effect_ledger_projection(
+    state: &AgenticLoopState,
+) -> Option<serde_json::Value> {
+    if !requires_external_effect_completion(state) {
+        return None;
+    }
+    let mut rows = Vec::new();
+    for (ledger_index, record) in state.stall.tool_call_records.iter().enumerate() {
+        let Some(row) = external_effect_projection_row(state, record, ledger_index) else {
+            continue;
+        };
+        rows.push(row);
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    let mut selection: Vec<usize> = (0..rows.len()).collect();
+    selection.sort_by_key(|&position| {
+        (
+            rows[position].class_rank,
+            std::cmp::Reverse(rows[position].ledger_index),
+        )
+    });
+    let kept: HashSet<usize> = selection
+        .into_iter()
+        .take(EXTERNAL_EFFECT_LEDGER_PROJECTION_CAP)
+        .collect();
+    let mut calls = Vec::new();
+    let mut omitted = Vec::new();
+    for (position, row) in rows.iter().enumerate() {
+        if kept.contains(&position) {
+            calls.push(row.full.clone());
+        } else {
+            omitted.push(row.compact.clone());
+        }
+    }
+    let omitted_not_listed = omitted
+        .len()
+        .saturating_sub(EXTERNAL_EFFECT_LEDGER_OMITTED_IDENTITY_CAP);
+    omitted.truncate(EXTERNAL_EFFECT_LEDGER_OMITTED_IDENTITY_CAP);
+    Some(serde_json::json!({
+        "schema": "external_effect_ledger_projection.v1",
+        "calls": calls,
+        "coverage": {
+            "matched": rows.len(),
+            "projected": calls.len(),
+            "omitted": rows.len().saturating_sub(calls.len()),
+            "omitted_identities": omitted,
+            "omitted_identities_truncated": omitted_not_listed > 0,
+        },
+        "instruction": "These ledger rows already executed. executed_unconfirmed means the executor recorded no authoritative external receipt; do not issue that same operation again. operation_preview and operation_digest identify the call and are not a receipt. omitted_identities lists executed calls that did not fit in calls, with the same identity fields.",
+    }))
+}
+
+fn external_effect_projection_row(
+    state: &AgenticLoopState,
+    record: &astra_services::session_journal::ToolCallRecord,
+    ledger_index: usize,
+) -> Option<ExternalEffectProjectionRow> {
+    if !record.was_executed() {
+        return None;
+    }
+    let confirmed = record_has_concrete_external_effect(state, record);
+    let unconfirmed_vehicle =
+        record.ok && matches!(record.name.as_str(), "bash" | "memory") && !confirmed;
+    if !confirmed && !unconfirmed_vehicle {
+        return None;
+    }
+    let roots = external_effect_scope_from_record(record);
+    let class_rank = if confirmed {
+        0
+    } else if roots.is_some() {
+        1
+    } else {
+        2
+    };
+    let confirmation = if confirmed {
+        "executor_confirmed"
+    } else {
+        "executed_unconfirmed"
+    };
+    let (operation_digest, operation_preview) = redacted_operation_identity(record);
+    let mut compact = serde_json::json!({
+        "tool_call_id": record.tool_call_id,
+        "tool": record.name,
+        "executor_confirmation": confirmation,
+    });
+    if let Some(digest) = operation_digest.clone() {
+        compact["operation_digest"] = serde_json::json!(digest);
+    }
+    if let Some(preview) = operation_preview.clone() {
+        compact["operation_preview"] = serde_json::json!(preview);
+    }
+    if let Some(roots) = roots.clone() {
+        compact["declared_external_roots"] = serde_json::json!(roots);
+    }
+    let mut full = serde_json::json!({
+        "tool_call_id": record.tool_call_id,
+        "tool": record.name,
+        "executed": true,
+        "ok": record.ok,
+        "authoritative_external_receipt": confirmed,
+        "executor_confirmation": confirmation,
+    });
+    if let Some(digest) = operation_digest {
+        full["operation_digest"] = serde_json::json!(digest);
+    }
+    if let Some(preview) = operation_preview {
+        full["operation_preview"] = serde_json::json!(preview);
+    }
+    if let Some(roots) = roots {
+        full["declared_external_roots"] = serde_json::json!(roots);
+    }
+    if !confirmed {
+        full["replay"] = serde_json::json!("forbidden");
+    }
+    if confirmed && let Some(receipt) = record.external_effect_receipt.as_ref() {
+        let target = external_effect_receipt_target_identifiers(receipt);
+        if target.as_object().is_some_and(|fields| !fields.is_empty()) {
+            full["target"] = target;
+        }
+    }
+    Some(ExternalEffectProjectionRow {
+        class_rank,
+        ledger_index,
+        full,
+        compact,
+    })
+}
+
+/// Display-safe correlation for one executed call. The digest and preview are
+/// not an executor receipt. Durable redacted arguments are preferred over the
+/// live argument copy, which can still hold credentials.
+fn redacted_operation_identity(
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> (Option<String>, Option<String>) {
+    let Some(raw) = record
+        .args_full
+        .as_deref()
+        .filter(|args| !args.is_empty())
+        .or(record.runtime_args_full.as_deref())
+    else {
+        return (None, record.args_preview.clone());
+    };
+    let Ok(mut args) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return (None, record.args_preview.clone());
+    };
+    astra_tools::credential_redaction::redact_credentials_in_json(&mut args);
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(astra_core::canonical_json_string(&args))
+    );
+    let preview = record.args_preview.clone().or_else(|| {
+        crate::turn::headless_tool_pipeline::record::safe_args_preview(&record.name, &args)
+    });
+    (Some(digest), preview)
+}
+
+fn external_effect_receipt_target_identifiers(receipt: &serde_json::Value) -> serde_json::Value {
+    let mut target = serde_json::Map::new();
+    for key in [
+        "target_set_digest",
+        "observed_roots",
+        "tool",
+        "action",
+        "operation_digest",
+    ] {
+        if let Some(value) = receipt.get(key) {
+            target.insert(key.to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(target)
 }
 
 /// A memory receipt is authoritative for a memory turn, but it cannot settle
@@ -6296,15 +6593,7 @@ fn external_effect_scope_from_record(
     {
         return None;
     }
-    let paths = args
-        .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
-        .and_then(serde_json::Value::as_array)?;
-    let paths = paths
-        .iter()
-        .map(serde_json::Value::as_str)
-        .map(|path| path.map(str::trim).filter(|path| !path.is_empty()))
-        .collect::<Option<Vec<_>>>()?;
-    (!paths.is_empty()).then(|| paths.into_iter().map(ToString::to_string).collect())
+    external_roots_from_args(&args)
 }
 
 /// Remember the last executor-admitted external observation scope for the
@@ -7198,6 +7487,21 @@ pub(crate) fn completion_action_hint_for_state(
         );
     }
     if matches!(action, CompletionAction::RequiredExternalEffect)
+        && let Some(roots) = latest_continuable_external_file_roots(state)
+    {
+        hint["bound_external_state_paths"] = serde_json::json!(roots);
+        if let Some(shapes) = hint["accepted_action_shapes"].as_array_mut()
+            && let Some(bash_shape) = shapes.iter_mut().find(|shape| shape["tool"] == "bash")
+        {
+            *bash_shape = serde_json::json!({
+                "tool": "bash",
+                "external_state_paths": roots,
+                "constraint": "one foreground Bash whose external_state_paths are exactly bound_external_state_paths; the executor compares that same set. A different root does not match and does not authorize another write",
+                "evidence_inference_forbidden": ["assistant_text", "tool_name", "command_text", "exit_code"],
+            });
+        }
+    }
+    if matches!(action, CompletionAction::RequiredExternalEffect)
         && !typed_memory_external_effect_is_in_scope(state)
     {
         // Memory is always resident for session maintenance, but only a
@@ -7248,35 +7552,43 @@ fn completion_action_mismatch_instruction(
             "Only one complete-state typed write_file call may execute at this boundary. A real change requires an executor mutation receipt; an already-exact no-op requires an executor convergence receipt plus a later separate full read_file of the same target. Bash output, Bash exit status, assistant prose, and server-side stat of a remote workspace are not evidence."
         };
     }
-    match (action, correction_available) {
-        (CompletionAction::CanonicalWorkValidation, true) => {
+    let bound_external_roots = matches!(action, CompletionAction::RequiredExternalEffect)
+        && latest_continuable_external_file_roots(state).is_some();
+    match (action, correction_available, bound_external_roots) {
+        (CompletionAction::RequiredExternalEffect, true, true) => {
+            "This request did not match the already declared external_state_paths set and was not executed. Repeat one foreground Bash whose external_state_paths are exactly that set. A different root does not match, and a Bash call that already ran without this contract must not be repeated."
+        }
+        (CompletionAction::RequiredExternalEffect, false, true) => {
+            "Only one foreground Bash whose external_state_paths exactly match the already declared set may execute at this boundary. A different root does not match. A later read-only probe cannot establish the receipt."
+        }
+        (CompletionAction::CanonicalWorkValidation, true, _) => {
             "This request did not match the typed completion obligation and was not executed. Rerun one direct standard project build/test validation previously recognized in this Work attempt; do not wrap it in a custom inline program. Correct it now with exactly one matching action; another mismatch ends the turn incomplete."
         }
-        (CompletionAction::CanonicalWorkValidation, false) => {
+        (CompletionAction::CanonicalWorkValidation, false, _) => {
             "Only one direct standard project build/test validation matching the typed completion obligation may execute at this boundary; a custom inline program, reader/probe, mutation, or settlement call does not match."
         }
-        (CompletionAction::CanonicalWorkRepair, true) => {
+        (CompletionAction::CanonicalWorkRepair, true, _) => {
             "This request did not match the bounded canonical-validation repair obligation and was not executed. Make exactly one workspace change; the runtime will require canonical revalidation next."
         }
-        (CompletionAction::CanonicalWorkRepair, false) => {
+        (CompletionAction::CanonicalWorkRepair, false, _) => {
             "Only one workspace repair may execute after the failed canonical validation; the next boundary requires canonical revalidation."
         }
-        (CompletionAction::CompletionTaskAction, true) => {
+        (CompletionAction::CompletionTaskAction, true, _) => {
             "This request was not a task-facing tool action and was not executed. Correct it now with exactly one action from the live admitted tool surface; runtime control and self-inspection calls do not match."
         }
-        (CompletionAction::CompletionTaskAction, false) => {
+        (CompletionAction::CompletionTaskAction, false, _) => {
             "Only one task-facing action from the live admitted tool surface may execute at this boundary; runtime control and self-inspection calls do not match."
         }
-        (CompletionAction::RequiredExternalEffect, true) => {
+        (CompletionAction::RequiredExternalEffect, true, false) => {
             "This request did not match an observable external-effect contract and was not executed. Correct it with one foreground Bash action that performs the required mutation and, on that same call, names only the smallest absolute external roots that must change; a later read-only probe cannot establish the receipt. Or use one mutating memory action whose executor produces an action-bound authoritative receipt."
         }
-        (CompletionAction::RequiredExternalEffect, false) => {
+        (CompletionAction::RequiredExternalEffect, false, false) => {
             "Only one foreground Bash action that performs the required mutation and carries a valid external_state_paths observation contract on that same call, or one mutating memory action with an executor-owned receipt contract, may execute at this boundary. A later read-only probe cannot establish the receipt."
         }
-        (_, true) => {
+        (_, true, _) => {
             "This request did not match the typed completion obligation and was not executed. Correct it now with exactly one matching action; another mismatch ends the turn incomplete."
         }
-        (_, false) => {
+        (_, false, _) => {
             "Only tool calls matching the typed completion obligation may execute at this boundary; each declared verification may be attempted at most once."
         }
     }
@@ -7327,6 +7639,7 @@ pub(crate) fn completion_action_match_label(
                             .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
                             .and_then(serde_json::Value::as_array)
                             .is_some_and(|paths| !paths.is_empty())
+                        && bash_matches_continuable_external_roots(state, args)
                 });
             let typed_memory_mutation = typed_memory_external_effect_is_in_scope(state)
                 && name == "memory"
@@ -11546,6 +11859,248 @@ mod tests {
         ));
         assert!(has_concrete_external_effect(&state));
         assert_eq!(pending_completion_action(&state).unwrap(), None);
+    }
+
+    fn external_must_mutate(state: &mut AgenticLoopState, scope: MutationCompletionScope) {
+        use astra_config::user_profile::TurnIntent;
+
+        state.task_profile = structured_mutating_profile();
+        state.turn_intent = Some(
+            TurnIntent::default()
+                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
+                .with_mutation_completion_scope(scope),
+        );
+    }
+
+    fn pathless_upload_bash(call_id: &str) -> ToolCallRecord {
+        ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            tool_call_id: Some(call_id.into()),
+            args_full: Some(r#"{"command":"moi upload"}"#.into()),
+            runtime_args_full: Some(r#"{"command":"moi upload"}"#.into()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pathless_bash_external_completion_closes_without_replay() {
+        use astra_config::user_profile::MutationCompletionScope;
+
+        let mut state = make_state();
+        external_must_mutate(&mut state, MutationCompletionScope::External);
+        state.final_text = "uploaded file_id=abc".into();
+        state
+            .stall
+            .tool_call_records
+            .push(pathless_upload_bash("upload-1"));
+        let max_turns = state.max_turns;
+        let remaining_turns = state.remaining_turns;
+
+        assert!(!enforce_workspace_completion_before_text_completion(
+            &mut state
+        ));
+        assert_eq!(
+            state.hooks.completion_settlement.external_effect_retries, 0,
+            "a missing file contract must not spend the retry on another write"
+        );
+        assert_eq!(state.max_turns, max_turns);
+        assert_eq!(state.remaining_turns, remaining_turns);
+        assert_eq!(state.stall.tool_call_records.len(), 1);
+        assert_eq!(state.final_text, "uploaded file_id=abc");
+        assert!(
+            state
+                .volatile_pending
+                .iter()
+                .all(|entry| entry.payload["signal"] != "required_external_effect_missing")
+        );
+        assert_eq!(
+            state.interruption.as_ref().map(|record| record.kind),
+            Some(InterruptionKind::ExecutionIncomplete)
+        );
+        assert!(
+            state
+                .interruption
+                .as_ref()
+                .and_then(|record| record.error_detail.as_deref())
+                .is_some_and(|detail| detail.contains("do not replay"))
+        );
+    }
+
+    #[test]
+    fn accepted_external_file_contract_still_requests_one_observation() {
+        use astra_config::user_profile::MutationCompletionScope;
+
+        let mut state = make_state();
+        external_must_mutate(&mut state, MutationCompletionScope::External);
+        state.final_text = "changed the host file".into();
+        let args = serde_json::json!({
+            "command": "install-unit",
+            "external_state_paths": ["/etc/app/config"],
+        })
+        .to_string();
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            tool_call_id: Some("file-1".into()),
+            args_full: Some(args.clone()),
+            runtime_args_full: Some(args),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+
+        assert!(enforce_workspace_completion_before_text_completion(
+            &mut state
+        ));
+        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 1);
+        assert!(state.final_text.is_empty());
+        let payload = state
+            .volatile_pending
+            .iter()
+            .find(|entry| entry.payload["signal"] == "required_external_effect_missing")
+            .expect("bound file-contract recovery");
+        assert_eq!(
+            payload.payload["bound_external_state_paths"],
+            serde_json::json!(["/etc/app/config"])
+        );
+        assert_eq!(
+            state
+                .hooks
+                .completion_settlement
+                .external_effect_recovery_paths
+                .as_deref(),
+            Some(["/etc/app/config".to_string()].as_slice())
+        );
+        let same_roots = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"install-unit","external_state_paths":["/etc/app/config"]}"#
+            }
+        });
+        let other_roots = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"upload","external_state_paths":["/var/lib/other"]}"#
+            }
+        });
+        assert!(completion_action_matches_tool_call(
+            &state,
+            &CompletionAction::RequiredExternalEffect,
+            &same_roots,
+        ));
+        assert!(!completion_action_matches_tool_call(
+            &state,
+            &CompletionAction::RequiredExternalEffect,
+            &other_roots,
+        ));
+    }
+
+    #[test]
+    fn unrelated_file_contract_does_not_reopen_a_pathless_upload() {
+        use astra_config::user_profile::MutationCompletionScope;
+
+        let mut state = make_state();
+        external_must_mutate(&mut state, MutationCompletionScope::External);
+        state.final_text = "uploaded file_id=abc".into();
+        let probe = serde_json::json!({
+            "command": "ls /etc/app",
+            "external_state_paths": ["/etc/app"],
+        })
+        .to_string();
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            tool_call_id: Some("probe-1".into()),
+            args_full: Some(probe.clone()),
+            runtime_args_full: Some(probe),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        state
+            .stall
+            .tool_call_records
+            .push(pathless_upload_bash("upload-1"));
+
+        assert!(!enforce_workspace_completion_before_text_completion(
+            &mut state
+        ));
+        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 0);
+        assert_eq!(state.final_text, "uploaded file_id=abc");
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .is_none()
+        );
+        assert!(
+            state
+                .volatile_pending
+                .iter()
+                .all(|entry| entry.payload["signal"] != "required_external_effect_missing")
+        );
+    }
+
+    #[test]
+    fn unverified_remote_does_not_waive_mixed_workspace_receipt() {
+        use astra_config::user_profile::MutationCompletionScope;
+
+        let mut state = make_state();
+        external_must_mutate(&mut state, MutationCompletionScope::Mixed);
+        state.final_text = "uploaded".into();
+        state
+            .stall
+            .tool_call_records
+            .push(pathless_upload_bash("upload-1"));
+
+        assert!(enforce_workspace_completion_before_text_completion(
+            &mut state
+        ));
+        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 0);
+        assert!(state.interruption.is_none());
+        assert!(
+            state
+                .volatile_pending
+                .iter()
+                .any(|entry| { entry.payload["signal"] == "required_workspace_mutation_missing" })
+        );
+        assert!(
+            state
+                .volatile_pending
+                .iter()
+                .all(|entry| entry.payload["signal"] != "required_external_effect_missing")
+        );
+    }
+
+    #[test]
+    fn rejected_overlapping_external_paths_are_not_an_executed_upload() {
+        use astra_config::user_profile::MutationCompletionScope;
+
+        let mut state = make_state();
+        external_must_mutate(&mut state, MutationCompletionScope::External);
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: false,
+            args_full: Some(
+                r#"{"command":"upload","external_state_paths":["/workspace/file"]}"#.into(),
+            ),
+            disposition: Some(ToolCallDisposition::Rejected),
+            ..Default::default()
+        });
+
+        assert!(enforce_workspace_completion_before_text_completion(
+            &mut state
+        ));
+        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 1);
+        assert!(
+            state
+                .volatile_pending
+                .iter()
+                .any(|entry| entry.payload["signal"] == "required_external_effect_missing")
+        );
     }
 
     #[test]

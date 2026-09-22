@@ -120,6 +120,17 @@ fn enqueue_active_turn_frame(state: &mut AgenticLoopState, user_content: &str) {
     );
 }
 
+fn enqueue_external_effect_ledger(state: &mut AgenticLoopState) {
+    match crate::turn::agentic_loop::execution_phase::external_effect_ledger_projection(state) {
+        Some(payload) => state.push_volatile_payload(
+            crate::turn::agentic_loop::host::VolatileKind::ExternalEffectLedger,
+            payload,
+        ),
+        None => state
+            .clear_volatile(crate::turn::agentic_loop::host::VolatileKind::ExternalEffectLedger),
+    }
+}
+
 pub(crate) fn cache_capability_from_model_metadata(
     value: Option<astra_services::PromptCacheCapabilityData>,
 ) -> Option<astra_turn_core::cache_placement::CacheCapability> {
@@ -1471,6 +1482,7 @@ pub(crate) fn assemble_context_pipeline(
     }
 
     enqueue_active_turn_frame(state, input.user_content);
+    enqueue_external_effect_ledger(state);
 
     let mut external = build_external_sources(
         input.runtime_signals.edge_profile,
@@ -3413,6 +3425,289 @@ mod context_cache_contract_tests {
         }));
         state.commit_volatile_attempt_lease();
         assert!(state.volatile_pending.is_empty());
+    }
+
+    #[test]
+    fn external_effect_ledger_survives_when_compaction_drops_the_upload_call() {
+        use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
+
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                true,
+                false,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_workspace_mutation(
+                    astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
+                )
+                .with_mutation_completion_scope(
+                    astra_config::user_profile::MutationCompletionScope::External,
+                ),
+        );
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            tool_call_id: Some("upload-11".into()),
+            args_full: Some(r#"{"command":"moi upload"}"#.into()),
+            runtime_args_full: Some(r#"{"command":"moi upload"}"#.into()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: false,
+            tool_call_id: Some("lookup-12".into()),
+            args_full: Some(r#"{"command":"moi files list"}"#.into()),
+            runtime_args_full: Some(r#"{"command":"moi files list"}"#.into()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        state.messages = vec![
+            json!({"role": "user", "content": "upload this file"}),
+            json!({
+                "role": "system",
+                "content": "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"
+            }),
+            json!({"role": "assistant", "content": "looking up file_id"}),
+            json!({"role": "tool", "tool_call_id": "lookup-12", "content": "not found"}),
+        ];
+
+        enqueue_external_effect_ledger(&mut state);
+
+        let payload = state
+            .volatile_pending
+            .iter()
+            .find(|injection| {
+                injection.kind
+                    == crate::turn::agentic_loop::host::VolatileKind::ExternalEffectLedger
+            })
+            .expect("ledger projection")
+            .payload
+            .clone();
+        let calls = payload["calls"].as_array().expect("projected calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["tool_call_id"], "upload-11");
+        assert_eq!(calls[0]["tool"], "bash");
+        assert_eq!(calls[0]["executed"], true);
+        assert_eq!(calls[0]["ok"], true);
+        assert_eq!(calls[0]["authoritative_external_receipt"], false);
+        assert_eq!(calls[0]["executor_confirmation"], "executed_unconfirmed");
+        assert_eq!(calls[0]["replay"], "forbidden");
+        let history = state
+            .messages
+            .iter()
+            .map(|message| message.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!history.contains("upload-11"));
+        assert!(!history.contains("executed_unconfirmed"));
+        assert!(history.contains("lookup-12"));
+        let upload = &payload["calls"][0];
+        assert_eq!(upload["replay"], "forbidden");
+        assert!(
+            upload["operation_digest"]
+                .as_str()
+                .is_some_and(|digest| { digest.len() == 64 })
+        );
+        assert_eq!(upload["operation_preview"], "moi upload");
+        assert!(upload["target"].is_null());
+        assert_eq!(upload["authoritative_external_receipt"], json!(false));
+    }
+
+    #[test]
+    fn external_effect_ledger_keeps_the_upload_after_earlier_successful_probes() {
+        use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
+
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                true,
+                false,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_workspace_mutation(
+                    astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
+                )
+                .with_mutation_completion_scope(
+                    astra_config::user_profile::MutationCompletionScope::External,
+                ),
+        );
+        for index in 0..8 {
+            let args = format!(r#"{{"command":"ls /tmp/probe-{index}"}}"#);
+            state.stall.tool_call_records.push(ToolCallRecord {
+                name: "bash".into(),
+                ok: true,
+                tool_call_id: Some(format!("probe-{index}")),
+                args_full: Some(args.clone()),
+                runtime_args_full: Some(args),
+                args_preview: Some(format!("ls /tmp/probe-{index}")),
+                disposition: Some(ToolCallDisposition::Executed),
+                ..Default::default()
+            });
+        }
+        let upload_args = r#"{"command":"moi upload ./spec.pdf"}"#;
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            tool_call_id: Some("upload-11".into()),
+            args_full: Some(upload_args.into()),
+            runtime_args_full: Some(upload_args.into()),
+            args_preview: Some("moi upload ./spec.pdf".into()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        let target_set_digest = "cd".repeat(32);
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            tool_call_id: Some("receipt-12".into()),
+            args_full: Some(
+                r#"{"command":"sync","external_state_paths":["/var/lib/uploads"]}"#.into(),
+            ),
+            runtime_args_full: Some(
+                r#"{"command":"sync","external_state_paths":["/var/lib/uploads"]}"#.into(),
+            ),
+            disposition: Some(ToolCallDisposition::Executed),
+            external_effect_observed: Some(true),
+            external_effect_scope: Some(
+                astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE.into(),
+            ),
+            external_effect_receipt: Some(json!({
+                "schema": "external_effect_receipt.v1",
+                "source": "post_execution_fingerprint",
+                "scope": astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE,
+                "changed": true,
+                "ownership": astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP,
+                "target_set_digest": target_set_digest,
+                "observed_roots": 1,
+            })),
+            ..Default::default()
+        });
+        state.messages = vec![json!({
+            "role": "system",
+            "content": "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"
+        })];
+
+        enqueue_external_effect_ledger(&mut state);
+
+        let payload = &state
+            .volatile_pending
+            .iter()
+            .find(|injection| {
+                injection.kind
+                    == crate::turn::agentic_loop::host::VolatileKind::ExternalEffectLedger
+            })
+            .expect("ledger projection")
+            .payload;
+        let calls = payload["calls"].as_array().expect("projected calls");
+        assert!(calls.iter().any(|call| {
+            call["tool_call_id"] == "upload-11"
+                && call["operation_preview"] == "moi upload ./spec.pdf"
+                && call["executor_confirmation"] == "executed_unconfirmed"
+                && call["replay"] == "forbidden"
+                && call["authoritative_external_receipt"] == json!(false)
+        }));
+        assert!(calls.iter().any(|call| {
+            call["tool_call_id"] == "receipt-12"
+                && call["target"]["target_set_digest"] == target_set_digest
+                && call["executor_confirmation"] == "executor_confirmed"
+        }));
+        assert!(payload["coverage"]["omitted"].as_u64().unwrap_or(0) > 0);
+        let omitted = payload["coverage"]["omitted_identities"]
+            .as_array()
+            .expect("omitted identities");
+        assert!(omitted.iter().any(|call| {
+            call["tool_call_id"] == "probe-0"
+                && call["operation_digest"].is_string()
+                && call["operation_preview"] == "ls /tmp/probe-0"
+        }));
+        assert!(
+            !state
+                .messages
+                .iter()
+                .any(|message| message.to_string().contains("upload-11"))
+        );
+    }
+
+    #[test]
+    fn external_effect_ledger_keeps_receipt_target_after_the_call_leaves_history() {
+        use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
+
+        let target_set_digest = "ab".repeat(32);
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                true,
+                false,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            );
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_workspace_mutation(
+                    astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
+                )
+                .with_mutation_completion_scope(
+                    astra_config::user_profile::MutationCompletionScope::External,
+                ),
+        );
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            tool_call_id: Some("upload-11".into()),
+            args_full: Some(
+                r#"{"command":"moi upload","external_state_paths":["/var/lib/uploads"]}"#.into(),
+            ),
+            runtime_args_full: Some(
+                r#"{"command":"moi upload","external_state_paths":["/var/lib/uploads"]}"#.into(),
+            ),
+            disposition: Some(ToolCallDisposition::Executed),
+            external_effect_observed: Some(true),
+            external_effect_scope: Some(
+                astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE.into(),
+            ),
+            external_effect_receipt: Some(json!({
+                "schema": "external_effect_receipt.v1",
+                "source": "post_execution_fingerprint",
+                "scope": astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE,
+                "changed": true,
+                "ownership": astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP,
+                "target_set_digest": target_set_digest,
+                "observed_roots": 1,
+            })),
+            ..Default::default()
+        });
+        state.messages = vec![json!({
+            "role": "system",
+            "content": "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"
+        })];
+
+        enqueue_external_effect_ledger(&mut state);
+
+        let call = &state
+            .volatile_pending
+            .iter()
+            .find(|injection| {
+                injection.kind
+                    == crate::turn::agentic_loop::host::VolatileKind::ExternalEffectLedger
+            })
+            .expect("ledger projection")
+            .payload["calls"][0];
+        assert_eq!(call["tool_call_id"], "upload-11");
+        assert_eq!(call["executor_confirmation"], "executor_confirmed");
+        assert_eq!(call["target"]["target_set_digest"], target_set_digest);
+        assert_eq!(call["target"]["observed_roots"], 1);
+        assert!(call["replay"].is_null());
+        assert!(
+            !state
+                .messages
+                .iter()
+                .any(|message| message.to_string().contains("upload-11"))
+        );
     }
 
     #[test]
