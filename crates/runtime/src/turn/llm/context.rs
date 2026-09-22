@@ -3868,6 +3868,98 @@ mod context_cache_contract_tests {
             "the authorized root set must reach the same prompt"
         );
 
+        state.commit_volatile_attempt_lease();
+        let retry = json!({
+            "id": "file-retry",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"install-unit","external_state_paths":["/etc/app/config"]}"#
+            }
+        });
+        let admitted =
+            crate::turn::agentic_loop::execution_phase::apply_completion_action_admission(
+                &mut state,
+                crate::turn::agentic_loop::host::ToolCallAdmission {
+                    admitted: vec![
+                    astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::ordinary(
+                        retry.clone(),
+                    ),
+                ],
+                    rejected: Vec::new(),
+                    completion_action_applied: false,
+                },
+                std::slice::from_ref(&retry),
+            );
+        assert_eq!(admitted.admitted.len(), 1);
+        let records_before = state.stall.tool_call_records.len();
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            tool_call_id: Some("file-retry".into()),
+            args_full: Some(contract.into()),
+            runtime_args_full: Some(contract.into()),
+            args_preview: Some("install-unit".into()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        crate::turn::agentic_loop::execution_phase::advance_completion_action_window_after_tool_round_from_record_index(
+            &mut state,
+            records_before,
+            None,
+        );
+        let window = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .expect("the spent recovery stays auditable");
+        assert!(window.consumed);
+        assert_eq!(window.attempts_remaining, 0);
+        assert!(state.hooks.completion_settlement.text_only);
+
+        let spent = assembled_provider_prompt(&mut state);
+        let spent_ledger = required_context_by_kind(&spent, "external_effect_ledger");
+        let spent_calls = spent_ledger["context"]["calls"]
+            .as_array()
+            .expect("spent ledger calls");
+        let spent_omitted = spent_ledger["context"]["coverage"]["omitted_identities"]
+            .as_array()
+            .expect("spent omitted identities");
+        assert!(
+            spent_calls
+                .iter()
+                .chain(spent_omitted.iter())
+                .all(|call| call["replay"] != "continuable"),
+            "a consumed file-contract attempt must not stay authorized"
+        );
+        assert!(
+            spent_calls
+                .iter()
+                .any(|call| { call["tool_call_id"] == "file-1" && call["replay"] == "forbidden" })
+        );
+        assert!(
+            spent_calls.iter().any(|call| {
+                call["tool_call_id"] == "file-retry" && call["replay"] == "forbidden"
+            })
+        );
+        assert!(
+            spent_calls.iter().any(|call| {
+                call["tool_call_id"] == "probe-ls" && call["replay"] == "not_a_write"
+            })
+        );
+        assert!(
+            spent_ledger["context"]["instruction"]
+                .as_str()
+                .is_some_and(|instruction| !instruction.contains("still the authorized recovery")),
+            "a spent recovery must not keep authorizing another foreground repeat"
+        );
+        assert!(
+            spent.contains("typed_completion_action_settled"),
+            "the next prompt must ask for the final explanation"
+        );
+        assert!(spent.contains("\"execution_authority\":\"none\""));
+
         let mut blocked = external_effect_projection_state();
         blocked.messages = vec![json!({"role": "user", "content": "upload the file"})];
         blocked.final_text = "uploaded file_id=abc".into();

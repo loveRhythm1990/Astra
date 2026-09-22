@@ -6554,8 +6554,22 @@ pub(crate) fn external_effect_ledger_projection(
             "omitted_identities": omitted,
             "omitted_identities_truncated": omitted_not_listed > 0,
         },
-        "instruction": "These ledger rows already executed. executed_unconfirmed means the executor recorded no authoritative external receipt; that is not itself a replay decision. replay=forbidden means do not issue that same operation again. replay=continuable means one foreground repeat of that declared external_state_paths set is still the authorized recovery. replay=not_a_write means the effect classifier proved the call read-only. replay=not_foreground means the call started in the background and is not a foreground external write. operation_preview and operation_digest identify the call and are not a receipt. omitted_identities use the same replay field.",
+        "instruction": external_effect_projection_instruction(external_file_recovery_is_open(
+            state,
+            replay_forbidden,
+        )),
     }))
+}
+
+fn external_effect_projection_instruction(recovery_open: bool) -> String {
+    let continuable = if recovery_open {
+        "replay=continuable means one foreground repeat of that declared external_state_paths set is still the authorized recovery. "
+    } else {
+        "No declared-root row is continuable; the file-contract recovery is closed, so do not repeat that write. "
+    };
+    format!(
+        "These ledger rows already executed. executed_unconfirmed means the executor recorded no authoritative external receipt; that is not itself a replay decision. replay=forbidden means do not issue that same operation again. {continuable}replay=not_a_write means the effect classifier proved the call read-only. replay=not_foreground means the call started in the background and is not a foreground external write. operation_preview and operation_digest identify the call and are not a receipt. omitted_identities use the same replay field."
+    )
 }
 
 fn record_is_active_external_file_continuation(
@@ -6571,8 +6585,30 @@ fn record_is_active_external_file_continuation(
     normalized_external_roots(&roots) == normalized_external_roots(&expected)
 }
 
+/// The one file-contract recovery is still executable. A consumed window, a
+/// text-only close, a receipt, or a pathless-write veto withdraws it.
+fn external_file_recovery_is_open(state: &AgenticLoopState, replay_forbidden: bool) -> bool {
+    if replay_forbidden
+        || has_concrete_external_effect(state)
+        || state.hooks.completion_settlement.text_only
+    {
+        return false;
+    }
+    state
+        .hooks
+        .completion_settlement
+        .completion_action_window
+        .as_ref()
+        .is_some_and(|window| {
+            matches!(window.action, CompletionAction::RequiredExternalEffect)
+                && !window.consumed
+                && window.attempts_remaining > 0
+        })
+}
+
 /// Prompt replay follows the same admission policy as the completion window.
-/// Missing a receipt is not the same decision as forbidding a repeat.
+/// Missing a receipt is not the same decision as forbidding a repeat. The
+/// continuable label lasts only while that window is still the live authority.
 fn projected_replay_disposition(
     state: &AgenticLoopState,
     record: &astra_services::session_journal::ToolCallRecord,
@@ -6583,7 +6619,9 @@ fn projected_replay_disposition(
     if confirmed {
         return None;
     }
-    if !replay_forbidden && record_is_active_external_file_continuation(state, record) {
+    if external_file_recovery_is_open(state, replay_forbidden)
+        && record_is_active_external_file_continuation(state, record)
+    {
         return Some("continuable");
     }
     if proven_read_only {
@@ -12431,6 +12469,12 @@ mod tests {
             payload.payload["bound_external_state_paths"],
             serde_json::json!(["/etc/app/config"])
         );
+        let open = external_effect_ledger_projection(&state).expect("open recovery");
+        let open_file = open["calls"]
+            .as_array()
+            .and_then(|calls| calls.iter().find(|call| call["tool_call_id"] == "file-1"))
+            .expect("file contract");
+        assert_eq!(open_file["replay"], "continuable");
         let same_roots = serde_json::json!({
             "id": "file-retry",
             "type": "function",
@@ -12454,7 +12498,7 @@ mod tests {
             .as_array()
             .and_then(|calls| calls.iter().find(|call| call["tool_call_id"] == "file-1"))
             .expect("file contract");
-        assert_eq!(file["replay"], "continuable");
+        assert_eq!(file["replay"], "forbidden");
         assert_eq!(file["executor_confirmation"], "executed_unconfirmed");
     }
 
