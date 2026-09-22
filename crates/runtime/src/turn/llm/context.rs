@@ -3666,6 +3666,11 @@ mod context_cache_contract_tests {
             }),
             "a pathless upload outranks newer listings for a full row"
         );
+        assert!(
+            calls
+                .iter()
+                .any(|call| { call["tool_call_id"] == "new-7" && call["replay"] == "not_a_write" })
+        );
         let omitted = payload["coverage"]["omitted_identities"]
             .as_array()
             .expect("omitted identities");
@@ -3716,7 +3721,13 @@ mod context_cache_contract_tests {
             omitted
                 .iter()
                 .any(|call| call["tool_call_id"] == "upload-old"
-                    && call["operation_preview"] == "moi upload ./old.pdf")
+                    && call["operation_preview"] == "moi upload ./old.pdf"
+                    && call["replay"] == "forbidden")
+        );
+        assert!(
+            omitted.iter().any(|call| {
+                call["tool_call_id"] == "probe-39" && call["replay"] == "not_a_write"
+            })
         );
         assert!(payload["coverage"]["omitted_identities_truncated"] == json!(true));
         assert!(
@@ -3791,6 +3802,166 @@ mod context_cache_contract_tests {
             .expect("ledger projection")
             .payload
             .clone()
+    }
+
+    #[test]
+    fn assembled_file_contract_recovery_is_not_forbidden_in_the_next_prompt() {
+        use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
+
+        let mut state = external_effect_projection_state();
+        state.messages = vec![json!({"role": "user", "content": "change the host file"})];
+        state.final_text = "changed the host file".into();
+        let listing = r#"{"command":"ls /etc/app"}"#;
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            tool_call_id: Some("probe-ls".into()),
+            args_full: Some(listing.into()),
+            runtime_args_full: Some(listing.into()),
+            args_preview: Some("ls /etc/app".into()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        let contract = r#"{"command":"install-unit","external_state_paths":["/etc/app/config"]}"#;
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            tool_call_id: Some("file-1".into()),
+            args_full: Some(contract.into()),
+            runtime_args_full: Some(contract.into()),
+            args_preview: Some("install-unit".into()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        assert!(
+            crate::turn::agentic_loop::execution_phase::enforce_workspace_completion_before_text_completion(
+                &mut state
+            )
+        );
+
+        let wire = assembled_provider_prompt(&mut state);
+        let ledger = required_context_by_kind(&wire, "external_effect_ledger");
+        let calls = ledger["context"]["calls"].as_array().expect("ledger calls");
+        let file = calls
+            .iter()
+            .find(|call| call["tool_call_id"] == "file-1")
+            .expect("authorized file contract");
+        assert_eq!(file["replay"], "continuable");
+        assert_eq!(file["executor_confirmation"], "executed_unconfirmed");
+        let probe = calls
+            .iter()
+            .find(|call| call["tool_call_id"] == "probe-ls")
+            .expect("read-only probe");
+        assert_eq!(probe["replay"], "not_a_write");
+        assert!(
+            ledger["context"]["instruction"]
+                .as_str()
+                .is_some_and(|instruction| instruction.contains("replay=continuable")
+                    && instruction.contains("replay=forbidden"))
+        );
+        assert!(
+            wire.contains("required_external_effect_missing"),
+            "the completion gate must still request the bound file observation"
+        );
+        assert!(
+            wire.contains("/etc/app/config"),
+            "the authorized root set must reach the same prompt"
+        );
+
+        let mut blocked = external_effect_projection_state();
+        blocked.messages = vec![json!({"role": "user", "content": "upload the file"})];
+        blocked.final_text = "uploaded file_id=abc".into();
+        blocked.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            tool_call_id: Some("upload-1".into()),
+            args_full: Some(r#"{"command":"moi upload"}"#.into()),
+            runtime_args_full: Some(r#"{"command":"moi upload"}"#.into()),
+            args_preview: Some("moi upload".into()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        assert!(
+            !crate::turn::agentic_loop::execution_phase::enforce_workspace_completion_before_text_completion(
+                &mut blocked
+            )
+        );
+        let blocked_wire = assembled_provider_prompt(&mut blocked);
+        let blocked_ledger = required_context_by_kind(&blocked_wire, "external_effect_ledger");
+        let upload = blocked_ledger["context"]["calls"]
+            .as_array()
+            .and_then(|calls| calls.iter().find(|call| call["tool_call_id"] == "upload-1"))
+            .expect("pathless upload");
+        assert_eq!(upload["replay"], "forbidden");
+        assert!(
+            !blocked_wire.contains("required_external_effect_missing"),
+            "a pathless upload must not be offered as the authorized recovery"
+        );
+    }
+
+    fn assembled_provider_prompt(
+        state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
+    ) -> String {
+        use std::collections::HashSet;
+
+        let visible_tools = vec![tool("bash")];
+        let restricted_tools = HashSet::new();
+        let cache_cfg = PromptCacheConfig::latch("openai");
+        let output = assemble_context_pipeline(LlmContextAssemblyInput {
+            state,
+            session_id: "sid-external-effect",
+            tool_surface: ToolSurfacePlan::from_visible_tools(&visible_tools, &restricted_tools),
+            runtime_signals: RuntimeSignals::new(&serde_json::Map::new(), None),
+            cache_cfg: &cache_cfg,
+            provider: "openai",
+            model_name: "gpt-4",
+            context_window: Some(200_000),
+            max_completion_tokens: Some(16_384),
+            cache_capability: None,
+            user_content: "change the host file",
+            query_source: "test",
+        })
+        .expect("context pipeline");
+        let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+        let messages = assemble_wire_messages(LlmWireAssemblyInput {
+            artifact_recovery_route: crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
+            system_messages: output.system_messages,
+            volatile_preamble: output.volatile_preamble,
+            compacted_messages: output.messages,
+            state,
+            compaction_boundary_hit: false,
+            thinking: &thinking,
+            session_id: "sid-external-effect",
+            provider: "openai",
+            model_name: "gpt-4",
+            cache_capability: None,
+            cache_cfg: &cache_cfg,
+        })
+        .expect("provider wire");
+        messages
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn required_context_by_kind(wire: &str, kind: &str) -> serde_json::Value {
+        let tag = "<runtime-required-context>";
+        let mut rest = wire;
+        while let Some(start) = rest.find(tag) {
+            let after = &rest[start + tag.len()..];
+            let end = after
+                .find("</runtime-required-context>")
+                .expect("required context closes");
+            let body = after[..end].trim();
+            let value: serde_json::Value =
+                serde_json::from_str(body).expect("required context is json");
+            if value["kind"] == kind {
+                return value;
+            }
+            rest = &after[end..];
+        }
+        panic!("missing required context {kind}");
     }
 
     #[test]

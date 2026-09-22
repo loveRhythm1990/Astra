@@ -1867,7 +1867,9 @@ pub(crate) fn project_completion_action_text_settlement(state: &mut AgenticLoopS
 /// establishes that the final workspace was at least inspected.  No assistant
 /// prose or task-specific keyword is parsed here.
 #[cfg(test)]
-fn enforce_workspace_completion_before_text_completion(state: &mut AgenticLoopState) -> bool {
+pub(crate) fn enforce_workspace_completion_before_text_completion(
+    state: &mut AgenticLoopState,
+) -> bool {
     enforce_workspace_completion_before_text_completion_with_disposition(
         state,
         TerminalCompletionDisposition::OrdinaryCompletionCandidate,
@@ -6369,17 +6371,33 @@ fn latest_continuable_external_file_roots(state: &AgenticLoopState) -> Option<Ve
         })
 }
 
+fn executed_bash_requests_background(
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> bool {
+    let Some(raw) = record.authoritative_args_full() else {
+        return false;
+    };
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    args.get("run_in_background")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
 fn pathless_executed_bash(record: &astra_services::session_journal::ToolCallRecord) -> bool {
     record.was_executed()
         && record.name == "bash"
+        && !executed_bash_requests_background(record)
         && external_effect_scope_from_record(record).is_none()
         && !executed_external_vehicle_is_proven_read_only(record)
 }
 
-/// The external obligation is still open, and at least one Bash already ran
-/// without an accepted file-path contract and without a classifier proof that
-/// the command is read-only. A listing does not veto the first external
-/// mutation or a later file-contract observation. A different record's unused
+/// The external obligation is still open, and at least one foreground Bash
+/// already ran without an accepted file-path contract and without a classifier
+/// proof that the command is read-only. A listing does not veto the first
+/// external mutation or a later file-contract observation. A background start
+/// is not that foreground write. A different record's unused
 /// `external_state_paths` must not reopen a write for a pathless side-effecting
 /// call. Missing or unparseable arguments stay fail-closed.
 pub(crate) fn external_effect_replay_forbidden(state: &AgenticLoopState) -> bool {
@@ -6476,9 +6494,12 @@ pub(crate) fn external_effect_ledger_projection(
     if !requires_external_effect_completion(state) {
         return None;
     }
+    let replay_forbidden = external_effect_replay_forbidden(state);
     let mut rows = Vec::new();
     for (ledger_index, record) in state.stall.tool_call_records.iter().enumerate() {
-        let Some(row) = external_effect_projection_row(state, record, ledger_index) else {
+        let Some(row) =
+            external_effect_projection_row(state, record, ledger_index, replay_forbidden)
+        else {
             continue;
         };
         rows.push(row);
@@ -6533,14 +6554,52 @@ pub(crate) fn external_effect_ledger_projection(
             "omitted_identities": omitted,
             "omitted_identities_truncated": omitted_not_listed > 0,
         },
-        "instruction": "These ledger rows already executed. executed_unconfirmed means the executor recorded no authoritative external receipt; do not issue that same operation again. operation_preview and operation_digest identify the call and are not a receipt. omitted_identities lists executed calls that did not fit in calls, with the same identity fields.",
+        "instruction": "These ledger rows already executed. executed_unconfirmed means the executor recorded no authoritative external receipt; that is not itself a replay decision. replay=forbidden means do not issue that same operation again. replay=continuable means one foreground repeat of that declared external_state_paths set is still the authorized recovery. replay=not_a_write means the effect classifier proved the call read-only. replay=not_foreground means the call started in the background and is not a foreground external write. operation_preview and operation_digest identify the call and are not a receipt. omitted_identities use the same replay field.",
     }))
+}
+
+fn record_is_active_external_file_continuation(
+    state: &AgenticLoopState,
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> bool {
+    let Some(roots) = external_effect_scope_from_record(record) else {
+        return false;
+    };
+    let Some(expected) = latest_continuable_external_file_roots(state) else {
+        return false;
+    };
+    normalized_external_roots(&roots) == normalized_external_roots(&expected)
+}
+
+/// Prompt replay follows the same admission policy as the completion window.
+/// Missing a receipt is not the same decision as forbidding a repeat.
+fn projected_replay_disposition(
+    state: &AgenticLoopState,
+    record: &astra_services::session_journal::ToolCallRecord,
+    confirmed: bool,
+    proven_read_only: bool,
+    replay_forbidden: bool,
+) -> Option<&'static str> {
+    if confirmed {
+        return None;
+    }
+    if !replay_forbidden && record_is_active_external_file_continuation(state, record) {
+        return Some("continuable");
+    }
+    if proven_read_only {
+        return Some("not_a_write");
+    }
+    if executed_bash_requests_background(record) {
+        return Some("not_foreground");
+    }
+    Some("forbidden")
 }
 
 fn external_effect_projection_row(
     state: &AgenticLoopState,
     record: &astra_services::session_journal::ToolCallRecord,
     ledger_index: usize,
+    replay_forbidden: bool,
 ) -> Option<ExternalEffectProjectionRow> {
     if !record.was_executed() {
         return None;
@@ -6570,6 +6629,8 @@ fn external_effect_projection_row(
     } else {
         "executed_unconfirmed"
     };
+    let replay =
+        projected_replay_disposition(state, record, confirmed, proven_read_only, replay_forbidden);
     let (operation_digest, operation_preview) = redacted_operation_identity(record);
     let mut compact = serde_json::json!({
         "tool_call_id": record.tool_call_id,
@@ -6584,6 +6645,9 @@ fn external_effect_projection_row(
     }
     if let Some(roots) = roots.clone() {
         compact["declared_external_roots"] = serde_json::json!(roots);
+    }
+    if let Some(replay) = replay {
+        compact["replay"] = serde_json::json!(replay);
     }
     let mut full = serde_json::json!({
         "tool_call_id": record.tool_call_id,
@@ -6602,8 +6666,8 @@ fn external_effect_projection_row(
     if let Some(roots) = roots {
         full["declared_external_roots"] = serde_json::json!(roots);
     }
-    if !confirmed {
-        full["replay"] = serde_json::json!("forbidden");
+    if let Some(replay) = replay {
+        full["replay"] = serde_json::json!(replay);
     }
     if confirmed && let Some(receipt) = record.external_effect_receipt.as_ref() {
         let target = external_effect_receipt_target_identifiers(receipt);
@@ -12053,6 +12117,23 @@ mod tests {
         }
     }
 
+    fn executed_background_bash(call_id: &str, command: &str) -> ToolCallRecord {
+        let args = serde_json::json!({
+            "command": command,
+            "run_in_background": true,
+        })
+        .to_string();
+        ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            tool_call_id: Some(call_id.into()),
+            args_full: Some(args.clone()),
+            runtime_args_full: Some(args),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn pathless_bash_external_completion_closes_without_replay() {
         use astra_config::user_profile::MutationCompletionScope;
@@ -12278,6 +12359,135 @@ mod tests {
     }
 
     #[test]
+    fn ready_background_bash_does_not_forbid_the_first_external_action() {
+        use astra_config::user_profile::MutationCompletionScope;
+
+        let mut state = make_state();
+        external_must_mutate(&mut state, MutationCompletionScope::External);
+        state.final_text = "helper is up".into();
+        state.stall.tool_call_records.push(executed_background_bash(
+            "helper-1",
+            "python3 -m http.server 8000",
+        ));
+
+        assert!(!external_effect_replay_forbidden(&state));
+        assert!(enforce_workspace_completion_before_text_completion(
+            &mut state
+        ));
+        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 1);
+        assert!(state.interruption.is_none());
+        assert!(
+            state
+                .volatile_pending
+                .iter()
+                .any(|entry| entry.payload["signal"] == "required_external_effect_missing")
+        );
+        let projection = external_effect_ledger_projection(&state).expect("background row");
+        let helper = projection["calls"]
+            .as_array()
+            .and_then(|calls| calls.iter().find(|call| call["tool_call_id"] == "helper-1"))
+            .expect("background helper stays visible");
+        assert_eq!(helper["replay"], "not_foreground");
+        assert_eq!(helper["executor_confirmation"], "executed_unconfirmed");
+    }
+
+    #[test]
+    fn ready_background_bash_does_not_block_a_later_file_contract() {
+        use astra_config::user_profile::MutationCompletionScope;
+
+        let mut state = make_state();
+        external_must_mutate(&mut state, MutationCompletionScope::External);
+        state.final_text = "changed the host file".into();
+        state.stall.tool_call_records.push(executed_background_bash(
+            "helper-1",
+            "python3 -m http.server 8000",
+        ));
+        let args = serde_json::json!({
+            "command": "install-unit",
+            "external_state_paths": ["/etc/app/config"],
+        })
+        .to_string();
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            tool_call_id: Some("file-1".into()),
+            args_full: Some(args.clone()),
+            runtime_args_full: Some(args),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+
+        assert!(!external_effect_replay_forbidden(&state));
+        assert!(enforce_workspace_completion_before_text_completion(
+            &mut state
+        ));
+        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 1);
+        let payload = state
+            .volatile_pending
+            .iter()
+            .find(|entry| entry.payload["signal"] == "required_external_effect_missing")
+            .expect("the background helper must not block the file contract");
+        assert_eq!(
+            payload.payload["bound_external_state_paths"],
+            serde_json::json!(["/etc/app/config"])
+        );
+        let same_roots = serde_json::json!({
+            "id": "file-retry",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"install-unit","external_state_paths":["/etc/app/config"]}"#
+            }
+        });
+        let admitted = apply_completion_action_admission(
+            &mut state,
+            ToolCallAdmission {
+                admitted: ordinary_admitted([same_roots.clone()]),
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+            std::slice::from_ref(&same_roots),
+        );
+        assert_eq!(admitted.admitted.len(), 1);
+        let projection = external_effect_ledger_projection(&state).expect("ledger");
+        let file = projection["calls"]
+            .as_array()
+            .and_then(|calls| calls.iter().find(|call| call["tool_call_id"] == "file-1"))
+            .expect("file contract");
+        assert_eq!(file["replay"], "continuable");
+        assert_eq!(file["executor_confirmation"], "executed_unconfirmed");
+    }
+
+    #[test]
+    fn ready_background_bash_does_not_excuse_a_later_pathless_upload() {
+        use astra_config::user_profile::MutationCompletionScope;
+
+        let mut state = make_state();
+        external_must_mutate(&mut state, MutationCompletionScope::External);
+        state.final_text = "uploaded file_id=abc".into();
+        state.stall.tool_call_records.push(executed_background_bash(
+            "helper-1",
+            "python3 -m http.server 8000",
+        ));
+        state
+            .stall
+            .tool_call_records
+            .push(pathless_upload_bash("upload-1"));
+
+        assert!(external_effect_replay_forbidden(&state));
+        assert!(!enforce_workspace_completion_before_text_completion(
+            &mut state
+        ));
+        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 0);
+        let projection = external_effect_ledger_projection(&state).expect("ledger");
+        let upload = projection["calls"]
+            .as_array()
+            .and_then(|calls| calls.iter().find(|call| call["tool_call_id"] == "upload-1"))
+            .expect("pathless upload");
+        assert_eq!(upload["replay"], "forbidden");
+    }
+
+    #[test]
     fn accepted_external_file_contract_still_requests_one_observation() {
         use astra_config::user_profile::MutationCompletionScope;
 
@@ -12444,6 +12654,17 @@ mod tests {
                 .volatile_pending
                 .iter()
                 .all(|entry| entry.payload["signal"] != "required_external_effect_missing")
+        );
+        let projection = external_effect_ledger_projection(&state).expect("ledger");
+        let calls = projection["calls"].as_array().expect("calls");
+        assert!(
+            calls.iter().any(|call| {
+                call["tool_call_id"] == "upload-1" && call["replay"] == "forbidden"
+            })
+        );
+        assert!(
+            calls.iter().all(|call| call["replay"] != "continuable"),
+            "a later pathless upload withdraws the older file-contract continuation"
         );
     }
 
