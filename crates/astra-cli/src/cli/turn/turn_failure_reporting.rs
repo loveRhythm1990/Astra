@@ -219,8 +219,11 @@ async fn reconcile_failure_accounting(
             return;
         }
         let request_timeout = remaining.min(std::time::Duration::from_secs(1));
-        if let Ok(Ok(run)) =
-            tokio::time::timeout(request_timeout, api.get_run(Some(&token), &run_id)).await
+        if let Ok(Ok(run)) = tokio::time::timeout(
+            request_timeout,
+            api.get_run_with_presented_bearer(&token, &run_id),
+        )
+        .await
             && run
                 .get("accounting")
                 .is_some_and(|accounting| apply_durable_run_accounting(partial, accounting))
@@ -431,7 +434,7 @@ mod tests {
     use super::{
         admission_rejection_message, apply_durable_run_accounting,
         await_failure_reconciliation_before_deadline, reconcile_and_report_turn_failure,
-        report_admission_rejection, report_turn_failure,
+        reconcile_failure_accounting, report_admission_rejection, report_turn_failure,
     };
     use crate::cli::session::session_state::SessionState;
     use crate::tests::heavy_checkpoint_with_runtime_state;
@@ -588,6 +591,83 @@ mod tests {
         assert_eq!(outcomes.requested, 4);
         assert_eq!(outcomes.executed, 3);
         assert_eq!(outcomes.rejected, 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failure_accounting_uses_presented_native_token_without_refresh() {
+        use astra_credentials::native::{Environment, NativeSession, NativeStore, unix_now};
+        use std::os::unix::fs::PermissionsExt;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let origin = server.uri();
+        let issuer = format!("{origin}/realms/moi");
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = NativeStore::with_directory(directory.path().to_path_buf());
+        let saved = store.clone();
+        let session = NativeSession {
+            environment: Environment {
+                issuer: issuer.clone(),
+                astra_url: origin.clone(),
+                moi_url: origin.clone(),
+                authorization_endpoint: format!("{origin}/api/v1/uc/oauth2/authorize"),
+                token_endpoint: format!("{issuer}/protocol/openid-connect/token"),
+                revocation_endpoint: format!("{issuer}/protocol/openid-connect/revoke"),
+                jwks_uri: format!("{issuer}/protocol/openid-connect/certs"),
+            },
+            generation: "replaced-on-publish".into(),
+            subject: "subject-a".into(),
+            session_id: "sid-a".into(),
+            astra_user_id: "astra-a".into(),
+            moi_principal_id: "moi-a".into(),
+            catalog_user_id: "catalog-a".into(),
+            access_token: "presented-access-token".into(),
+            refresh_token: "refresh-must-not-be-sent".into(),
+            expires_at: unix_now().unwrap() + 30,
+            workspace_id: None,
+            role_id: None,
+            refresh_pending: false,
+        };
+        let (published, _) = store.publish(session).unwrap();
+        let binding = crate::cli::native_auth::binding_for_test(store, published);
+        let _active = crate::cli::native_auth::install_active_for_test(binding.clone());
+        Mock::given(method("POST"))
+            .and(path("/realms/moi/protocol/openid-connect/token"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/run-accounting"))
+            .and(header("authorization", "Bearer presented-access-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accounting": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 4,
+                    "cache_read_tokens": 2,
+                    "cache_creation_tokens": 1
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&origin, None)
+            .unwrap()
+            .with_bearer_provider(binding);
+        let mut partial = crate::PartialTurnData {
+            run_id: Some("run-accounting".into()),
+            ..Default::default()
+        };
+        reconcile_failure_accounting(&api, None, &mut partial).await;
+        assert_eq!(partial.prompt_tokens, 11);
+        assert_eq!(partial.completion_tokens, 4);
+        let current = saved.current().unwrap();
+        assert!(!current.refresh_pending);
+        assert_eq!(current.refresh_token, "refresh-must-not-be-sent");
+        assert_eq!(current.access_token, "presented-access-token");
     }
 
     #[test]

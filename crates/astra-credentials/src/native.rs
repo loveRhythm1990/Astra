@@ -798,9 +798,16 @@ async fn settle_token_rotation(
         // committed rotation. HTTP status is not proof of non-consumption.
         return Err(log_rotation_failure(CredentialFailure::RotationRejected));
     }
-    let token: TokenResponse = bounded_json(response)
-        .await
-        .map_err(|error| log_rotation_failure(CredentialFailure::Unavailable(error)))?;
+    let token: TokenResponse = match bounded_json(response).await {
+        Ok(token) => token,
+        Err(error) => {
+            // The request was sent and the pending flag is durable. An unreadable
+            // body is not proof the issuer rejected the refresh, and the old
+            // refresh token must not be replayed.
+            tracing::warn!(error = %error, "native token rotation response was unreadable");
+            return Err(log_rotation_failure(CredentialFailure::RotationUnconfirmed));
+        }
+    };
     if token.access_token.is_empty()
         || token.refresh_token.is_empty()
         || token.expires_in <= 0
@@ -1432,6 +1439,83 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn unreadable_rotation_response_requires_reauthentication() {
+        for body in ["{}", ""] {
+            assert_unreadable_rotation_requires_reauthentication(body).await;
+        }
+    }
+
+    async fn assert_unreadable_rotation_requires_reauthentication(body: &str) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let payload = body.to_string();
+        let request = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut input = [0; 8192];
+            let len = stream.read(&mut input).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&input[..len])
+                    .starts_with("POST /realms/moi/protocol/openid-connect/token ")
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let (_directory, store) = store();
+        let mut expiring = session("A");
+        expiring.environment = Environment {
+            issuer: format!("{origin}/realms/moi"),
+            authorization_endpoint: format!("{origin}/api/v1/uc/oauth2/authorize"),
+            token_endpoint: format!("{origin}/realms/moi/protocol/openid-connect/token"),
+            revocation_endpoint: format!("{origin}/realms/moi/protocol/openid-connect/revoke"),
+            jwks_uri: format!("{origin}/realms/moi/protocol/openid-connect/certs"),
+            ..expiring.environment
+        };
+        expiring.expires_at = unix_now().unwrap();
+        store.publish(expiring).unwrap();
+        let error = store.credential("moi", None).await.unwrap_err();
+        assert_eq!(error, CredentialFailure::RotationUnconfirmed);
+        assert_eq!(error.access_miss(), AccessMiss::ReauthenticationRequired);
+        request.await.unwrap();
+        assert!(store.current().unwrap().refresh_pending);
+        let followed = store.credential("moi", None).await.unwrap_err();
+        assert_eq!(followed, CredentialFailure::RotationInterrupted);
+    }
+
+    #[tokio::test]
+    async fn dropped_rotation_response_requires_reauthentication() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let request = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut input = [0; 8192];
+            let _ = stream.read(&mut input).await.unwrap();
+            drop(stream);
+        });
+        let (_directory, store) = store();
+        let mut expiring = session("A");
+        expiring.environment = Environment {
+            issuer: format!("{origin}/realms/moi"),
+            authorization_endpoint: format!("{origin}/api/v1/uc/oauth2/authorize"),
+            token_endpoint: format!("{origin}/realms/moi/protocol/openid-connect/token"),
+            revocation_endpoint: format!("{origin}/realms/moi/protocol/openid-connect/revoke"),
+            jwks_uri: format!("{origin}/realms/moi/protocol/openid-connect/certs"),
+            ..expiring.environment
+        };
+        expiring.expires_at = unix_now().unwrap();
+        store.publish(expiring).unwrap();
+        let error = store.credential("astra", None).await.unwrap_err();
+        assert_eq!(error, CredentialFailure::RotationUnconfirmed);
+        assert_eq!(error.access_miss(), AccessMiss::ReauthenticationRequired);
+        request.await.unwrap();
+        assert!(store.current().unwrap().refresh_pending);
     }
 
     #[tokio::test]

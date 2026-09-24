@@ -11,6 +11,30 @@ pub(crate) struct Binding {
 
 static ACTIVE: RwLock<Option<Arc<Binding>>> = RwLock::new(None);
 
+#[cfg(test)]
+pub(crate) fn binding_for_test(store: NativeStore, session: native::NativeSession) -> Arc<Binding> {
+    Arc::new(Binding { store, session })
+}
+
+#[cfg(test)]
+pub(crate) struct ActiveBindingGuard(Option<Arc<Binding>>);
+
+#[cfg(test)]
+impl Drop for ActiveBindingGuard {
+    fn drop(&mut self) {
+        *ACTIVE.write().expect("native identity lock poisoned") = self.0.take();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_active_for_test(binding: Arc<Binding>) -> ActiveBindingGuard {
+    let previous = ACTIVE
+        .write()
+        .expect("native identity lock poisoned")
+        .replace(binding);
+    ActiveBindingGuard(previous)
+}
+
 pub(crate) fn active() -> Option<Arc<Binding>> {
     ACTIVE
         .read()
