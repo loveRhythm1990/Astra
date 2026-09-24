@@ -3044,6 +3044,21 @@ fn followup_gate_after_auth(
     }
 }
 
+/// Authentication was refused before any login task or view existed.
+/// The remaining FIFO will not get a later completion, so put it back
+/// in the composer.
+fn recover_followups_after_rejected_authentication(
+    queued_followup_submissions: &mut VecDeque<String>,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+) -> bool {
+    recover_queued_followups_after_cancelled_read(
+        queued_followup_submissions,
+        bottom_pane,
+        chat_widget,
+    )
+}
+
 /// A cancelled read will not reach the completion handoff. Put the held
 /// backlog back in the composer so a later manual submit cannot pass it.
 fn recover_queued_followups_after_cancelled_read(
@@ -8226,7 +8241,16 @@ pub(crate) async fn run_tui_session(
                                         slash_dispatch::SlashResult::Authenticate { register } => {
                                             if background_registry.running_count() > 0 || work_start_in_flight {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::warning("Wait for or stop background tasks before changing authentication."));
+                                                recover_followups_after_rejected_authentication(
+                                                    &mut queued_followup_submissions,
+                                                    &mut bottom_pane,
+                                                    &mut chat_widget,
+                                                );
                                                 flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                finish_submission_feedback(
+                                                    &mut bottom_pane,
+                                                    &mut status_indicator,
+                                                );
                                                 continue;
                                             }
                                             login_phase.reset();
@@ -14688,6 +14712,25 @@ mod tests {
         assert!(!slash_result_releases_followups(
             &slash_dispatch::SlashResult::Authenticate { register: false }
         ));
+        assert!(!slash_result_releases_followups(
+            &slash_dispatch::SlashResult::Authenticate { register: true }
+        ));
+    }
+
+    #[test]
+    fn rejected_login_and_register_restore_the_following_message() {
+        for _register in [false, true] {
+            let mut queued = VecDeque::from(["plain A".to_string()]);
+            let mut pane = BottomPane::new();
+            let mut chat = chat_widget::ChatWidget::new("");
+            assert!(recover_followups_after_rejected_authentication(
+                &mut queued,
+                &mut pane,
+                &mut chat,
+            ));
+            assert!(queued.is_empty());
+            assert_eq!(pane.composer.text().trim(), "plain A");
+        }
     }
 
     #[test]
