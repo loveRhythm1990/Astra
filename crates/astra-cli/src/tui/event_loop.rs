@@ -2954,17 +2954,42 @@ fn resume_queued_followups_after_modal(
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
     event_stream: &mut TuiEventStream,
+    followup_replay_armed: &mut bool,
     gate: FollowupReleaseGate,
 ) -> QueuedFollowupHandoff {
     let handoff =
         handoff_queued_followups(queued_followup_submissions, bottom_pane, chat_widget, gate);
     if handoff == QueuedFollowupHandoff::SubmitNext {
+        // The injected Enter is the queued item itself. The next idle
+        // submission must run it, not append it behind whatever remains.
+        *followup_replay_armed = true;
         event_stream.push_front(TuiEvent::Key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Enter,
             crossterm::event::KeyModifiers::NONE,
         )));
     }
     handoff
+}
+
+/// A model-facing message typed while an older backlog is still held must
+/// join that FIFO. Slash commands and the one injected replay may proceed.
+fn admit_idle_followup(
+    text: &str,
+    followup_replay_armed: &mut bool,
+    queued_followup_submissions: &mut VecDeque<String>,
+) -> bool {
+    if *followup_replay_armed {
+        *followup_replay_armed = false;
+        return false;
+    }
+    let trimmed = text.trim_start();
+    let model_facing =
+        !trimmed.is_empty() && !trimmed.starts_with('/') && !trimmed.starts_with('!');
+    if !model_facing || queued_followup_submissions.is_empty() {
+        return false;
+    }
+    queued_followup_submissions.push_back(text.to_string());
+    true
 }
 
 fn followup_release_gate(
@@ -7134,6 +7159,7 @@ pub(crate) async fn run_tui_session(
     // FIFO order and re-enter the ordinary submit path rather than presenting
     // an "accepted" acknowledgement that never produces a response.
     let mut queued_followup_submissions = VecDeque::<String>::new();
+    let mut followup_replay_armed = false;
     let mut runtime_notification_turn_pending = false;
     let mut runtime_notification_wake_at: Option<std::time::Instant> = None;
 
@@ -7355,6 +7381,11 @@ pub(crate) async fn run_tui_session(
                         // Recreate its retired memory service using the still-pinned
                         // API; a committed account change cannot reuse this client.
                         restore_login_identity_services(api, profile, &mut state, &mut external_skill_discovery, &mut external_skill_discovery_pending).await;
+                        recover_queued_followups_after_cancelled_read(
+                            &mut queued_followup_submissions,
+                            &mut bottom_pane,
+                            &mut chat_widget,
+                        );
                         if cancelled {
                             while login_progress_rx.try_recv().is_ok() {}
                             chat_widget.commit_system(history_cell::system::SystemCell::response("Login cancelled."));
@@ -7444,6 +7475,7 @@ pub(crate) async fn run_tui_session(
                     &mut bottom_pane,
                     &mut chat_widget,
                     &mut event_stream,
+                    &mut followup_replay_armed,
                     followup_release_gate(model_catalog_loading, slash_background_read_count),
                 );
                 let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
@@ -7666,6 +7698,7 @@ pub(crate) async fn run_tui_session(
                     &mut bottom_pane,
                     &mut chat_widget,
                     &mut event_stream,
+                    &mut followup_replay_armed,
                     followup_release_gate(model_catalog_loading, slash_background_read_count),
                 );
                 frame_requester.schedule_frame();
@@ -7682,6 +7715,7 @@ pub(crate) async fn run_tui_session(
                     &mut bottom_pane,
                     &mut chat_widget,
                     &mut event_stream,
+                    &mut followup_replay_armed,
                     followup_release_gate(model_catalog_loading, slash_background_read_count),
                 );
                 frame_requester.schedule_frame();
@@ -8018,6 +8052,26 @@ pub(crate) async fn run_tui_session(
                                     chat_widget.commit_system(
                                         history_cell::system::SystemCell::info(format!(
                                             "Work is starting · queued: {preview} · it will send automatically when its Session is ready.",
+                                        )),
+                                    );
+                                    flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                    finish_submission_feedback(
+                                        &mut bottom_pane,
+                                        &mut status_indicator,
+                                    );
+                                    frame_requester.schedule_frame();
+                                    continue;
+                                }
+
+                                if admit_idle_followup(
+                                    &text,
+                                    &mut followup_replay_armed,
+                                    &mut queued_followup_submissions,
+                                ) {
+                                    let preview = user_intent_preview(&text);
+                                    chat_widget.commit_system(
+                                        history_cell::system::SystemCell::info(format!(
+                                            "Your message is queued behind the command that is still finishing: {preview}",
                                         )),
                                     );
                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
@@ -8386,6 +8440,7 @@ pub(crate) async fn run_tui_session(
                                             &mut bottom_pane,
                                             &mut chat_widget,
                                             &mut event_stream,
+                    &mut followup_replay_armed,
                                             followup_gate,
                                         );
                                         if matches!(
@@ -10640,6 +10695,7 @@ pub(crate) async fn run_tui_session(
                                             &mut bottom_pane,
                                             &mut chat_widget,
                                             &mut event_stream,
+                    &mut followup_replay_armed,
                                             followup_release_gate(
                                                 model_catalog_loading,
                                                 slash_background_read_count,
@@ -10689,6 +10745,7 @@ pub(crate) async fn run_tui_session(
                                             &mut bottom_pane,
                                             &mut chat_widget,
                                             &mut event_stream,
+                    &mut followup_replay_armed,
                                             followup_gate_after_auth(
                                                 auth_session_id.as_deref(),
                                                 auth_epoch,
@@ -10742,6 +10799,7 @@ pub(crate) async fn run_tui_session(
                                             &mut bottom_pane,
                                             &mut chat_widget,
                                             &mut event_stream,
+                    &mut followup_replay_armed,
                                             followup_gate_after_auth(
                                                 auth_session_id.as_deref(),
                                                 auth_epoch,
@@ -10802,6 +10860,7 @@ pub(crate) async fn run_tui_session(
                                             &mut bottom_pane,
                                             &mut chat_widget,
                                             &mut event_stream,
+                    &mut followup_replay_armed,
                                             followup_release_gate(
                                                 model_catalog_loading,
                                                 slash_background_read_count,
@@ -10856,6 +10915,7 @@ pub(crate) async fn run_tui_session(
                                                 &mut bottom_pane,
                                                 &mut chat_widget,
                                                 &mut event_stream,
+                    &mut followup_replay_armed,
                                                 followup_release_gate(
                                                     model_catalog_loading,
                                                     slash_background_read_count,
@@ -10931,6 +10991,7 @@ pub(crate) async fn run_tui_session(
                                             &mut bottom_pane,
                                             &mut chat_widget,
                                             &mut event_stream,
+                    &mut followup_replay_armed,
                                             followup_release_gate(
                                                 model_catalog_loading,
                                                 slash_background_read_count,
@@ -11240,6 +11301,7 @@ pub(crate) async fn run_tui_session(
                                     &mut bottom_pane,
                                     &mut chat_widget,
                                     &mut event_stream,
+                    &mut followup_replay_armed,
                                     FollowupReleaseGate {
                                         model_catalog_loading,
                                         background_reads_in_flight: slash_background_read_count > 0,
@@ -14614,6 +14676,40 @@ mod tests {
             QueuedFollowupHandoff::SubmitNext
         );
         assert_eq!(pane.composer.text().trim(), "plain B");
+    }
+
+    #[test]
+    fn idle_submission_waits_behind_a_held_backlog_unless_it_is_the_replay() {
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut replay_armed = false;
+        assert!(admit_idle_followup(
+            "manual B",
+            &mut replay_armed,
+            &mut queued
+        ));
+        assert_eq!(
+            queued.into_iter().collect::<Vec<_>>(),
+            vec!["plain A".to_string(), "manual B".to_string()]
+        );
+
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut replay_armed = true;
+        assert!(!admit_idle_followup(
+            "/model gpt",
+            &mut replay_armed,
+            &mut queued
+        ));
+        assert!(!replay_armed);
+        assert_eq!(queued, VecDeque::from(["plain A".to_string()]));
+
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut replay_armed = false;
+        assert!(!admit_idle_followup(
+            "/help",
+            &mut replay_armed,
+            &mut queued
+        ));
+        assert_eq!(queued, VecDeque::from(["plain A".to_string()]));
     }
 
     #[test]
