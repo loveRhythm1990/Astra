@@ -840,12 +840,23 @@ async fn settle_token_rotation(
         .await
     {
         let _ = revoke(&expected.environment, &token.refresh_token).await;
-        return Err(log_rotation_failure(CredentialFailure::Unavailable(error)));
+        tracing::warn!(cause = %error, "rotated token could not be saved");
+        return Err(log_rotation_failure(classify_post_rotation_save(error)));
     }
     store
         .blocking(|store| store.current())
         .await
         .map_err(CredentialFailure::from_session_read)
+}
+
+fn classify_post_rotation_save(error: String) -> CredentialFailure {
+    match error.as_str() {
+        "MOI session logged out during operation" => CredentialFailure::LoggedOut,
+        "MOI environment changed during operation" | "MOI account changed during operation" => {
+            CredentialFailure::AccountChanged
+        }
+        _ => CredentialFailure::RotationUnconfirmed,
+    }
 }
 
 fn log_rotation_failure(error: CredentialFailure) -> CredentialFailure {
@@ -1386,6 +1397,36 @@ mod tests {
         );
         assert!(store.current().unwrap().refresh_pending);
         drop(lock);
+    }
+
+    #[tokio::test]
+    async fn unsaved_rotation_requires_reauthentication_and_is_not_replayed() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+        let fixture = rotation_fixture("A").await;
+        let (directory, store) = store();
+        let mut expiring = session("A");
+        expiring.environment = fixture.environment.clone();
+        expiring.expires_at = unix_now().unwrap();
+        store.publish(expiring).unwrap();
+        let clone = store.clone();
+        let caller = tokio::spawn(async move { clone.credential("astra", None).await });
+        fixture.entered.notified().await;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        fixture.release.notify_one();
+        let error = caller.await.unwrap().unwrap_err();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(error, CredentialFailure::RotationUnconfirmed);
+        assert_eq!(error.access_miss(), AccessMiss::ReauthenticationRequired);
+        assert_eq!(fixture.revocations.load(Ordering::SeqCst), 1);
+        let current = store.current().unwrap();
+        assert!(current.refresh_pending);
+        assert_eq!(current.refresh_token, "synthetic-refresh");
+        assert_eq!(
+            store.credential("astra", None).await.unwrap_err(),
+            CredentialFailure::RotationInterrupted
+        );
+        assert_eq!(fixture.rotations.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
