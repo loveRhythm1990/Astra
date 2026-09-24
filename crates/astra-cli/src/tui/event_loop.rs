@@ -2856,12 +2856,19 @@ fn model_facing_followup_backlog(queued: &VecDeque<String>) -> bool {
         .any(|text| !text.trim_start().starts_with('/'))
 }
 
+fn slash_result_releases_followups(result: &slash_dispatch::SlashResult) -> bool {
+    matches!(
+        result,
+        slash_dispatch::SlashResult::Handled | slash_dispatch::SlashResult::OpenWorkTasks
+    )
+}
+
 fn local_slash_releases_followups(
-    handled_locally: bool,
+    synchronous_completion: bool,
     session_changed: bool,
     has_active_view: bool,
 ) -> bool {
-    handled_locally && !session_changed && !has_active_view
+    synchronous_completion && !session_changed && !has_active_view
 }
 
 #[derive(PartialEq, Eq)]
@@ -3009,13 +3016,18 @@ fn turn_settlement_followup_handoff(
     chat_widget: &mut chat_widget::ChatWidget,
     model_catalog_loading: bool,
     background_reads_in_flight: usize,
+    followup_replay_armed: &mut bool,
 ) -> QueuedFollowupHandoff {
-    handoff_queued_followups(
+    let handoff = handoff_queued_followups(
         queued_followup_submissions,
         bottom_pane,
         chat_widget,
         followup_release_gate(model_catalog_loading, background_reads_in_flight),
-    )
+    );
+    if handoff == QueuedFollowupHandoff::SubmitNext {
+        *followup_replay_armed = true;
+    }
+    handoff
 }
 
 fn followup_gate_after_auth(
@@ -8202,8 +8214,8 @@ pub(crate) async fn run_tui_session(
                                         pending_work_retries: &mut pending_work_retries,
                                     };
                                     let result = slash_dispatch::dispatch(&text, &mut dctx).await;
-                                    let slash_handled_locally =
-                                        matches!(&result, slash_dispatch::SlashResult::Handled);
+                                    let slash_finished_synchronously =
+                                        slash_result_releases_followups(&result);
                                     let flush_slash_response =
                                         should_flush_after_slash_dispatch(&result);
                                     pending_deferred_slash_flush =
@@ -8430,7 +8442,7 @@ pub(crate) async fn run_tui_session(
                                     followup_gate.session_rebound = session_changed;
                                     if session_changed
                                         || local_slash_releases_followups(
-                                            slash_handled_locally,
+                                            slash_finished_synchronously,
                                             session_changed,
                                             bottom_pane.has_active_view(),
                                         )
@@ -10584,6 +10596,7 @@ pub(crate) async fn run_tui_session(
                                         &mut chat_widget,
                                         model_catalog_loading,
                                         slash_background_read_count,
+                                        &mut followup_replay_armed,
                                     );
                                     if handoff == QueuedFollowupHandoff::SubmitNext {
                                         event_stream.push_front(TuiEvent::Key(
@@ -14626,12 +14639,55 @@ mod tests {
         let mut chat = chat_widget::ChatWidget::new("");
         pane.push_view(Box::new(BackgroundTaskView::new(Vec::new())));
         assert!(pane.has_active_view());
+        let mut replay_armed = false;
         assert_eq!(
-            turn_settlement_followup_handoff(&mut queued, &mut pane, &mut chat, false, 0),
+            turn_settlement_followup_handoff(
+                &mut queued,
+                &mut pane,
+                &mut chat,
+                false,
+                0,
+                &mut replay_armed,
+            ),
             QueuedFollowupHandoff::Held
         );
+        assert!(!replay_armed);
         assert_eq!(queued, VecDeque::from(["plain A".to_string()]));
         assert!(pane.composer.is_empty());
+    }
+
+    #[test]
+    fn turn_settlement_replay_does_not_reorder_a_two_message_backlog() {
+        let mut queued = VecDeque::from(["plain A".to_string(), "plain B".to_string()]);
+        let mut pane = BottomPane::new();
+        let mut chat = chat_widget::ChatWidget::new("");
+        let mut replay_armed = false;
+        assert_eq!(
+            turn_settlement_followup_handoff(
+                &mut queued,
+                &mut pane,
+                &mut chat,
+                false,
+                0,
+                &mut replay_armed,
+            ),
+            QueuedFollowupHandoff::SubmitNext
+        );
+        let replayed = pane.composer.text();
+        assert_eq!(replayed.trim(), "plain A");
+        assert!(!admit_idle_followup(
+            &replayed,
+            &mut replay_armed,
+            &mut queued
+        ));
+        assert!(!replay_armed);
+        assert_eq!(queued, VecDeque::from(["plain B".to_string()]));
+        assert!(slash_result_releases_followups(
+            &slash_dispatch::SlashResult::OpenWorkTasks
+        ));
+        assert!(!slash_result_releases_followups(
+            &slash_dispatch::SlashResult::Authenticate { register: false }
+        ));
     }
 
     #[test]
