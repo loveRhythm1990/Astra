@@ -299,6 +299,14 @@ fn run_chat_turn_boxed<'a>(
     Box::pin(run_chat_turn(request))
 }
 
+/// A handled startup failure is not a completed turn. Follow-up input queued
+/// while authentication was still pending must be restored, not sent.
+#[derive(Clone, Debug)]
+pub(crate) enum InteractiveTurnOutcome {
+    Completed(Option<TurnUsage>),
+    NotStarted,
+}
+
 pub(crate) async fn handle_chat_input(
     line: String,
     current_token: Option<&str>,
@@ -322,7 +330,7 @@ pub(crate) async fn handle_chat_input_with_ui(
     state: &mut SessionState,
     ctx: TurnContext<'_>,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
-) -> Result<Option<TurnUsage>, String> {
+) -> Result<InteractiveTurnOutcome, String> {
     if let Some(decision) = classify_shell_passthrough(&line) {
         match decision {
             ShellPassthroughDecision::Empty => {}
@@ -352,14 +360,14 @@ pub(crate) async fn handle_chat_input_with_ui(
                 }
             }
         }
-        return Ok(None);
+        return Ok(InteractiveTurnOutcome::Completed(None));
     }
 
     let token = match current_token {
         Some(token) => token,
         None => {
             ui.show_warning("  Not logged in. Use /login to authenticate.");
-            return Ok(None);
+            return Ok(InteractiveTurnOutcome::NotStarted);
         }
     };
 
@@ -447,10 +455,12 @@ pub(crate) async fn handle_chat_input_with_ui(
             .pending_bg_notifications
             .extend(notifications_arriving_during_settlement);
     }
-    Ok(turn_usage_sink
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .take())
+    Ok(InteractiveTurnOutcome::Completed(
+        turn_usage_sink
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take(),
+    ))
 }
 
 /// Resume an idle root from runtime-owned background facts without inventing
@@ -464,15 +474,15 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
     state: &mut SessionState,
     ctx: TurnContext<'_>,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
-) -> Result<Option<TurnUsage>, String> {
+) -> Result<InteractiveTurnOutcome, String> {
     if state.pending_bg_notifications.is_empty() {
-        return Ok(None);
+        return Ok(InteractiveTurnOutcome::Completed(None));
     }
     let token = match current_token {
         Some(token) => token,
         None => {
             ui.show_warning("  Background work finished, but Astra is not logged in; the update will be kept for your next turn.");
-            return Ok(None);
+            return Ok(InteractiveTurnOutcome::NotStarted);
         }
     };
 
@@ -550,10 +560,12 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         let consumed = notification_count.min(state.pending_bg_notifications.len());
         state.pending_bg_notifications.drain(..consumed);
     }
-    Ok(turn_usage_sink
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .take())
+    Ok(InteractiveTurnOutcome::Completed(
+        turn_usage_sink
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take(),
+    ))
 }
 
 pub(super) fn acquire_interactive_turn_admission(
