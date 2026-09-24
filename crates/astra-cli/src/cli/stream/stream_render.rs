@@ -10981,6 +10981,101 @@ mod tests {
         )));
     }
 
+    #[tokio::test]
+    async fn recorded_timeout_keeps_later_approval_delivery_open() {
+        let timeout_body = r#"{"detail":"approval decision already recorded for request req-timeout run run-timeout as timeout","error_code":"approval_decision_already_recorded","metadata":{"decision":"timeout","outcome":"timed_out","request_id":"req-timeout","run_id":"run-timeout"}}"#;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/approval/respond"))
+            .respond_with(ResponseTemplate::new(409).set_body_string(timeout_body))
+            .up_to_n_times(1)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/approval/respond"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: Some(&cancel),
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        let requests = [
+            astra_turn_core::chat_turn_sse_dispatch::EdgeApprovalRequest {
+                session_id: Some("session-timeout".into()),
+                run_id: Some("run-timeout".into()),
+                request_id: "req-timeout".into(),
+                tool: "bash".into(),
+                approval_kind: astra_thin_client::ApprovalKind::Standard,
+                detail: None,
+                display_label: None,
+            },
+            astra_turn_core::chat_turn_sse_dispatch::EdgeApprovalRequest {
+                session_id: Some("session-timeout".into()),
+                run_id: Some("run-timeout".into()),
+                request_id: "req-next".into(),
+                tool: "bash".into(),
+                approval_kind: astra_thin_client::ApprovalKind::Standard,
+                detail: None,
+                display_label: None,
+            },
+        ];
+
+        let results = host
+            .resolve_approvals_batch(&requests, Some("session-timeout"), Some("run-timeout"))
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            host.callback_failure.is_none(),
+            "a recorded timeout is a settled decision, not a callback failure: {:?}",
+            host.callback_failure
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "a recorded timeout must not cancel the local stream"
+        );
+        let posted = server.received_requests().await.expect("requests");
+        assert_eq!(
+            posted.len(),
+            2,
+            "the approval after a recorded timeout must still be delivered"
+        );
+        assert_eq!(results[1].request_id, "req-next");
+        assert!(
+            results[1].reason.as_deref()
+                != Some("approval callback delivery stopped after an earlier failure"),
+            "later approval was detached after the recorded timeout: {results:?}"
+        );
+    }
+
     #[test]
     fn approval_stale_revalidation() {
         // unchanged file passes
