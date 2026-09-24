@@ -76,10 +76,17 @@ impl ReplUiAdapter for TuiUiAdapter {
                 false
             }
         };
+        let submission_id = request.submission_id.clone();
         match self.tx.try_send(TuiAppEvent::RestoreInput(request)) {
             Ok(()) => true,
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => queued,
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                // The event loop owns both the channel and the fallback drain.
+                // A closed channel means that loop is gone, so a queued restore
+                // would never be applied.
+                if let Ok(mut queue) = self.restore_input_queue.lock() {
+                    queue.retain(|pending| pending.submission_id != submission_id);
+                }
                 tracing::warn!(
                     "TUI application event queue closed before restoring rejected input"
                 );
