@@ -9103,7 +9103,7 @@ mod tests {
     use serde_json::Value;
     use std::path::PathBuf;
     use tempfile::tempdir;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -10987,15 +10987,20 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/approval/respond"))
+            .and(body_partial_json(
+                serde_json::json!({"request_id": "req-timeout"}),
+            ))
             .respond_with(ResponseTemplate::new(409).set_body_string(timeout_body))
-            .up_to_n_times(1)
-            .with_priority(2)
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path("/approval/respond"))
+            .and(body_partial_json(
+                serde_json::json!({"request_id": "req-next"}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-            .with_priority(1)
+            .expect(1)
             .mount(&server)
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
@@ -11053,6 +11058,12 @@ mod tests {
             .await;
 
         assert_eq!(results.len(), 2);
+        assert_eq!(results[0].request_id, "req-timeout");
+        assert_eq!(
+            results[0].reason.as_deref(),
+            Some("approval_decision_already_recorded:timeout"),
+            "the first callback must observe the recorded timeout, got {results:?}"
+        );
         assert!(
             host.callback_failure.is_none(),
             "a recorded timeout is a settled decision, not a callback failure: {:?}",
