@@ -118,10 +118,10 @@ pub(crate) fn report_admission_rejection(
             state.pending_recovery = Some(owner.to_string());
         }
         let mut message = admission_rejection_message(draft_restored, true);
-        if owner.is_some() {
-            message.push_str("  To continue existing work, run /resume and choose the session.\n");
-        }
-        message.push_str("  Retry after the current work settles, or use another worktree.\n");
+        message.push_str(&workspace_claim_guidance(
+            owner,
+            workspace_recovery_action(metadata),
+        ));
         message.push_str("  No model or tool ran.");
         ui.show_error(&message);
         return;
@@ -129,6 +129,40 @@ pub(crate) fn report_admission_rejection(
     let mut message = admission_rejection_message(draft_restored, false);
     message.push_str("  No model or tool ran.");
     ui.show_error(&message);
+}
+
+fn workspace_recovery_action(metadata: Option<&serde_json::Value>) -> Option<&str> {
+    let action = metadata
+        .and_then(|value| value.get("recovery_action"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|action| !action.is_empty());
+    if action.is_some() {
+        return action;
+    }
+    match metadata
+        .and_then(|value| value.get("workspace_blocker"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("execution_slot" | "active_run") => Some("wait_or_cancel_session"),
+        Some("writer_or_reservation" | "claim_changed") => Some("retry_session"),
+        Some(
+            "settlement_pending" | "binding_not_ready" | "unresolved_tool" | "owner_unavailable",
+        ) => Some("inspect_session"),
+        _ => None,
+    }
+}
+
+fn workspace_claim_guidance(owner: Option<&str>, recovery_action: Option<&str>) -> String {
+    let owner = owner.unwrap_or("the previous session");
+    match recovery_action {
+        Some("wait_or_cancel_session") => format!(
+            "  Session {owner} still holds this directory.\n  Wait for it to finish, or stop it with `astra session cancel {owner}` and retry.\n  Use another worktree for concurrent work.\n"
+        ),
+        Some("retry_session") => "  A conversation write is still settling. Retry this message; do not cancel the session.\n".to_string(),
+        _ => format!(
+            "  Session {owner} still has unfinished execution state.\n  Inspect it with `astra session show {owner}` before retrying.\n  Use another worktree for concurrent work.\n"
+        ),
+    }
 }
 
 fn admission_rejection_message(draft_restored: bool, workspace_claimed: bool) -> String {
@@ -159,9 +193,12 @@ async fn reconcile_failure_accounting(
         return;
     };
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    // Do not call fresh_access_token here. Its refresh writes auth.json and
+    // outlives this 5s deadline only when settlement is detached; starting it
+    // from a best-effort read is unnecessary and used to cancel mid-rotation.
     let Some(token) = await_failure_reconciliation_before_deadline(
         deadline,
-        crate::cli::session::session_runtime::fresh_access_token(api, profile),
+        crate::cli::session::session_runtime::access_token_without_refresh(profile),
     )
     .await
     .flatten() else {
@@ -880,6 +917,46 @@ mod tests {
         assert!(shown.contains("do not cancel"));
         assert!(!shown.contains("astra session cancel"));
         assert!(!shown.contains("astra --resume"));
+    }
+
+    #[test]
+    fn workspace_claim_guidance_follows_the_server_recovery_action() {
+        for (action, expected, forbidden) in [
+            (
+                "wait_or_cancel_session",
+                "astra session cancel owner-session",
+                "/resume",
+            ),
+            ("retry_session", "do not cancel the session", "/resume"),
+            (
+                "inspect_session",
+                "astra session show owner-session",
+                "/resume",
+            ),
+        ] {
+            let mut state = SessionState::default();
+            let failure = crate::TurnFailure {
+                error: "workspace is busy".into(),
+                partial: crate::PartialTurnData {
+                    error_code: Some("execution_workspace_claimed".into()),
+                    error_metadata: Some(serde_json::json!({
+                        "admission_state": "rejected",
+                        "recovery_action": action,
+                        "workspace_blocker": "execution_slot",
+                        "owner_session_id": "owner-session"
+                    })),
+                    admission_rejected: true,
+                    ..Default::default()
+                },
+            };
+            let mut ui = crate::tests::TestUi::default();
+            report_admission_rejection(&mut state, "draft", &failure, &mut ui);
+            let shown = ui.errors.join("\n");
+            assert!(shown.contains("Workspace is already in use"), "{shown}");
+            assert!(shown.contains(expected), "{action}: {shown}");
+            assert!(!shown.contains(forbidden), "{action}: {shown}");
+            assert_eq!(ui.restored_inputs, vec!["draft"]);
+        }
     }
 
     #[test]

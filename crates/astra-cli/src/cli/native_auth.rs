@@ -45,7 +45,20 @@ impl Binding {
         Ok(current)
     }
 
-    pub(crate) async fn access_token(&self) -> Result<String, String> {
+    /// Same identity check as [`snapshot`], without failing when a rotation is pending.
+    /// The file lock runs on the blocking pool.
+    pub(crate) async fn snapshot_off_runtime(&self) -> Result<native::NativeSession, String> {
+        let current = self.store.current_off_runtime().await?;
+        if current.generation != self.session.generation
+            || current.environment != self.session.environment
+            || current.subject != self.session.subject
+        {
+            return Err("MOI account or environment changed; restart Astra".into());
+        }
+        Ok(current)
+    }
+
+    pub(crate) async fn access_token(&self) -> Result<String, native::CredentialFailure> {
         let credential = self
             .store
             .credential("astra", Some(&self.session.generation))
@@ -54,7 +67,7 @@ impl Binding {
             || credential.subject != self.session.subject
             || credential.environment != self.session.environment.key()
         {
-            return Err("MOI account or environment changed; restart Astra".into());
+            return Err(native::CredentialFailure::AccountChanged);
         }
         Ok(credential.access_token)
     }
@@ -71,9 +84,9 @@ impl astra_thin_client::client::BearerProvider for Binding {
         >,
     > {
         Box::pin(async {
-            self.access_token()
-                .await
-                .map_err(astra_thin_client::ThinClientError::InvalidInput)
+            self.access_token().await.map_err(|error| {
+                astra_thin_client::ThinClientError::InvalidInput(error.to_string())
+            })
         })
     }
 }
