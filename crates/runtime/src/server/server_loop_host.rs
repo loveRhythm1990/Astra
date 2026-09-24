@@ -15837,7 +15837,6 @@ impl ServerAgenticLoopHost {
                         }
                     }
                     EdgeApprovalWait::Denied(denied) => {
-                        let structured = denied.tool_results.first();
                         let output = denied
                             .raw_tool_output(0)
                             .unwrap_or("approval request did not produce a terminal result")
@@ -15854,15 +15853,29 @@ impl ServerAgenticLoopHost {
                             executable_calls.push(*tc);
                             continue;
                         }
-                        for map in &denied.sse_maps {
+                        let presentation = match authority.as_ref() {
+                            Ok(settlement) => {
+                                authoritative_unapproved_delivery(&denied, *settlement, tc)
+                            }
+                            Err(_) => denied.clone(),
+                        };
+                        for map in &presentation.sse_maps {
                             self.emit_progress_event(Value::Object(map.clone()));
                         }
                         let resolution_error = authority.err();
-                        let status = structured
+                        let status = presentation
+                            .tool_results
+                            .first()
                             .map(|result| result.status.clone())
                             .unwrap_or_else(|| "error".to_string());
-                        let fields =
-                            structured.and_then(|result| result.tool_result_fields.clone());
+                        let fields = presentation
+                            .tool_results
+                            .first()
+                            .and_then(|result| result.tool_result_fields.clone());
+                        let output = presentation
+                            .raw_tool_output(0)
+                            .unwrap_or(&output)
+                            .to_string();
                         results_by_id.insert(
                             request_id.clone(),
                             EdgeToolExecResult {
@@ -15904,7 +15917,6 @@ impl ServerAgenticLoopHost {
                         }
                     }
                     EdgeApprovalWait::TimedOut(timed_out) => {
-                        let structured = timed_out.tool_results.first();
                         let output = timed_out
                             .raw_tool_output(0)
                             .unwrap_or("approval deadline elapsed")
@@ -15921,15 +15933,29 @@ impl ServerAgenticLoopHost {
                             executable_calls.push(*tc);
                             continue;
                         }
-                        for map in &timed_out.sse_maps {
+                        let presentation = match authority.as_ref() {
+                            Ok(settlement) => {
+                                authoritative_unapproved_delivery(&timed_out, *settlement, tc)
+                            }
+                            Err(_) => timed_out.clone(),
+                        };
+                        for map in &presentation.sse_maps {
                             self.emit_progress_event(Value::Object(map.clone()));
                         }
                         let resolution_error = authority.err();
-                        let status = structured
+                        let status = presentation
+                            .tool_results
+                            .first()
                             .map(|result| result.status.clone())
                             .unwrap_or_else(|| "timed_out".to_string());
-                        let fields =
-                            structured.and_then(|result| result.tool_result_fields.clone());
+                        let fields = presentation
+                            .tool_results
+                            .first()
+                            .and_then(|result| result.tool_result_fields.clone());
+                        let output = presentation
+                            .raw_tool_output(0)
+                            .unwrap_or(&output)
+                            .to_string();
                         results_by_id.insert(
                             request_id.clone(),
                             EdgeToolExecResult {
@@ -23696,6 +23722,29 @@ fn edge_tool_delivery_timed_out(
         .any(|result| result.status == "timed_out")
 }
 
+fn authoritative_unapproved_delivery(
+    local: &astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery,
+    authority: EdgeApprovalSettlement,
+    tool_call: &Value,
+) -> astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery {
+    use astra_turn_core::cloud_tool_delivery::{
+        approval_denial_delivery, approval_timeout_delivery,
+    };
+
+    let local_status = local
+        .tool_results
+        .first()
+        .map(|result| result.status.as_str());
+    match authority {
+        EdgeApprovalSettlement::Timeout if local_status == Some("timed_out") => local.clone(),
+        EdgeApprovalSettlement::Timeout => approval_timeout_delivery(tool_call),
+        EdgeApprovalSettlement::Deny if local_status == Some("denied") => local.clone(),
+        EdgeApprovalSettlement::Deny | EdgeApprovalSettlement::Allow => {
+            approval_denial_delivery(tool_call, None)
+        }
+    }
+}
+
 fn edge_approval_wait_from_ledger(
     result: Result<(), astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery>,
 ) -> EdgeApprovalWait {
@@ -26097,6 +26146,88 @@ mod tests {
             }
             other => panic!("shared timeout produced {other:?}"),
         }
+    }
+
+    struct FixedApprovalSettlementSink {
+        settlement: EdgeApprovalSettlement,
+    }
+
+    #[async_trait::async_trait]
+    impl HostInteractionSink for FixedApprovalSettlementSink {
+        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn resolve_edge_approval(
+            &self,
+            _request_id: &str,
+            _tool_name: &str,
+            _settlement: EdgeApprovalSettlement,
+            _reason: Option<&str>,
+        ) -> Result<EdgeApprovalSettlement, String> {
+            Ok(self.settlement)
+        }
+    }
+
+    #[tokio::test]
+    async fn competing_denial_replaces_local_approval_timeout_result() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-compete-deny".to_string(),
+            "s-compete-deny".to_string(),
+        )
+        .with_execution_time_budget(Some(ExecutionTimeBudget {
+            remaining_seconds: 2,
+        }))
+        .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+        .with_interactive_client(true)
+        .build();
+        host.set_approval_audit_context(test_approval_audit_context(
+            "u-compete-deny",
+            "s-compete-deny",
+        ));
+        host.set_interaction_sink(Arc::new(FixedApprovalSettlementSink {
+            settlement: EdgeApprovalSettlement::Deny,
+        }));
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "description": "Run a shell command",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })],
+            Default::default(),
+        );
+        let context = test_edge_action_context("u-compete-deny", "run-compete-deny").await;
+        let call = json!({
+            "id": "bash-compete-deny",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{}"}
+        });
+
+        let outcome = host
+            .deliver_edge_tools_via_ledger("run-compete-deny", "chain", &[call], &context)
+            .await;
+
+        assert_eq!(outcome.results.len(), 1, "control={:?}", outcome.control);
+        assert_eq!(
+            outcome.results[0].status, "denied",
+            "output={} fields={:?}",
+            outcome.results[0].output, outcome.results[0].tool_result_fields
+        );
+        assert!(
+            outcome.results[0].output.contains("user REJECTED")
+                || outcome.results[0].output.contains("REJECTED"),
+            "tool result must follow the durable denial, got {}",
+            outcome.results[0].output
+        );
+        assert!(
+            !outcome.results[0].output.contains("timed out waiting"),
+            "stale timeout text must not survive a durable denial"
+        );
     }
 
     struct SequencedSummaryClient {

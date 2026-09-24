@@ -406,6 +406,33 @@ fn journal_decision_to_cloud_result(
     Some(result)
 }
 
+/// Terminal edge delivery for an explicit user denial.
+pub fn approval_denial_delivery(tc: &Value, reason: Option<&str>) -> EdgeToolRoundDelivery {
+    let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+    let tool_name = tc
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    EdgeToolRoundDelivery {
+        sse_maps: vec![build_tool_call_end_event(
+            id,
+            Value::String(denied_tool_content(reason)),
+        )],
+        tool_messages: vec![json!({
+            "role": "tool",
+            "tool_call_id": id,
+            "content": llm_safe_tool_content(&denied_tool_content(reason), tool_name),
+        })],
+        persist_tool_results: vec![persist_denied_tool_result(tc, reason)],
+        tool_results: vec![EdgeDeliveredToolResult {
+            execution_completion: None,
+            tool_call_id: id.to_string(),
+            ..terminal_tool_result("denied", "capability_denied", false)
+        }],
+    }
+}
+
 /// Terminal edge delivery for an approval deadline. This is not a user denial.
 pub fn approval_timeout_delivery(tc: &Value) -> EdgeToolRoundDelivery {
     let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
@@ -579,23 +606,9 @@ async fn wait_approval_ledger_for_tool_with_journal_poll(
     }
 
     match approval_outcome {
-        CloudApprovalResult::Denied { reason } => Err(EdgeToolRoundDelivery {
-            sse_maps: vec![build_tool_call_end_event(
-                id,
-                Value::String(denied_tool_content(reason.as_deref())),
-            )],
-            tool_messages: vec![json!({
-                "role": "tool",
-                "tool_call_id": id,
-                "content": llm_safe_tool_content(&denied_tool_content(reason.as_deref()), tool_name),
-            })],
-            persist_tool_results: vec![persist_denied_tool_result(tc, reason.as_deref())],
-            tool_results: vec![EdgeDeliveredToolResult {
-                execution_completion: None,
-                tool_call_id: id.to_string(),
-                ..terminal_tool_result("denied", "capability_denied", false)
-            }],
-        }),
+        CloudApprovalResult::Denied { reason } => {
+            Err(approval_denial_delivery(tc, reason.as_deref()))
+        }
         CloudApprovalResult::Timeout => Err(approval_timeout_delivery(tc)),
         CloudApprovalResult::Malformed => Err(EdgeToolRoundDelivery {
             sse_maps: vec![build_tool_call_end_event(
