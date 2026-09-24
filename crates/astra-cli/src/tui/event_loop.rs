@@ -10239,7 +10239,7 @@ pub(crate) async fn run_tui_session(
                                     // underflow when a late recovery projection rewinds counters.
                                     let turn_usage = match turn_result.as_ref() {
                                         Ok(crate::cli::turn::turn_entry::InteractiveTurnOutcome::Completed(usage)) => {
-                                            usage.clone()
+                                            usage.clone().map(|usage| *usage)
                                         }
                                         _ => None,
                                     };

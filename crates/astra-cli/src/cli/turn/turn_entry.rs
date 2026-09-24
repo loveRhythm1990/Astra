@@ -303,7 +303,7 @@ fn run_chat_turn_boxed<'a>(
 /// while authentication was still pending must be restored, not sent.
 #[derive(Clone, Debug)]
 pub(crate) enum InteractiveTurnOutcome {
-    Completed(Option<TurnUsage>),
+    Completed(Option<Box<TurnUsage>>),
     NotStarted,
 }
 
@@ -459,7 +459,8 @@ pub(crate) async fn handle_chat_input_with_ui(
         turn_usage_sink
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .take(),
+            .take()
+            .map(Box::new),
     ))
 }
 
@@ -564,7 +565,8 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         turn_usage_sink
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .take(),
+            .take()
+            .map(Box::new),
     ))
 }
 
