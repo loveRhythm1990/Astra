@@ -2760,13 +2760,49 @@ fn active_submission_routes_to_next_turn(
     output_has_settled: bool,
     foreground_lifecycle_transferred: bool,
     guidance_admission_closed: bool,
+    follow_up_deferred_before_bind: bool,
 ) -> bool {
     guidance_admission_closed
+        || follow_up_deferred_before_bind
         || active_submission_belongs_to_next_turn(
             text,
             output_has_settled,
             foreground_lifecycle_transferred,
         )
+}
+
+/// Current-run guidance needs the durable server run id from `RunBound`.
+/// Until that identity exists, a follow-up stays on the next-turn queue.
+/// An empty id is not a target.
+fn follow_up_waits_for_unbound_run(remote_run_id: Option<&str>) -> bool {
+    remote_run_id
+        .map(str::trim)
+        .filter(|run_id| !run_id.is_empty())
+        .is_none()
+}
+
+/// Queue one model-facing follow-up while the durable run id is still absent.
+/// The first queued message latches the rest of this turn onto the next-turn
+/// FIFO, so a later `RunBound` cannot deliver a newer message ahead of it.
+/// Keeping this branch shared by the event loop and its regression test is
+/// deliberate: this path must not open a remote guidance submission.
+fn defer_follow_up_before_run_bind(
+    text: &str,
+    remote_run_id: Option<&str>,
+    follow_up_deferred_before_bind: &mut bool,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+) -> bool {
+    if !follow_up_waits_for_unbound_run(remote_run_id) {
+        return false;
+    }
+    if bottom_pane.queue_next_turn_submission(text.to_string()) {
+        *follow_up_deferred_before_bind = true;
+        chat_widget.commit_system(history_cell::system::SystemCell::info(
+            UNBOUND_RUN_FOLLOW_UP_NOTICE.to_string(),
+        ));
+    }
+    true
 }
 
 /// Handle the one active-run slash command that is a pure navigation action.
@@ -3303,6 +3339,9 @@ const RUN_INTENT_SETTLEMENT_FENCED_ERROR_CODE: &str = "run_intent_settlement_fen
 
 const SETTLEMENT_FENCED_FOLLOW_UP_NOTICE: &str =
     "This run is settling. Your message is queued and will be sent as the next turn.";
+
+const UNBOUND_RUN_FOLLOW_UP_NOTICE: &str =
+    "The current run is starting. Your message is queued and will be sent as the next turn.";
 
 #[derive(Debug, PartialEq, Eq)]
 enum GuidanceSubmissionError {
@@ -8228,6 +8267,10 @@ pub(crate) async fn run_tui_session(
                                     // Later input stays queued for the next turn. This does not
                                     // mean the visible reply has settled.
                                     let mut guidance_admission_closed = false;
+                                    // Set when a model-facing follow-up was queued before
+                                    // RunBound. Later plain text stays behind it for this
+                                    // turn. Slash-only queue entries must not set this.
+                                    let mut follow_up_deferred_before_bind = false;
                                     // Queue length when the in-flight guidance was submitted.
                                     // A delayed fence inserts there, ahead of messages queued
                                     // while that POST was still pending.
@@ -8887,13 +8930,39 @@ pub(crate) async fn run_tui_session(
                                                                             output_settled_at.is_some(),
                                                                             foreground_lifecycle_transferred,
                                                                             guidance_admission_closed,
+                                                                            follow_up_deferred_before_bind,
                                                                         ) {
                                                                             // The response stream has ended, foreground
-                                                                            // ownership has moved, or the server has
-                                                                            // fenced current-run guidance. Hold the
-                                                                            // text until this turn hands ownership
-                                                                            // back; do not post it to the fenced run.
+                                                                            // ownership has moved, the server has
+                                                                            // fenced current-run guidance, or an
+                                                                            // earlier follow-up is already waiting
+                                                                            // for RunBound. Hold the text until this
+                                                                            // turn hands ownership back.
                                                                             bottom_pane.queue_next_turn_submission(queued_text);
+                                                                            frame_requester.schedule_frame();
+                                                                            continue;
+                                                                        }
+                                                                        let remote_run_id = astra_core::sync_poison::recover_mutex_lock(
+                                                                            &active_remote_run_id,
+                                                                        )
+                                                                        .clone();
+                                                                        if defer_follow_up_before_run_bind(
+                                                                            &queued_text,
+                                                                            remote_run_id.as_deref(),
+                                                                            &mut follow_up_deferred_before_bind,
+                                                                            &mut bottom_pane,
+                                                                            &mut chat_widget,
+                                                                        ) {
+                                                                            let w = guard
+                                                                                .terminal
+                                                                                .size()
+                                                                                .map(|s| s.width)
+                                                                                .unwrap_or(80);
+                                                                            flush_chat_widget(
+                                                                                &mut guard,
+                                                                                &mut chat_widget,
+                                                                                w,
+                                                                            );
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
@@ -13826,19 +13895,96 @@ mod tests {
             false,
             false,
             false,
+            false,
         ));
         assert!(active_submission_routes_to_next_turn(
             "list my workspaces",
             false,
             false,
             true,
+            false,
         ));
         assert!(active_submission_routes_to_next_turn(
             "please continue",
             true,
             false,
             false,
+            false,
         ));
+        assert!(active_submission_routes_to_next_turn(
+            "再加测试",
+            false,
+            false,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn unbound_run_holds_follow_up_for_the_next_turn() {
+        assert!(follow_up_waits_for_unbound_run(None));
+        assert!(follow_up_waits_for_unbound_run(Some("")));
+        assert!(follow_up_waits_for_unbound_run(Some("   ")));
+        assert!(!follow_up_waits_for_unbound_run(Some("run-1")));
+
+        let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = chat_widget::ChatWidget::new("");
+        let mut deferred = false;
+        assert!(defer_follow_up_before_run_bind(
+            "用 Python 写",
+            None,
+            &mut deferred,
+            &mut bottom_pane,
+            &mut chat_widget,
+        ));
+        assert!(deferred);
+        assert!(run_control.pending_remote_submission_ids().is_empty());
+        assert_eq!(bottom_pane.pending_user_intent_count(), 0);
+
+        // RunBound flips the id, but the latch keeps the newer message behind A.
+        assert!(!defer_follow_up_before_run_bind(
+            "再加测试",
+            Some("run-1"),
+            &mut deferred,
+            &mut bottom_pane,
+            &mut chat_widget,
+        ));
+        assert!(active_submission_routes_to_next_turn(
+            "再加测试",
+            false,
+            false,
+            false,
+            deferred,
+        ));
+        assert!(bottom_pane.queue_next_turn_submission("再加测试".to_string()));
+        assert!(run_control.pending_remote_submission_ids().is_empty());
+
+        // A slash command already queued must not itself arm the latch.
+        let mut slash_only = BottomPane::new();
+        let mut slash_deferred = false;
+        assert!(slash_only.queue_next_turn_submission("/status".to_string()));
+        assert!(!defer_follow_up_before_run_bind(
+            "plain text after slash",
+            Some("run-1"),
+            &mut slash_deferred,
+            &mut slash_only,
+            &mut chat_widget,
+        ));
+        assert!(!slash_deferred);
+
+        let mut queued = bottom_pane.take_queued_next_turn_submissions();
+        let mut followups = std::collections::VecDeque::new();
+        assert!(
+            settle_followup_submissions(&mut followups, std::iter::empty(), &mut queued, true)
+                .is_none()
+        );
+        assert_eq!(
+            followups.into_iter().collect::<Vec<_>>(),
+            vec!["用 Python 写".to_string(), "再加测试".to_string()]
+        );
+        assert!(!UNBOUND_RUN_FOLLOW_UP_NOTICE.contains("HTTP"));
+        assert!(UNBOUND_RUN_FOLLOW_UP_NOTICE.contains("queued"));
     }
 
     #[test]
