@@ -2978,6 +2978,56 @@ fn followup_release_gate(
     }
 }
 
+fn turn_settlement_followup_handoff(
+    queued_followup_submissions: &mut VecDeque<String>,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+    model_catalog_loading: bool,
+    background_reads_in_flight: usize,
+) -> QueuedFollowupHandoff {
+    handoff_queued_followups(
+        queued_followup_submissions,
+        bottom_pane,
+        chat_widget,
+        followup_release_gate(model_catalog_loading, background_reads_in_flight),
+    )
+}
+
+fn followup_gate_after_auth(
+    before_session_id: Option<&str>,
+    before_epoch: u64,
+    after_session_id: Option<&str>,
+    after_epoch: u64,
+    model_catalog_loading: bool,
+    background_reads_in_flight: usize,
+) -> FollowupReleaseGate {
+    FollowupReleaseGate {
+        session_rebound: before_session_id != after_session_id || before_epoch != after_epoch,
+        ..followup_release_gate(model_catalog_loading, background_reads_in_flight)
+    }
+}
+
+/// A cancelled read will not reach the completion handoff. Put the held
+/// backlog back in the composer so a later manual submit cannot pass it.
+fn recover_queued_followups_after_cancelled_read(
+    queued_followup_submissions: &mut VecDeque<String>,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+) -> bool {
+    if queued_followup_submissions.is_empty() {
+        return false;
+    }
+    let restored = std::mem::take(queued_followup_submissions)
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    bottom_pane.restore_into_composer(&restored);
+    chat_widget.commit_system(history_cell::system::SystemCell::info(
+        "A queued message was kept in the composer after the background action was stopped. Review it before sending.".to_string(),
+    ));
+    true
+}
+
 fn primary_guidance_disposition_event(
     event: astra_thin_client::StreamEvent,
     expected_run_id: &str,
@@ -7236,6 +7286,11 @@ pub(crate) async fn run_tui_session(
                         slash_background_read_tasks.abort_all();
                         slash_background_read_count = 0;
                         slash_background_read_generation = slash_background_read_generation.wrapping_add(1);
+                        recover_queued_followups_after_cancelled_read(
+                            &mut queued_followup_submissions,
+                            &mut bottom_pane,
+                            &mut chat_widget,
+                        );
                         let uc = matches!(method, LoginMethod::Uc(_));
                         let api = api.clone();
                         let profile = profile.map(str::to_owned);
@@ -7731,6 +7786,11 @@ pub(crate) async fn run_tui_session(
                             slash_background_read_count = 0;
                             slash_background_read_generation =
                                 slash_background_read_generation.wrapping_add(1);
+                            recover_queued_followups_after_cancelled_read(
+                                &mut queued_followup_submissions,
+                                &mut bottom_pane,
+                                &mut chat_widget,
+                            );
                             chat_widget.commit_system(history_cell::system::SystemCell::info(
                                 format!(
                                     "Stopped waiting for {dismissed} background action(s). Work already launched locally may finish separately, but its result will not interrupt this session."
@@ -10459,26 +10519,31 @@ pub(crate) async fn run_tui_session(
                                     tui_cancel_token = new_tok.clone();
                                     state.tui_cancel_token = Some(new_tok);
 
-                                    // A user may keep typing while a queued follow-up is waiting.
-                                    // Preserve that draft instead of replacing it; the queued text
-                                    // is restored beside it so neither intent is silently lost.
-                                    match release_next_queued_followup(
+                                    // The same gate used by modal completion. An open view,
+                                    // catalog load, or background read must keep the
+                                    // follow-up queued so a synthetic Enter cannot be
+                                    // consumed by that view.
+                                    let handoff = turn_settlement_followup_handoff(
                                         &mut queued_followup_submissions,
                                         &mut bottom_pane,
                                         &mut chat_widget,
+                                        model_catalog_loading,
+                                        slash_background_read_count,
+                                    );
+                                    if handoff == QueuedFollowupHandoff::SubmitNext {
+                                        event_stream.push_front(TuiEvent::Key(
+                                            crossterm::event::KeyEvent::new(
+                                                crossterm::event::KeyCode::Enter,
+                                                crossterm::event::KeyModifiers::NONE,
+                                            ),
+                                        ));
+                                    }
+                                    if matches!(
+                                        handoff,
+                                        QueuedFollowupHandoff::HeldWithDraft
+                                            | QueuedFollowupHandoff::RestoredAfterSessionChange
                                     ) {
-                                        QueuedFollowupRelease::SubmitNext => {
-                                            event_stream.push_front(TuiEvent::Key(
-                                                crossterm::event::KeyEvent::new(
-                                                    crossterm::event::KeyCode::Enter,
-                                                    crossterm::event::KeyModifiers::NONE,
-                                                ),
-                                            ));
-                                        }
-                                        QueuedFollowupRelease::HeldWithDraft => {
-                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                        }
-                                        QueuedFollowupRelease::Idle => {}
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
                                     }
 
                                 }
@@ -10587,6 +10652,8 @@ pub(crate) async fn run_tui_session(
                                         continue;
                                     }
                                     if let bottom_pane::view::ViewResult::Login { username, password } = &result {
+                                        let auth_session_id = state.session_id.clone();
+                                        let auth_epoch = state.session_attachment_epoch;
                                         match crate::cli::auth_flow::do_login_for_session(api, profile, username, password, &mut state).await {
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
@@ -10622,7 +10689,11 @@ pub(crate) async fn run_tui_session(
                                             &mut bottom_pane,
                                             &mut chat_widget,
                                             &mut event_stream,
-                                            followup_release_gate(
+                                            followup_gate_after_auth(
+                                                auth_session_id.as_deref(),
+                                                auth_epoch,
+                                                state.session_id.as_deref(),
+                                                state.session_attachment_epoch,
                                                 model_catalog_loading,
                                                 slash_background_read_count,
                                             ),
@@ -10634,6 +10705,8 @@ pub(crate) async fn run_tui_session(
                                         continue;
                                     }
                                     if let bottom_pane::view::ViewResult::Register { username, email, password } = &result {
+                                        let auth_session_id = state.session_id.clone();
+                                        let auth_epoch = state.session_attachment_epoch;
                                         match crate::cli::auth_flow::do_register_for_session(api, profile, username, email, password, &mut state).await {
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Registered and logged in as {username}")));
@@ -10669,7 +10742,11 @@ pub(crate) async fn run_tui_session(
                                             &mut bottom_pane,
                                             &mut chat_widget,
                                             &mut event_stream,
-                                            followup_release_gate(
+                                            followup_gate_after_auth(
+                                                auth_session_id.as_deref(),
+                                                auth_epoch,
+                                                state.session_id.as_deref(),
+                                                state.session_attachment_epoch,
                                                 model_catalog_loading,
                                                 slash_background_read_count,
                                             ),
@@ -14476,6 +14553,67 @@ mod tests {
         );
         assert!(queued.is_empty());
         assert_eq!(pane.composer.text().trim(), "plain A");
+    }
+
+    #[test]
+    fn turn_settlement_keeps_followup_queued_while_tasks_view_is_open() {
+        use bottom_pane::background_task_view::BackgroundTaskView;
+
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut pane = BottomPane::new();
+        let mut chat = chat_widget::ChatWidget::new("");
+        pane.push_view(Box::new(BackgroundTaskView::new(Vec::new())));
+        assert!(pane.has_active_view());
+        assert_eq!(
+            turn_settlement_followup_handoff(&mut queued, &mut pane, &mut chat, false, 0),
+            QueuedFollowupHandoff::Held
+        );
+        assert_eq!(queued, VecDeque::from(["plain A".to_string()]));
+        assert!(pane.composer.is_empty());
+    }
+
+    #[test]
+    fn cancelled_background_read_restores_the_held_followup() {
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut pane = BottomPane::new();
+        let mut chat = chat_widget::ChatWidget::new("");
+        assert!(recover_queued_followups_after_cancelled_read(
+            &mut queued,
+            &mut pane,
+            &mut chat
+        ));
+        assert!(queued.is_empty());
+        assert_eq!(pane.composer.text().trim(), "plain A");
+        assert!(!recover_queued_followups_after_cancelled_read(
+            &mut queued,
+            &mut pane,
+            &mut chat
+        ));
+    }
+
+    #[test]
+    fn auth_session_change_restores_followup_and_same_session_can_submit() {
+        let changed = followup_gate_after_auth(Some("old"), 1, Some("new"), 2, false, 0);
+        assert!(changed.session_rebound);
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut pane = BottomPane::new();
+        let mut chat = chat_widget::ChatWidget::new("");
+        assert_eq!(
+            handoff_queued_followups(&mut queued, &mut pane, &mut chat, changed),
+            QueuedFollowupHandoff::RestoredAfterSessionChange
+        );
+        assert!(queued.is_empty());
+        assert_eq!(pane.composer.text().trim(), "plain A");
+
+        let same = followup_gate_after_auth(Some("same"), 4, Some("same"), 4, false, 0);
+        assert!(!same.session_rebound);
+        let mut queued = VecDeque::from(["plain B".to_string()]);
+        let mut pane = BottomPane::new();
+        assert_eq!(
+            handoff_queued_followups(&mut queued, &mut pane, &mut chat, same),
+            QueuedFollowupHandoff::SubmitNext
+        );
+        assert_eq!(pane.composer.text().trim(), "plain B");
     }
 
     #[test]
