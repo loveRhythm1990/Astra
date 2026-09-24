@@ -307,17 +307,19 @@ pub(crate) enum InteractiveTurnOutcome {
     /// Authentication or another startup gate stopped the turn before it ran.
     NotStarted,
     /// The turn was attempted and settled as failed or interrupted.
-    Failed,
+    /// Usage already captured for that attempt stays with the outcome.
+    Failed(Option<Box<TurnUsage>>),
 }
 
 fn interactive_outcome(
     settlement: TurnSettlementOutcome,
     usage: Option<TurnUsage>,
 ) -> InteractiveTurnOutcome {
+    let usage = usage.map(Box::new);
     match settlement {
-        TurnSettlementOutcome::Succeeded => InteractiveTurnOutcome::Completed(usage.map(Box::new)),
+        TurnSettlementOutcome::Succeeded => InteractiveTurnOutcome::Completed(usage),
         TurnSettlementOutcome::Interrupted | TurnSettlementOutcome::Failed => {
-            InteractiveTurnOutcome::Failed
+            InteractiveTurnOutcome::Failed(usage)
         }
     }
 }
@@ -690,12 +692,46 @@ mod tests {
         assert_eq!(ui.restored_inputs, vec!["replayed follow-up".to_string()]);
         assert!(matches!(
             interactive_outcome(TurnSettlementOutcome::Failed, None),
-            InteractiveTurnOutcome::Failed
+            InteractiveTurnOutcome::Failed(None)
         ));
         assert!(matches!(
             interactive_outcome(TurnSettlementOutcome::Succeeded, None),
             InteractiveTurnOutcome::Completed(None)
         ));
+    }
+
+    #[test]
+    fn failed_and_interrupted_settlement_keep_partial_usage() {
+        let partial = crate::PartialTurnData {
+            prompt_tokens: 12,
+            completion_tokens: 3,
+            cache_read_tokens: 4,
+            cache_creation_tokens: 1,
+            usage_attribution: UsageAttribution {
+                auxiliary_capture_unavailable: true,
+                ..UsageAttribution::default()
+            },
+            ..Default::default()
+        };
+        let usage = TurnUsage::from_partial(&partial).expect("partial usage must be retained");
+
+        match interactive_outcome(TurnSettlementOutcome::Failed, Some(usage.clone())) {
+            InteractiveTurnOutcome::Failed(Some(kept)) => {
+                assert_eq!(kept.prompt_tokens, 12);
+                assert_eq!(kept.completion_tokens, 3);
+                assert_eq!(kept.cache_read_tokens, 4);
+                assert_eq!(kept.cache_creation_tokens, 1);
+                assert!(kept.usage_attribution.auxiliary_capture_unavailable);
+            }
+            other => panic!("failed settlement dropped usage: {other:?}"),
+        }
+        match interactive_outcome(TurnSettlementOutcome::Interrupted, Some(usage)) {
+            InteractiveTurnOutcome::Failed(Some(kept)) => {
+                assert_eq!(kept.prompt_tokens, 12);
+                assert!(kept.usage_observed);
+            }
+            other => panic!("interrupted settlement dropped usage: {other:?}"),
+        }
     }
 
     #[tokio::test]

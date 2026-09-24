@@ -2895,22 +2895,86 @@ fn release_next_queued_followup(
     QueuedFollowupRelease::Idle
 }
 
+/// Facts that decide whether a queued follow-up may leave the FIFO.
+///
+/// An empty view stack is not enough: the command that was ahead of the
+/// backlog may still be loading, and a Session rebind must not send the
+/// previous conversation's text.
+#[derive(Clone, Copy)]
+struct FollowupReleaseGate {
+    model_catalog_loading: bool,
+    background_reads_in_flight: bool,
+    session_rebound: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum QueuedFollowupHandoff {
+    SubmitNext,
+    HeldWithDraft,
+    RestoredAfterSessionChange,
+    Held,
+    Idle,
+}
+
+fn handoff_queued_followups(
+    queued_followup_submissions: &mut VecDeque<String>,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+    gate: FollowupReleaseGate,
+) -> QueuedFollowupHandoff {
+    if gate.session_rebound {
+        if queued_followup_submissions.is_empty() {
+            return QueuedFollowupHandoff::Idle;
+        }
+        let restored = std::mem::take(queued_followup_submissions)
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        bottom_pane.restore_into_composer(&restored);
+        chat_widget.commit_system(history_cell::system::SystemCell::info(
+            "A message queued for the previous Session was kept in the composer after the Session changed. Review it before sending.".to_string(),
+        ));
+        return QueuedFollowupHandoff::RestoredAfterSessionChange;
+    }
+    if bottom_pane.has_active_view()
+        || gate.model_catalog_loading
+        || gate.background_reads_in_flight
+    {
+        return QueuedFollowupHandoff::Held;
+    }
+    match release_next_queued_followup(queued_followup_submissions, bottom_pane, chat_widget) {
+        QueuedFollowupRelease::SubmitNext => QueuedFollowupHandoff::SubmitNext,
+        QueuedFollowupRelease::HeldWithDraft => QueuedFollowupHandoff::HeldWithDraft,
+        QueuedFollowupRelease::Idle => QueuedFollowupHandoff::Idle,
+    }
+}
+
 fn resume_queued_followups_after_modal(
     queued_followup_submissions: &mut VecDeque<String>,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
     event_stream: &mut TuiEventStream,
-) {
-    if bottom_pane.has_active_view() {
-        return;
-    }
-    if release_next_queued_followup(queued_followup_submissions, bottom_pane, chat_widget)
-        == QueuedFollowupRelease::SubmitNext
-    {
+    gate: FollowupReleaseGate,
+) -> QueuedFollowupHandoff {
+    let handoff =
+        handoff_queued_followups(queued_followup_submissions, bottom_pane, chat_widget, gate);
+    if handoff == QueuedFollowupHandoff::SubmitNext {
         event_stream.push_front(TuiEvent::Key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Enter,
             crossterm::event::KeyModifiers::NONE,
         )));
+    }
+    handoff
+}
+
+fn followup_release_gate(
+    model_catalog_loading: bool,
+    background_reads_in_flight: usize,
+) -> FollowupReleaseGate {
+    FollowupReleaseGate {
+        model_catalog_loading,
+        background_reads_in_flight: background_reads_in_flight > 0,
+        session_rebound: false,
     }
 }
 
@@ -7320,6 +7384,13 @@ pub(crate) async fn run_tui_session(
                     &mut bottom_pane,
                     &mut chat_widget,
                 );
+                resume_queued_followups_after_modal(
+                    &mut queued_followup_submissions,
+                    &mut bottom_pane,
+                    &mut chat_widget,
+                    &mut event_stream,
+                    followup_release_gate(model_catalog_loading, slash_background_read_count),
+                );
                 let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
                 flush_chat_widget(&mut guard, &mut chat_widget, width);
                 bottom_pane.sync_popups();
@@ -7540,6 +7611,7 @@ pub(crate) async fn run_tui_session(
                     &mut bottom_pane,
                     &mut chat_widget,
                     &mut event_stream,
+                    followup_release_gate(model_catalog_loading, slash_background_read_count),
                 );
                 frame_requester.schedule_frame();
             }
@@ -7555,6 +7627,7 @@ pub(crate) async fn run_tui_session(
                     &mut bottom_pane,
                     &mut chat_widget,
                     &mut event_stream,
+                    followup_release_gate(model_catalog_loading, slash_background_read_count),
                 );
                 frame_requester.schedule_frame();
             }
@@ -8236,28 +8309,31 @@ pub(crate) async fn run_tui_session(
                                     );
                                     let session_changed = state.session_id != pre_sid
                                         || state.session_attachment_epoch != pre_attachment_epoch;
-                                    if local_slash_releases_followups(
-                                        slash_handled_locally,
-                                        session_changed,
-                                        bottom_pane.has_active_view(),
-                                    ) {
-                                        match release_next_queued_followup(
+                                    let mut followup_gate = followup_release_gate(
+                                        model_catalog_loading,
+                                        slash_background_read_count,
+                                    );
+                                    followup_gate.session_rebound = session_changed;
+                                    if session_changed
+                                        || local_slash_releases_followups(
+                                            slash_handled_locally,
+                                            session_changed,
+                                            bottom_pane.has_active_view(),
+                                        )
+                                    {
+                                        let handoff = resume_queued_followups_after_modal(
                                             &mut queued_followup_submissions,
                                             &mut bottom_pane,
                                             &mut chat_widget,
+                                            &mut event_stream,
+                                            followup_gate,
+                                        );
+                                        if matches!(
+                                            handoff,
+                                            QueuedFollowupHandoff::HeldWithDraft
+                                                | QueuedFollowupHandoff::RestoredAfterSessionChange
                                         ) {
-                                            QueuedFollowupRelease::SubmitNext => {
-                                                event_stream.push_front(TuiEvent::Key(
-                                                    crossterm::event::KeyEvent::new(
-                                                        crossterm::event::KeyCode::Enter,
-                                                        crossterm::event::KeyModifiers::NONE,
-                                                    ),
-                                                ));
-                                            }
-                                            QueuedFollowupRelease::HeldWithDraft => {
-                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                            }
-                                            QueuedFollowupRelease::Idle => {}
+                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
                                         }
                                     }
                                     frame_requester.schedule_frame();
@@ -10274,9 +10350,14 @@ pub(crate) async fn run_tui_session(
                                     // them while this turn is in flight. This also avoids unsigned
                                     // underflow when a late recovery projection rewinds counters.
                                     let turn_usage = match turn_result.as_ref() {
-                                        Ok(crate::cli::turn::turn_entry::InteractiveTurnOutcome::Completed(usage)) => {
-                                            usage.clone().map(|usage| *usage)
-                                        }
+                                        Ok(
+                                            crate::cli::turn::turn_entry::InteractiveTurnOutcome::Completed(
+                                                usage,
+                                            )
+                                            | crate::cli::turn::turn_entry::InteractiveTurnOutcome::Failed(
+                                                usage,
+                                            ),
+                                        ) => usage.clone().map(|usage| *usage),
                                         _ => None,
                                     };
                                     let primary_usage = turn_usage.as_ref().map_or_else(
@@ -10443,6 +10524,7 @@ pub(crate) async fn run_tui_session(
                                 .await;
                             }
                             BottomPaneAction::ViewCompleted { result, reopen } => {
+                                let mut followup_session_rebound = false;
                                 if let Some(result) = result {
                                     if let bottom_pane::view::ViewResult::WorkspaceTrust(choice) = &result {
                                         match choice {
@@ -10488,6 +10570,16 @@ pub(crate) async fn run_tui_session(
                                             }
                                         }
                                         pending_deferred_slash_flush = false;
+                                        resume_queued_followups_after_modal(
+                                            &mut queued_followup_submissions,
+                                            &mut bottom_pane,
+                                            &mut chat_widget,
+                                            &mut event_stream,
+                                            followup_release_gate(
+                                                model_catalog_loading,
+                                                slash_background_read_count,
+                                            ),
+                                        );
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
                                         bottom_pane.sync_popups();
@@ -10525,6 +10617,16 @@ pub(crate) async fn run_tui_session(
                                             }
                                         }
                                         pending_deferred_slash_flush = false;
+                                        resume_queued_followups_after_modal(
+                                            &mut queued_followup_submissions,
+                                            &mut bottom_pane,
+                                            &mut chat_widget,
+                                            &mut event_stream,
+                                            followup_release_gate(
+                                                model_catalog_loading,
+                                                slash_background_read_count,
+                                            ),
+                                        );
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
                                         bottom_pane.sync_popups();
@@ -10562,6 +10664,16 @@ pub(crate) async fn run_tui_session(
                                             }
                                         }
                                         pending_deferred_slash_flush = false;
+                                        resume_queued_followups_after_modal(
+                                            &mut queued_followup_submissions,
+                                            &mut bottom_pane,
+                                            &mut chat_widget,
+                                            &mut event_stream,
+                                            followup_release_gate(
+                                                model_catalog_loading,
+                                                slash_background_read_count,
+                                            ),
+                                        );
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
                                         bottom_pane.sync_popups();
@@ -10608,6 +10720,16 @@ pub(crate) async fn run_tui_session(
                                             Err(e) => history_cell::system::SystemCell::error(e),
                                         };
                                         chat_widget.commit_system(msg);
+                                        resume_queued_followups_after_modal(
+                                            &mut queued_followup_submissions,
+                                            &mut bottom_pane,
+                                            &mut chat_widget,
+                                            &mut event_stream,
+                                            followup_release_gate(
+                                                model_catalog_loading,
+                                                slash_background_read_count,
+                                            ),
+                                        );
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
                                         bottom_pane.sync_popups();
@@ -10657,6 +10779,10 @@ pub(crate) async fn run_tui_session(
                                                 &mut bottom_pane,
                                                 &mut chat_widget,
                                                 &mut event_stream,
+                                                followup_release_gate(
+                                                    model_catalog_loading,
+                                                    slash_background_read_count,
+                                                ),
                                             );
                                         } else {
                                             use crate::tui::bottom_pane::list_selection_view::{
@@ -10728,6 +10854,10 @@ pub(crate) async fn run_tui_session(
                                             &mut bottom_pane,
                                             &mut chat_widget,
                                             &mut event_stream,
+                                            followup_release_gate(
+                                                model_catalog_loading,
+                                                slash_background_read_count,
+                                            ),
                                         );
                                         bottom_pane.sync_popups();
                                         frame_requester.schedule_frame();
@@ -10908,6 +11038,7 @@ pub(crate) async fn run_tui_session(
                                         }
                                         let session_rebound = state.session_id != pre_sid
                                             || state.session_attachment_epoch != pre_attachment_epoch;
+                                        followup_session_rebound = session_rebound;
                                         let restored_work_submissions = if session_rebound {
                                             restore_work_start_submissions_after_scope_change(
                                                 &mut pending_work_start_submissions,
@@ -11032,6 +11163,11 @@ pub(crate) async fn run_tui_session(
                                     &mut bottom_pane,
                                     &mut chat_widget,
                                     &mut event_stream,
+                                    FollowupReleaseGate {
+                                        model_catalog_loading,
+                                        background_reads_in_flight: slash_background_read_count > 0,
+                                        session_rebound: followup_session_rebound,
+                                    },
                                 );
                             }
                             BottomPaneAction::Interrupt | BottomPaneAction::Quit => { break 'main Ok(()); }
@@ -14202,6 +14338,144 @@ mod tests {
             QueuedFollowupRelease::SubmitNext
         ));
         assert_eq!(closed_pane.composer.text().trim(), "plain A");
+    }
+
+    #[test]
+    fn unrelated_view_close_holds_followup_while_model_catalog_loads() {
+        use bottom_pane::help_view::HelpView;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut pane = BottomPane::new();
+        let mut chat = chat_widget::ChatWidget::new("");
+        pane.push_view(Box::new(HelpView::new()));
+        let loading = FollowupReleaseGate {
+            model_catalog_loading: true,
+            background_reads_in_flight: false,
+            session_rebound: false,
+        };
+        assert_eq!(
+            handoff_queued_followups(&mut queued, &mut pane, &mut chat, loading),
+            QueuedFollowupHandoff::Held
+        );
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            bottom_pane::BottomPaneAction::ViewCompleted { .. }
+        ));
+        assert!(!pane.has_active_view());
+        assert_eq!(
+            handoff_queued_followups(&mut queued, &mut pane, &mut chat, loading),
+            QueuedFollowupHandoff::Held
+        );
+        assert_eq!(queued, VecDeque::from(["plain A".to_string()]));
+
+        let ready = FollowupReleaseGate {
+            model_catalog_loading: false,
+            ..loading
+        };
+        assert_eq!(
+            handoff_queued_followups(&mut queued, &mut pane, &mut chat, ready),
+            QueuedFollowupHandoff::SubmitNext
+        );
+        assert_eq!(pane.composer.text().trim(), "plain A");
+    }
+
+    #[test]
+    fn config_cancel_releases_the_following_backlog() {
+        use astra_config::runtime_config::RuntimeConfig;
+        use bottom_pane::config_edit_view::ConfigEditView;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut pane = BottomPane::new();
+        let mut chat = chat_widget::ChatWidget::new("");
+        pane.push_view(Box::new(ConfigEditView::new(RuntimeConfig::default())));
+        assert_eq!(
+            handoff_queued_followups(
+                &mut queued,
+                &mut pane,
+                &mut chat,
+                FollowupReleaseGate {
+                    model_catalog_loading: false,
+                    background_reads_in_flight: false,
+                    session_rebound: false,
+                },
+            ),
+            QueuedFollowupHandoff::Held
+        );
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            bottom_pane::BottomPaneAction::ViewCompleted {
+                result: Some(bottom_pane::view::ViewResult::ConfigEdit { .. }),
+                ..
+            }
+        ));
+        assert_eq!(
+            handoff_queued_followups(
+                &mut queued,
+                &mut pane,
+                &mut chat,
+                FollowupReleaseGate {
+                    model_catalog_loading: false,
+                    background_reads_in_flight: false,
+                    session_rebound: false,
+                },
+            ),
+            QueuedFollowupHandoff::SubmitNext
+        );
+        assert_eq!(pane.composer.text().trim(), "plain A");
+    }
+
+    #[test]
+    fn background_read_in_flight_holds_followup_until_it_finishes() {
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut pane = BottomPane::new();
+        let mut chat = chat_widget::ChatWidget::new("");
+        let in_flight = FollowupReleaseGate {
+            model_catalog_loading: false,
+            background_reads_in_flight: true,
+            session_rebound: false,
+        };
+        assert_eq!(
+            handoff_queued_followups(&mut queued, &mut pane, &mut chat, in_flight),
+            QueuedFollowupHandoff::Held
+        );
+        assert!(queued.iter().eq(["plain A".to_string()].iter()));
+        assert_eq!(
+            handoff_queued_followups(
+                &mut queued,
+                &mut pane,
+                &mut chat,
+                FollowupReleaseGate {
+                    background_reads_in_flight: false,
+                    ..in_flight
+                },
+            ),
+            QueuedFollowupHandoff::SubmitNext
+        );
+        assert_eq!(pane.composer.text().trim(), "plain A");
+    }
+
+    #[test]
+    fn session_rebind_restores_followup_instead_of_submitting() {
+        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut pane = BottomPane::new();
+        let mut chat = chat_widget::ChatWidget::new("");
+        assert_eq!(
+            handoff_queued_followups(
+                &mut queued,
+                &mut pane,
+                &mut chat,
+                FollowupReleaseGate {
+                    model_catalog_loading: false,
+                    background_reads_in_flight: false,
+                    session_rebound: true,
+                },
+            ),
+            QueuedFollowupHandoff::RestoredAfterSessionChange
+        );
+        assert!(queued.is_empty());
+        assert_eq!(pane.composer.text().trim(), "plain A");
     }
 
     #[test]
