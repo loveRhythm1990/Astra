@@ -2864,6 +2864,7 @@ fn local_slash_releases_followups(
     handled_locally && !session_changed && !has_active_view
 }
 
+#[derive(PartialEq, Eq)]
 enum QueuedFollowupRelease {
     SubmitNext,
     HeldWithDraft,
@@ -2892,6 +2893,25 @@ fn release_next_queued_followup(
         return QueuedFollowupRelease::SubmitNext;
     }
     QueuedFollowupRelease::Idle
+}
+
+fn resume_queued_followups_after_modal(
+    queued_followup_submissions: &mut VecDeque<String>,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+    event_stream: &mut TuiEventStream,
+) {
+    if bottom_pane.has_active_view() {
+        return;
+    }
+    if release_next_queued_followup(queued_followup_submissions, bottom_pane, chat_widget)
+        == QueuedFollowupRelease::SubmitNext
+    {
+        event_stream.push_front(TuiEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+    }
 }
 
 fn primary_guidance_disposition_event(
@@ -7515,6 +7535,12 @@ pub(crate) async fn run_tui_session(
                     flush_chat_widget(&mut guard, &mut chat_widget, width);
                 }
                 bottom_pane.sync_popups();
+                resume_queued_followups_after_modal(
+                    &mut queued_followup_submissions,
+                    &mut bottom_pane,
+                    &mut chat_widget,
+                    &mut event_stream,
+                );
                 frame_requester.schedule_frame();
             }
             Some(Err(error)) = model_catalog_tasks.join_next(), if !model_catalog_tasks.is_empty() => {
@@ -7524,6 +7550,12 @@ pub(crate) async fn run_tui_session(
                 )));
                 let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
                 flush_chat_widget(&mut guard, &mut chat_widget, width);
+                resume_queued_followups_after_modal(
+                    &mut queued_followup_submissions,
+                    &mut bottom_pane,
+                    &mut chat_widget,
+                    &mut event_stream,
+                );
                 frame_requester.schedule_frame();
             }
             Some(effect) = startup_effect_rx.recv() => {
@@ -10146,8 +10178,12 @@ pub(crate) async fn run_tui_session(
                                         turn_result,
                                         Ok(crate::cli::turn::turn_entry::InteractiveTurnOutcome::NotStarted)
                                     );
+                                    let turn_succeeded = matches!(
+                                        turn_result,
+                                        Ok(crate::cli::turn::turn_entry::InteractiveTurnOutcome::Completed(_))
+                                    );
                                     let should_start_followups = should_start_queued_followups(
-                                        turn_result.is_ok(),
+                                        turn_succeeded,
                                         state.last_turn_interrupted,
                                         foreground_lifecycle_transferred,
                                         exit_after_turn_settlement,
@@ -10616,6 +10652,12 @@ pub(crate) async fn run_tui_session(
                                             pending_deferred_slash_flush = false;
                                             let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                             flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                            resume_queued_followups_after_modal(
+                                                &mut queued_followup_submissions,
+                                                &mut bottom_pane,
+                                                &mut chat_widget,
+                                                &mut event_stream,
+                                            );
                                         } else {
                                             use crate::tui::bottom_pane::list_selection_view::{
                                                 ListSelectionView, SelectionItem,
@@ -10681,6 +10723,12 @@ pub(crate) async fn run_tui_session(
                                         pending_deferred_slash_flush = false;
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        resume_queued_followups_after_modal(
+                                            &mut queued_followup_submissions,
+                                            &mut bottom_pane,
+                                            &mut chat_widget,
+                                            &mut event_stream,
+                                        );
                                         bottom_pane.sync_popups();
                                         frame_requester.schedule_frame();
                                         continue;
@@ -10979,6 +11027,12 @@ pub(crate) async fn run_tui_session(
                                     // as the Agents branch above.
                                     pending_deferred_slash_flush = false;
                                 }
+                                resume_queued_followups_after_modal(
+                                    &mut queued_followup_submissions,
+                                    &mut bottom_pane,
+                                    &mut chat_widget,
+                                    &mut event_stream,
+                                );
                             }
                             BottomPaneAction::Interrupt | BottomPaneAction::Quit => { break 'main Ok(()); }
                             BottomPaneAction::Consumed => {}
@@ -14128,6 +14182,26 @@ mod tests {
         );
         assert_eq!(restored.as_deref(), Some("queued during refresh"));
         assert!(auth_queue.is_empty());
+
+        let mut failed_queue = VecDeque::from(["after failed turn".to_string()]);
+        let mut failed_post = VecDeque::new();
+        let restored = settle_followup_submissions(
+            &mut failed_queue,
+            std::iter::empty(),
+            &mut failed_post,
+            should_start_queued_followups(false, false, false, false, false),
+        );
+        assert_eq!(restored.as_deref(), Some("after failed turn"));
+
+        let mut closed_view = VecDeque::from(["plain A".to_string()]);
+        let mut closed_pane = BottomPane::new();
+        let mut closed_chat = chat_widget::ChatWidget::new("");
+        assert!(!closed_pane.has_active_view());
+        assert!(matches!(
+            release_next_queued_followup(&mut closed_view, &mut closed_pane, &mut closed_chat),
+            QueuedFollowupRelease::SubmitNext
+        ));
+        assert_eq!(closed_pane.composer.text().trim(), "plain A");
     }
 
     #[test]

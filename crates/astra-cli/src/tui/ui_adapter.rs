@@ -61,27 +61,24 @@ impl ReplUiAdapter for TuiUiAdapter {
             session_id: session_id.map(str::to_string),
             submission_id: self.submission_id.clone(),
         };
-        match self.tx.try_send(TuiAppEvent::RestoreInput(request.clone())) {
-            Ok(()) => true,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                match self.restore_input_queue.lock() {
-                    Ok(mut queue) => {
-                        if queue
-                            .iter()
-                            .any(|pending| pending.submission_id == request.submission_id)
-                        {
-                            true
-                        } else {
-                            queue.push_back(request);
-                            true
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "TUI restore-input fallback queue unavailable");
-                        false
-                    }
+        let queued = match self.restore_input_queue.lock() {
+            Ok(mut queue) => {
+                if !queue
+                    .iter()
+                    .any(|pending| pending.submission_id == request.submission_id)
+                {
+                    queue.push_back(request.clone());
                 }
+                true
             }
+            Err(error) => {
+                tracing::warn!(%error, "TUI restore-input fallback queue unavailable");
+                false
+            }
+        };
+        match self.tx.try_send(TuiAppEvent::RestoreInput(request)) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => queued,
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 tracing::warn!(
                     "TUI application event queue closed before restoring rejected input"

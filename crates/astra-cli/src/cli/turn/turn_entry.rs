@@ -304,7 +304,22 @@ fn run_chat_turn_boxed<'a>(
 #[derive(Clone, Debug)]
 pub(crate) enum InteractiveTurnOutcome {
     Completed(Option<Box<TurnUsage>>),
+    /// Authentication or another startup gate stopped the turn before it ran.
     NotStarted,
+    /// The turn was attempted and settled as failed or interrupted.
+    Failed,
+}
+
+fn interactive_outcome(
+    settlement: TurnSettlementOutcome,
+    usage: Option<TurnUsage>,
+) -> InteractiveTurnOutcome {
+    match settlement {
+        TurnSettlementOutcome::Succeeded => InteractiveTurnOutcome::Completed(usage.map(Box::new)),
+        TurnSettlementOutcome::Interrupted | TurnSettlementOutcome::Failed => {
+            InteractiveTurnOutcome::Failed
+        }
+    }
 }
 
 pub(crate) async fn handle_chat_input(
@@ -367,6 +382,7 @@ pub(crate) async fn handle_chat_input_with_ui(
         Some(token) => token,
         None => {
             ui.show_warning("  Not logged in. Use /login to authenticate.");
+            let _ = ui.restore_input(&line, state.session_id.as_deref());
             return Ok(InteractiveTurnOutcome::NotStarted);
         }
     };
@@ -455,13 +471,11 @@ pub(crate) async fn handle_chat_input_with_ui(
             .pending_bg_notifications
             .extend(notifications_arriving_during_settlement);
     }
-    Ok(InteractiveTurnOutcome::Completed(
-        turn_usage_sink
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-            .map(Box::new),
-    ))
+    let usage = turn_usage_sink
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    Ok(interactive_outcome(settlement, usage))
 }
 
 /// Resume an idle root from runtime-owned background facts without inventing
@@ -561,13 +575,11 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         let consumed = notification_count.min(state.pending_bg_notifications.len());
         state.pending_bg_notifications.drain(..consumed);
     }
-    Ok(InteractiveTurnOutcome::Completed(
-        turn_usage_sink
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-            .map(Box::new),
-    ))
+    let usage = turn_usage_sink
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    Ok(interactive_outcome(settlement, usage))
 }
 
 pub(super) fn acquire_interactive_turn_admission(
@@ -644,14 +656,47 @@ async fn ensure_multi_agent_runtime_for_turn(
 
 #[cfg(test)]
 mod tests {
+    use super::super::turn_retry::TurnSettlementOutcome;
     use super::{
-        ShellPassthroughDecision, TurnContext, TurnUsage, acquire_interactive_turn_admission,
-        classify_shell_passthrough, ensure_interactive_session_identity,
-        ensure_multi_agent_runtime_for_turn, handle_chat_input_with_ui,
-        model_selection_preflight_failure,
+        InteractiveTurnOutcome, ShellPassthroughDecision, TurnContext, TurnUsage,
+        acquire_interactive_turn_admission, classify_shell_passthrough,
+        ensure_interactive_session_identity, ensure_multi_agent_runtime_for_turn,
+        handle_chat_input_with_ui, interactive_outcome, model_selection_preflight_failure,
     };
     use crate::cli::session::session_state::SessionState;
     use crate::cli::stream::streaming_types::UsageAttribution;
+
+    #[tokio::test]
+    async fn missing_token_restores_the_replayed_line_and_does_not_start() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+        let mut ui = crate::tests::TestUi::default();
+        let ctx = TurnContext {
+            api: &api,
+            profile: None,
+            post_commit_tx: None,
+            explain_analyze_terminal_degraded: None,
+        };
+        let outcome = handle_chat_input_with_ui(
+            "replayed follow-up".to_string(),
+            None,
+            &mut state,
+            ctx,
+            &mut ui,
+        )
+        .await
+        .expect("missing credentials are a handled startup failure");
+        assert!(matches!(outcome, InteractiveTurnOutcome::NotStarted));
+        assert_eq!(ui.restored_inputs, vec!["replayed follow-up".to_string()]);
+        assert!(matches!(
+            interactive_outcome(TurnSettlementOutcome::Failed, None),
+            InteractiveTurnOutcome::Failed
+        ));
+        assert!(matches!(
+            interactive_outcome(TurnSettlementOutcome::Succeeded, None),
+            InteractiveTurnOutcome::Completed(None)
+        ));
+    }
 
     #[tokio::test]
     async fn bound_interactive_session_is_not_resumed_before_the_next_turn() {
