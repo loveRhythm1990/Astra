@@ -430,7 +430,7 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
                 "offset",
                 "max_bytes",
             ][..],
-            "Observe. Server Explain: target=previous excludes current root; target=run needs run_id. Page via artifact.",
+            "question=label. Server Explain: explain={target:previous} OR artifact=handle; never both.",
         ),
         "reflect" => (
             &["question"][..],
