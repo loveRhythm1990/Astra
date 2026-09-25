@@ -18759,6 +18759,10 @@ async fn create_run_conflicts_when_same_session_already_has_active_run() {
     let err = err(svc.create_run("user-1".into(), second).await);
     assert_eq!(err.0, StatusCode::CONFLICT);
     assert_eq!(err.1.0.detail, "session already has an active run");
+    assert_eq!(
+        err.1.0.error_code.as_deref(),
+        Some("session_execution_slot_occupied")
+    );
 }
 
 #[tokio::test]
@@ -18793,6 +18797,10 @@ async fn stream_chat_conflicts_when_same_session_already_has_active_run() {
     let err = err(svc.stream_chat("user-1".into(), second).await);
     assert_eq!(err.0, StatusCode::CONFLICT);
     assert_eq!(err.1.0.detail, "session already has an active run");
+    assert_eq!(
+        err.1.0.error_code.as_deref(),
+        Some("session_execution_slot_occupied")
+    );
 }
 
 #[tokio::test]
@@ -26660,6 +26668,10 @@ async fn durable_resume_rejects_blocking_sibling_after_cache_miss() {
 
     assert_eq!(error.0, StatusCode::CONFLICT);
     assert_eq!(error.1.0.detail, "session already has an active run");
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("session_execution_slot_occupied")
+    );
     let durable = engine
         .load_run("user-1", "run-parent-blocked")
         .await
@@ -27655,6 +27667,51 @@ async fn submit_run_user_intent_rejects_terminal_durable_run() {
         )
         .await);
     assert_eq!(e.0, StatusCode::CONFLICT);
+    // A terminal-status conflict must carry the same stable code as the
+    // settlement fence, so the client can requeue this text as the next
+    // turn instead of treating it as a bare rejection (there is no "current
+    // run" left to guide either way).
+    assert_eq!(e.1.0.error_code.as_deref(), Some("run_intent_run_terminal"));
+}
+
+#[tokio::test]
+async fn submit_run_user_intent_rejects_paused_durable_run_without_terminal_code() {
+    // Paused is `Inactive` for guidance admission but is not a terminal
+    // status: the run may still resume, so this must keep the plain,
+    // uncoded rejection rather than being requeued as a next-turn message
+    // like a settlement fence or a genuinely finished run.
+    let svc = test_service();
+    let engine = &svc.run_engine;
+    engine
+        .start_run("run-paused-input", "user-1", "session-1")
+        .await
+        .unwrap();
+    engine
+        .persist_status(
+            "user-1",
+            "session-1",
+            "run-paused-input",
+            STATUS_PAUSED,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let e = err(svc
+        .submit_run_user_intent(
+            "run-paused-input".into(),
+            "user-1".into(),
+            RunUserIntentData {
+                intent_id: "intent-while-paused".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                input: json!({"content": "still paused"}),
+            },
+        )
+        .await);
+    assert_eq!(e.0, StatusCode::CONFLICT);
+    assert_eq!(e.1.0.detail, "Cannot submit input to run in 'paused' state");
+    assert_eq!(e.1.0.error_code, None);
 }
 
 #[tokio::test]

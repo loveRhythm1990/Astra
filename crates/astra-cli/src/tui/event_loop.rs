@@ -3413,8 +3413,8 @@ async fn submit_active_run_guidance(
                     GuidanceSubmissionError::Rejected(error) => {
                         return Err(GuidanceSubmissionError::Rejected(error));
                     }
-                    GuidanceSubmissionError::SettlementFenced => {
-                        return Err(GuidanceSubmissionError::SettlementFenced);
+                    GuidanceSubmissionError::GuidanceClosed(notice) => {
+                        return Err(GuidanceSubmissionError::GuidanceClosed(notice));
                     }
                     GuidanceSubmissionError::Unconfirmed(error) => {
                         last_unconfirmed = Some(error);
@@ -3571,8 +3571,23 @@ fn expire_guidance_closure_as_unconfirmed(
 /// guidance because the run is already settling. The submission did not commit.
 const RUN_INTENT_SETTLEMENT_FENCED_ERROR_CODE: &str = "run_intent_settlement_fenced";
 
+/// Machine code returned when the run had already reached a terminal status
+/// (completed/failed/cancelled/delegated) before this submission landed.
+/// Ownership never existed to transfer, so this is handled the same way as
+/// the settlement fence: requeue the text as the next turn.
+const RUN_INTENT_RUN_TERMINAL_ERROR_CODE: &str = "run_intent_run_terminal";
+
 const SETTLEMENT_FENCED_FOLLOW_UP_NOTICE: &str =
     "This run is settling. Your message is queued and will be sent as the next turn.";
+
+/// Terminal covers `cancelled` and `failed`, not just `completed`. Those two
+/// are exactly the cases where the turn also settles abnormally, and then
+/// `should_start_queued_followups` holds the backlog back and the text is
+/// restored to the composer instead. So this notice states what is true when
+/// it is printed — the text is on the next-turn queue — without promising a
+/// delivery the settlement path may not make.
+const RUN_TERMINAL_FOLLOW_UP_NOTICE: &str =
+    "That run has already finished. Your message was moved to the next-turn queue.";
 
 const UNBOUND_RUN_FOLLOW_UP_NOTICE: &str =
     "The current run is starting. Your message is queued and will be sent as the next turn.";
@@ -3581,10 +3596,13 @@ const UNBOUND_RUN_FOLLOW_UP_NOTICE: &str =
 enum GuidanceSubmissionError {
     /// The request is known not to have transferred ownership to the run.
     Rejected(String),
-    /// The server rolled this guidance back at the settlement fence. Ownership
-    /// did not transfer, so the original text can move to the next-turn queue.
-    /// Do not retry it against the fenced run.
-    SettlementFenced,
+    /// The server rolled this guidance back because current-run ownership is
+    /// gone — either the run fenced for settlement or it already reached a
+    /// terminal status. Either way ownership did not transfer, so the
+    /// original text can move to the next-turn queue instead of being
+    /// retried against a run that will never accept it. The carried notice
+    /// is the exact user-facing text for whichever case applied.
+    GuidanceClosed(&'static str),
     /// The request may have committed, but its acknowledgement was lost or
     /// malformed. Keep the stable local identity pending until durable run
     /// events settle it; never manufacture a second intent id.
@@ -3627,7 +3645,14 @@ impl GuidanceSubmissionError {
                     && api_error_code(body).as_deref()
                         == Some(RUN_INTENT_SETTLEMENT_FENCED_ERROR_CODE) =>
             {
-                Self::SettlementFenced
+                Self::GuidanceClosed(SETTLEMENT_FENCED_FOLLOW_UP_NOTICE)
+            }
+            astra_thin_client::ThinClientError::Api { status, ref body }
+                if status == reqwest::StatusCode::CONFLICT
+                    && api_error_code(body).as_deref()
+                        == Some(RUN_INTENT_RUN_TERMINAL_ERROR_CODE) =>
+            {
+                Self::GuidanceClosed(RUN_TERMINAL_FOLLOW_UP_NOTICE)
             }
             astra_thin_client::ThinClientError::Api { status, body }
                 if status.is_client_error() && status != reqwest::StatusCode::REQUEST_TIMEOUT =>
@@ -8842,7 +8867,7 @@ pub(crate) async fn run_tui_session(
                                                                 history_cell::system::SystemCell::error(error),
                                                             );
                                                         }
-                                                        Err(GuidanceSubmissionError::SettlementFenced) => {
+                                                        Err(GuidanceSubmissionError::GuidanceClosed(notice)) => {
                                                             let queue_index = submitted_queue_index.unwrap_or_else(
                                                                 || {
                                                                     bottom_pane
@@ -8860,8 +8885,7 @@ pub(crate) async fn run_tui_session(
                                                             if queued {
                                                                 chat_widget.commit_system(
                                                                     history_cell::system::SystemCell::info(
-                                                                        SETTLEMENT_FENCED_FOLLOW_UP_NOTICE
-                                                                            .to_string(),
+                                                                        notice.to_string(),
                                                                     ),
                                                                 );
                                                             }
@@ -17941,9 +17965,58 @@ mod tests {
                 .to_string(),
             },
         );
-        assert_eq!(fenced, GuidanceSubmissionError::SettlementFenced);
+        assert_eq!(
+            fenced,
+            GuidanceSubmissionError::GuidanceClosed(SETTLEMENT_FENCED_FOLLOW_UP_NOTICE)
+        );
         assert!(!SETTLEMENT_FENCED_FOLLOW_UP_NOTICE.contains("HTTP"));
         assert!(!SETTLEMENT_FENCED_FOLLOW_UP_NOTICE.contains("request_id"));
+
+        let run_terminal = GuidanceSubmissionError::from_thin_client(
+            astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::CONFLICT,
+                body: serde_json::json!({
+                    "detail": "This run has already finished and no longer accepts current-run guidance. Submit it as the next session turn instead.",
+                    "error_code": "run_intent_run_terminal",
+                    "request_id": "bdf2d58e521a46de78d71c3ecc5fdf8e"
+                })
+                .to_string(),
+            },
+        );
+        assert_eq!(
+            run_terminal,
+            GuidanceSubmissionError::GuidanceClosed(RUN_TERMINAL_FOLLOW_UP_NOTICE)
+        );
+        assert!(!RUN_TERMINAL_FOLLOW_UP_NOTICE.contains("HTTP"));
+        assert!(!RUN_TERMINAL_FOLLOW_UP_NOTICE.contains("request_id"));
+        // `cancelled`/`failed` are terminal too, and both settle the turn
+        // abnormally, so `should_start_queued_followups` will hold the
+        // backlog and restore this text to the composer instead of sending
+        // it. The notice must not promise a delivery that never happens.
+        assert!(!RUN_TERMINAL_FOLLOW_UP_NOTICE.contains("will be sent"));
+        assert!(!should_start_queued_followups(
+            false, false, false, false, false
+        ));
+        assert!(!should_start_queued_followups(
+            true, true, false, false, false
+        ));
+
+        // A conflict on the SAME run, but in a durable status this branch
+        // does not special-case (e.g. a manual pause), must keep falling
+        // through to a plain rejection. Only terminal statuses and the
+        // settlement fence get requeued to the next turn.
+        let unhandled_status_conflict =
+            GuidanceSubmissionError::from_thin_client(astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::CONFLICT,
+                body: serde_json::json!({
+                    "detail": "Cannot submit input to run in 'paused' state",
+                })
+                .to_string(),
+            });
+        assert!(matches!(
+            unhandled_status_conflict,
+            GuidanceSubmissionError::Rejected(_)
+        ));
 
         let identity_conflict =
             GuidanceSubmissionError::from_thin_client(astra_thin_client::ThinClientError::Api {

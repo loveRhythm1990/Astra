@@ -196,6 +196,17 @@ const DURABLE_LIVE_BATCH_MAX_BYTES: usize = 256 * 1024;
 const DURABLE_LIVE_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 const HOST_INTERACTION_COMMITTED_FIELD: &str = "_astra_host_interaction_committed";
 
+/// Machine code shared by every "session already has an active run" 409:
+/// the in-process `self.runs` admission guard in `create_run`/`stream_chat`,
+/// the durable insert conflict surfaced from `persist_run_start`, and the
+/// durable session-execution-slot check in `resume_run`. All four detect the
+/// same product-facing condition — this session's execution slot is held by
+/// another run — just at different layers (same-pod fast path vs. the
+/// cross-pod durable authority). The condition clears on its own once the
+/// run currently holding the slot reaches a non-blocking status; a client
+/// may treat this as retryable.
+const SESSION_EXECUTION_SLOT_OCCUPIED_ERROR_CODE: &str = "session_execution_slot_occupied";
+
 fn explain_artifact_publishable_status(status: RunStatus) -> bool {
     RunStatus::TERMINAL.contains(&status)
 }
@@ -7857,17 +7868,17 @@ impl AgenticRunLifecycleService {
             }
         };
         result.map_err(|error| {
-            let status = if error == "session already has an active run" {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::SERVICE_UNAVAILABLE
-            };
-            let detail = if status == StatusCode::CONFLICT {
-                error
-            } else {
-                format!("Failed to persist durable run start: {error}")
-            };
-            error_response(status, detail)
+            if error == "session already has an active run" {
+                return error_response_coded(
+                    StatusCode::CONFLICT,
+                    error,
+                    SESSION_EXECUTION_SLOT_OCCUPIED_ERROR_CODE,
+                );
+            }
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Failed to persist durable run start: {error}"),
+            )
         })
     }
 
@@ -15055,9 +15066,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let mut runs = self.runs.write().await;
             let has_active = Self::session_has_blocking_run(&runs, &user_id, &session_id);
             if has_active {
-                return Err(error_response(
+                return Err(error_response_coded(
                     StatusCode::CONFLICT,
-                    "session already has an active run".to_string(),
+                    "session already has an active run",
+                    SESSION_EXECUTION_SLOT_OCCUPIED_ERROR_CODE,
                 ));
             }
             runs.insert(run_id.clone(), run_state);
@@ -16808,9 +16820,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 )
                 .await;
             }
-            return Err(error_response(
+            return Err(error_response_coded(
                 StatusCode::CONFLICT,
-                "session already has an active run".to_string(),
+                "session already has an active run",
+                SESSION_EXECUTION_SLOT_OCCUPIED_ERROR_CODE,
             ));
         }
         // Persist run first, so the binding is durable before the client
@@ -19280,6 +19293,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
             AtomicRunGuidanceAdmission::Inactive { status } => {
                 Self::run_status_from_durable(&status)?;
+                if durable_run_status_is_terminal(&status) {
+                    // The run reached a terminal status (completed/failed/
+                    // cancelled/delegated) between the client's last observed
+                    // stream-lifecycle signal and this submission. There is no
+                    // "current run" left to guide; give this a stable code so
+                    // the client can requeue the text as the next turn instead
+                    // of surfacing a bare rejection, matching how the
+                    // settlement-fence conflict is already handled below.
+                    return Err(error_response_coded(
+                        StatusCode::CONFLICT,
+                        "This run has already finished and no longer accepts current-run guidance. Submit it as the next session turn instead.",
+                        "run_intent_run_terminal",
+                    ));
+                }
                 return Err(Self::run_state_conflict("submit input to", &status));
             }
             AtomicRunGuidanceAdmission::SettlementFenced => {
@@ -19782,9 +19809,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 })?
                 .is_some_and(|blocker| blocker.run_id != run_id)
             {
-                return Err(error_response(
+                return Err(error_response_coded(
                     StatusCode::CONFLICT,
-                    "session already has an active run".to_string(),
+                    "session already has an active run",
+                    SESSION_EXECUTION_SLOT_OCCUPIED_ERROR_CODE,
                 ));
             }
             let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
@@ -19825,9 +19853,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         match transition {
             astra_services::runs::GuardedRunStatusTransition::Updated => {}
             astra_services::runs::GuardedRunStatusTransition::SessionBlocked => {
-                return Err(error_response(
+                return Err(error_response_coded(
                     StatusCode::CONFLICT,
-                    "session already has an active run".to_string(),
+                    "session already has an active run",
+                    SESSION_EXECUTION_SLOT_OCCUPIED_ERROR_CODE,
                 ));
             }
             astra_services::runs::GuardedRunStatusTransition::StatusConflict => {
