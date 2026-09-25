@@ -146,7 +146,7 @@ impl CaseExecutor for AstraCliExecutor {
             "\"$(mktemp -d)/events.jsonl\"".into(),
             "-y".into(),
         ]);
-        if let Some(cli_wall_time_seconds) = case.cli_wall_time_seconds {
+        if let Some(cli_wall_time_seconds) = case.cli_wall_time_override_for(case.timeout_seconds) {
             parts.push("--max-wall-time-seconds".into());
             parts.push(shell_escape(cli_wall_time_seconds.to_string()));
         }
@@ -604,7 +604,7 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
         .arg("--stream-events")
         .arg(&stream_event_path)
         .arg("-y");
-    if let Some(cli_wall_time_seconds) = case.cli_wall_time_seconds {
+    if let Some(cli_wall_time_seconds) = case.cli_wall_time_override_for(case.timeout_seconds) {
         cmd.arg("--max-wall-time-seconds")
             .arg(cli_wall_time_seconds.to_string());
     }
@@ -1549,7 +1549,7 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec!["--verbose".into()],
             timeout_seconds: 180,
-            cli_wall_time_seconds: Some(180),
+            cli_wall_time_seconds: Some(150),
             capability: None,
             required_cache_scope: None,
             difficulty: None,
@@ -1571,13 +1571,20 @@ mod tests {
         assert!(repro.contains("--model"));
         assert!(repro.contains("qwen-flash"));
         assert!(repro.contains("--verbose"));
-        assert!(repro.contains("--max-wall-time-seconds '180'"));
-        let default_case = simple_case();
+        assert!(repro.contains("--max-wall-time-seconds '150'"));
+        let mut default_case = simple_case();
         assert!(
             !exec
                 .reproducer(&default_case, "qwen-flash")
                 .contains("--max-wall-time-seconds"),
-            "the harness must not silently shorten other cases' execution budgets"
+            "unconfigured cases must retain their full outer watchdog budget"
+        );
+        default_case.timeout_seconds = 180;
+        assert!(
+            !exec
+                .reproducer(&default_case, "qwen-flash")
+                .contains("--max-wall-time-seconds"),
+            "case duration alone must not truncate tool execution"
         );
         // POSIX single-quote escape: `'say '\''hello'\'''` preserves
         // the original bytes without relying on double-quote semantics
@@ -1616,7 +1623,6 @@ mod tests {
 
         let mut case = simple_case();
         case.timeout_seconds = 180;
-        case.cli_wall_time_seconds = Some(180);
         case.cli_env.insert(
             "HARNESS_ARGS_PATH".into(),
             args_path.to_string_lossy().into_owned(),
@@ -1635,12 +1641,10 @@ mod tests {
         );
         assert!(root_args.lines().any(|arg| arg == "--no-resume"));
         assert!(
-            root_args
+            !root_args
                 .lines()
-                .collect::<Vec<_>>()
-                .windows(2)
-                .any(|pair| pair == ["--max-wall-time-seconds", "180"]),
-            "CLI watchdog must receive the same outer wall budget: {root_args:?}"
+                .any(|arg| arg == "--max-wall-time-seconds"),
+            "unconfigured cases must preserve the outer watchdog budget: {root_args:?}"
         );
 
         case.extra_cli_args = vec![

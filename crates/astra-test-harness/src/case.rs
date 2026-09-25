@@ -11,6 +11,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+const CLI_TERMINAL_RESERVE_SECONDS: u64 = 72;
+const CLI_PROCESS_CUSHION_SECONDS: u64 = 15;
+
 /// A single test case. One YAML file == one `Case`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,11 +72,8 @@ pub struct Case {
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
 
-    /// Optional earlier CLI wall deadline, distinct from the harness process
-    /// watchdog above. Use this when a long-running CLI invocation needs time
-    /// to cancel owned work and serialize a terminal result before the
-    /// watchdog kills it. Omitted by default, so existing cases keep their
-    /// full timeout as execution time.
+    /// Optional explicit CLI wall deadline. Without one, only the outer
+    /// harness watchdog applies, preserving the full case execution budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_wall_time_seconds: Option<u64>,
 
@@ -472,6 +472,13 @@ pub fn matches_filter(name: &str, pattern: &str) -> bool {
 }
 
 impl Case {
+    pub(crate) fn cli_wall_time_override_for(&self, timeout_seconds: u64) -> Option<u64> {
+        self.cli_wall_time_seconds.filter(|seconds| {
+            *seconds > CLI_TERMINAL_RESERVE_SECONDS
+                && *seconds <= timeout_seconds.saturating_sub(CLI_PROCESS_CUSHION_SECONDS)
+        })
+    }
+
     /// Whether this case needs the live Memoria contract and its durable
     /// post-loop settlement marker. Explicit opt-in, exact-record cleanup, or
     /// a post-loop memory health criterion enables it; a capability label
@@ -563,15 +570,19 @@ impl Case {
             );
         }
         if let Some(cli_wall_time_seconds) = case.cli_wall_time_seconds {
-            if cli_wall_time_seconds <= 72 {
+            if cli_wall_time_seconds <= CLI_TERMINAL_RESERVE_SECONDS {
                 anyhow::bail!(
                     "case {}: cli_wall_time_seconds must exceed the CLI's 72-second terminal/request reserve",
                     path.display(),
                 );
             }
-            if cli_wall_time_seconds >= case.timeout_seconds {
+            if cli_wall_time_seconds
+                > case
+                    .timeout_seconds
+                    .saturating_sub(CLI_PROCESS_CUSHION_SECONDS)
+            {
                 anyhow::bail!(
-                    "case {}: cli_wall_time_seconds ({cli_wall_time_seconds}) must be less than the harness watchdog timeout_seconds ({}) to leave time for termination and final output",
+                    "case {}: cli_wall_time_seconds ({cli_wall_time_seconds}) must leave at least {CLI_PROCESS_CUSHION_SECONDS} seconds before the harness watchdog timeout_seconds ({}) for termination and final output",
                     path.display(),
                     case.timeout_seconds,
                 );
@@ -681,11 +692,12 @@ mod tests {
         assert!(c.criteria.is_empty());
         assert_eq!(c.timeout_seconds, 180);
         assert_eq!(c.cli_wall_time_seconds, None);
+        assert_eq!(c.cli_wall_time_override_for(c.timeout_seconds), None);
         assert!(!c.debug_log);
     }
 
     #[test]
-    fn cli_wall_deadline_is_opt_in_and_must_precede_the_harness_watchdog() {
+    fn explicit_cli_wall_deadline_precedes_watchdog() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("bounded-case.yaml");
         std::fs::write(
@@ -695,8 +707,14 @@ mod tests {
         .unwrap();
         let case = Case::from_path(&path).expect("independent inner deadline parses");
         assert_eq!(case.cli_wall_time_seconds, Some(310));
+        assert_eq!(
+            case.cli_wall_time_override_for(case.timeout_seconds),
+            Some(310)
+        );
+        assert_eq!(case.cli_wall_time_override_for(320), None);
+        assert_eq!(case.cli_wall_time_override_for(325), Some(310));
 
-        for cli_wall_time_seconds in [72, 360, 361] {
+        for cli_wall_time_seconds in [72, 346, 360, 361] {
             std::fs::write(
                 &path,
                 format!(
