@@ -18763,6 +18763,18 @@ async fn create_run_conflicts_when_same_session_already_has_active_run() {
         err.1.0.error_code.as_deref(),
         Some("session_execution_slot_occupied")
     );
+    // No run was admitted for the second request, so this must flow through
+    // the client's pre-admission-rejection contract (restore the draft, no
+    // TurnError, no turn-cursor advance) rather than ordinary failed-turn
+    // settlement.
+    assert_eq!(
+        err.1
+            .0
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("admission_state")),
+        Some(&json!("rejected"))
+    );
 }
 
 #[tokio::test]
@@ -18800,6 +18812,14 @@ async fn stream_chat_conflicts_when_same_session_already_has_active_run() {
     assert_eq!(
         err.1.0.error_code.as_deref(),
         Some("session_execution_slot_occupied")
+    );
+    assert_eq!(
+        err.1
+            .0
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("admission_state")),
+        Some(&json!("rejected"))
     );
 }
 
@@ -26671,6 +26691,19 @@ async fn durable_resume_rejects_blocking_sibling_after_cache_miss() {
     assert_eq!(
         error.1.0.error_code.as_deref(),
         Some("session_execution_slot_occupied")
+    );
+    // Deliberately different from the create_run/stream_chat start-rejection
+    // sites: a resume conflict is not a new-turn admission, so it must not
+    // carry `admission_state: "rejected"` and must not be settled through
+    // that draft-restoring contract.
+    assert_eq!(
+        error
+            .1
+            .0
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("admission_state")),
+        None
     );
     let durable = engine
         .load_run("user-1", "run-parent-blocked")

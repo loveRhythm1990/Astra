@@ -18099,6 +18099,154 @@ mod tests {
         assert_eq!(restored.as_deref(), Some("list my workspaces"));
     }
 
+    /// Terminal-guidance rejection (`run_intent_run_terminal`) reuses the exact
+    /// same next-turn queue as the settlement fence — but its wording promises
+    /// only "queued", not "will be sent" (see `RUN_TERMINAL_FOLLOW_UP_NOTICE`),
+    /// precisely because completion, cancellation, and failure settle
+    /// differently. This exercises the real queue/settlement path — the real
+    /// `should_start_queued_followups`, not a hand-picked bool — for all three
+    /// outcomes, alongside an earlier-queued message, to prove exactly-once
+    /// delivery and stable ordering in every case.
+    #[test]
+    fn terminal_guidance_followup_delivery_matches_turn_outcome() {
+        // Completed: the turn that made the guidance target terminal settled
+        // normally, so the rejected text starts as the next turn — exactly
+        // once, after whatever was already queued ahead of it.
+        {
+            let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+            let mut bottom_pane = BottomPane::new();
+            assert!(bottom_pane.queue_next_turn_submission("earlier message".to_string()));
+            let queue_index = bottom_pane.queued_next_turn_submission_count();
+            bottom_pane
+                .try_accept_user_intent(
+                    "intent-terminal-completed",
+                    astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    astra_turn_types::UserIntentStatus::AcceptedLocal,
+                    "rejected by completed run",
+                )
+                .expect("local guidance intent");
+            run_control.expect_remote_user_intent_submission("intent-terminal-completed");
+            assert!(release_settlement_fenced_guidance(
+                &run_control,
+                &mut bottom_pane,
+                "intent-terminal-completed",
+                "rejected by completed run",
+                queue_index,
+            ));
+
+            let mut queued = bottom_pane.take_queued_next_turn_submissions();
+            let mut followups = std::collections::VecDeque::new();
+            let should_start = should_start_queued_followups(true, false, false, false, false);
+            assert!(should_start, "a normally-settled turn must start followups");
+            assert!(
+                settle_followup_submissions(
+                    &mut followups,
+                    std::iter::empty(),
+                    &mut queued,
+                    should_start
+                )
+                .is_none(),
+                "delivered followups must not also be reported as a restored draft"
+            );
+            assert_eq!(
+                followups.into_iter().collect::<Vec<_>>(),
+                vec![
+                    "earlier message".to_string(),
+                    "rejected by completed run".to_string(),
+                ],
+                "exactly once, in submission order"
+            );
+        }
+
+        // Cancelled: the outer turn was interrupted, so nothing starts on its
+        // own — both messages come back as one restored draft, in order.
+        {
+            let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+            let mut bottom_pane = BottomPane::new();
+            assert!(bottom_pane.queue_next_turn_submission("earlier message".to_string()));
+            let queue_index = bottom_pane.queued_next_turn_submission_count();
+            bottom_pane
+                .try_accept_user_intent(
+                    "intent-terminal-cancelled",
+                    astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    astra_turn_types::UserIntentStatus::AcceptedLocal,
+                    "rejected by cancelled run",
+                )
+                .expect("local guidance intent");
+            run_control.expect_remote_user_intent_submission("intent-terminal-cancelled");
+            assert!(release_settlement_fenced_guidance(
+                &run_control,
+                &mut bottom_pane,
+                "intent-terminal-cancelled",
+                "rejected by cancelled run",
+                queue_index,
+            ));
+
+            let mut queued = bottom_pane.take_queued_next_turn_submissions();
+            let mut followups = std::collections::VecDeque::new();
+            let should_start = should_start_queued_followups(true, true, false, false, false);
+            assert!(
+                !should_start,
+                "an interrupted turn must not start followups"
+            );
+            let restored = settle_followup_submissions(
+                &mut followups,
+                std::iter::empty(),
+                &mut queued,
+                should_start,
+            );
+            assert_eq!(
+                restored.as_deref(),
+                Some("earlier message\n\nrejected by cancelled run")
+            );
+            assert!(
+                followups.is_empty(),
+                "a restored draft must not also sit in the followup queue"
+            );
+        }
+
+        // Failed: same non-starting outcome as cancelled, driven by turn_ok
+        // instead of the interrupted flag.
+        {
+            let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+            let mut bottom_pane = BottomPane::new();
+            assert!(bottom_pane.queue_next_turn_submission("earlier message".to_string()));
+            let queue_index = bottom_pane.queued_next_turn_submission_count();
+            bottom_pane
+                .try_accept_user_intent(
+                    "intent-terminal-failed",
+                    astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    astra_turn_types::UserIntentStatus::AcceptedLocal,
+                    "rejected by failed run",
+                )
+                .expect("local guidance intent");
+            run_control.expect_remote_user_intent_submission("intent-terminal-failed");
+            assert!(release_settlement_fenced_guidance(
+                &run_control,
+                &mut bottom_pane,
+                "intent-terminal-failed",
+                "rejected by failed run",
+                queue_index,
+            ));
+
+            let mut queued = bottom_pane.take_queued_next_turn_submissions();
+            let mut followups = std::collections::VecDeque::new();
+            let should_start = should_start_queued_followups(false, false, false, false, false);
+            assert!(!should_start, "a failed turn must not start followups");
+            let restored = settle_followup_submissions(
+                &mut followups,
+                std::iter::empty(),
+                &mut queued,
+                should_start,
+            );
+            assert_eq!(
+                restored.as_deref(),
+                Some("earlier message\n\nrejected by failed run")
+            );
+            assert!(followups.is_empty());
+        }
+    }
+
     #[test]
     fn settlement_fenced_follow_up_keeps_submission_order() {
         let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
