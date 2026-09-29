@@ -106,6 +106,14 @@ impl StartupTerminal {
                     sixel = response
                         .device_attributes
                         .map(|params| params.iter().skip(1).any(|&param| param == 4));
+                    // `CSI ?u` shares this same DA1-anchored round trip
+                    // (see startup_query.rs); a missing reply here means
+                    // unsupported, not "ask again" -- a second query would
+                    // race this one, exactly the class of bug the PTY
+                    // regression `pty_late_da1_is_unknown_until_reply` guards
+                    // against for the sibling DA1/sixel query.
+                    guard.keyboard_enhancement_supported =
+                        response.keyboard_enhancement_flags.is_some();
                 }
                 Err(error) => tracing::debug!(%error, "terminal startup query unavailable"),
             }
@@ -113,12 +121,6 @@ impl StartupTerminal {
             if let Some(supported) = sixel {
                 astra_tools::display_sixel::set_sixel_supported(supported);
             }
-            // Reuses the same quiet, pre-event-loop window as the color/sixel
-            // queries above. Without this, Shift+Enter is indistinguishable
-            // from plain Enter on terminals that need an explicit opt-in to
-            // report the modifier on a special key like Enter.
-            guard.keyboard_enhancement_supported =
-                crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
             Ok(guard)
         }
         #[cfg(not(unix))]
