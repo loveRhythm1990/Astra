@@ -6,7 +6,7 @@ use crate::cli::cli_config::cli_utils::{
     preflight_remote_resume_session,
 };
 use crate::cli::cloud_sync::{
-    append_cloud_pull_sync_journal, try_cloud_pull, try_cloud_pull_preferences,
+    CloudPullResult, append_cloud_pull_sync_journal, try_cloud_pull, try_cloud_pull_preferences,
 };
 use crate::cli::edge_lifecycle::register_and_start_heartbeat;
 use crate::cli::permission_manager;
@@ -677,18 +677,26 @@ pub(crate) async fn complete_session_startup(
     no_instructions: bool,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<SessionStartupArtifacts, String> {
-    // Resolve the native credential once, before cloud sync and memory startup
-    // can swallow its error or independently spend another lock-wait budget.
-    let native_startup_token = if let Some(binding) = crate::cli::native_auth::active() {
-        Some(crate::cli::native_auth::startup_access_token(&binding).await?)
-    } else {
-        None
-    };
     // Install panic hook to write session_end on unexpected crashes.
     install_session_panic_hook();
     // Install signal handlers so SIGTERM/SIGHUP can drain through normal REPL shutdown.
     install_sigterm_handler();
     let shutdown_signal_rx = subscribe_shutdown_signal();
+    // Resolve native auth before optional cloud work. An unavailable issuer
+    // should leave the local workbench usable and give the user a clear hint.
+    let native_binding = crate::cli::native_auth::active();
+    let native_startup_token = if let Some(binding) = native_binding.as_ref() {
+        match crate::cli::native_auth::startup_access_token(binding).await {
+            Ok(token) => Some(token),
+            Err(message) => {
+                eprintln!("warning: {message}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let native_auth_unavailable = native_binding.is_some() && native_startup_token.is_none();
 
     // --session-id: override with explicit session UUID
     if let Some(sid) = cli_context.session_id.as_deref() {
@@ -769,8 +777,18 @@ pub(crate) async fn complete_session_startup(
             astra_turn_core::tool_health_persistence::load_tool_health(profile_name);
         state.synced_tool_health_entries =
             astra_turn_core::tool_health_persistence::load_synced_tool_health(profile_name);
-        let cloud_pull_result = try_cloud_pull(profile_name).await;
-        let pref_keys = try_cloud_pull_preferences(state).await;
+        let cloud_pull_result = if native_auth_unavailable {
+            CloudPullResult {
+                cloud_reachable: false,
+            }
+        } else {
+            try_cloud_pull(profile_name).await
+        };
+        let pref_keys = if native_auth_unavailable {
+            Vec::new()
+        } else {
+            try_cloud_pull_preferences(state).await
+        };
         (cross_session_health_entries, cloud_pull_result, pref_keys)
     };
     tracer.phase("learning_state");
@@ -780,7 +798,11 @@ pub(crate) async fn complete_session_startup(
         state.synced_tool_health_entries = cross_session_health_entries;
     }
 
-    state.session_memory_extractor = build_cli_session_memory_extractor(api, profile).await;
+    state.session_memory_extractor = if native_auth_unavailable {
+        None
+    } else {
+        build_cli_session_memory_extractor(api, profile).await
+    };
     state.team_store = std::sync::Arc::new(crate::cli::http_team_store::HttpTeamStore::new(
         api.api_origin(),
         profile,
@@ -798,9 +820,19 @@ pub(crate) async fn complete_session_startup(
         &pref_keys_after_pull,
     );
 
-    let startup_token = match native_startup_token {
-        Some(token) => Some(token),
-        None => session_runtime::fresh_access_token(api, profile).await,
+    let startup_token = match (native_binding.as_ref(), native_startup_token) {
+        (Some(binding), Some(_)) => {
+            // The early token may be near expiry after other startup work.
+            match crate::cli::native_auth::startup_access_token(binding).await {
+                Ok(token) => Some(token),
+                Err(message) => {
+                    eprintln!("warning: {message}");
+                    None
+                }
+            }
+        }
+        (Some(_), None) => None,
+        (None, _) => session_runtime::fresh_access_token(api, profile).await,
     };
 
     // Keep startup on the same model-selection state machine used by turns and
@@ -819,7 +851,9 @@ pub(crate) async fn complete_session_startup(
         false
     };
     tracer.phase("model_check");
-    prune_stale_pending_recovery(api, profile, state).await;
+    if native_binding.is_none() || startup_token.is_some() {
+        prune_stale_pending_recovery(api, profile, state).await;
+    }
 
     if state.session_id.is_none()
         && let Some(sid) = resume_session_id

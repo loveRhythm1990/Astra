@@ -62,7 +62,10 @@ not submit a second rotation. Interactive startup shows `Refreshing your
 sign-in…` after one second of waiting. The progress timer does not cancel the
 refresh. The existing 20-second lock wait and per-request HTTP timeouts still
 apply; 20 seconds is not an end-to-end startup deadline. A lock-wait timeout
-asks the user to retry starting Astra, not to sign in again.
+asks the user to retry starting Astra, not to sign in again. If credential
+acquisition fails, interactive Astra still opens with a warning and skips
+native cloud initialization for that startup. MOI requests still require a
+valid credential; this does not bypass authentication.
 
 `astra auth status` never refreshes tokens. While a pending refresh still owns
 the lock, its JSON state is `refresh_in_progress`. If the lock can be acquired
@@ -80,7 +83,9 @@ digest, login generation, timestamp, elapsed time, stage, error classification,
 HTTP status and a bounded request ID when supplied. They never include tokens
 or response bodies. Diagnostic write failures do not change refresh outcomes;
 the file is evidence only and is never used to authorize recovery. A killed
-process may leave an incomplete attempt. Rejected/uncertain rotations still
+process may leave an incomplete attempt or lose a queued diagnostic record;
+diagnostic file writes do not delay token settlement, and records from the same
+attempt may arrive out of order. Rejected/uncertain rotations still
 require a new login; these startup changes do not extend the issuer's session
 lifetime or make an uncertain refresh token safe to replay.
 

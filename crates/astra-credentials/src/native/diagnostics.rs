@@ -77,18 +77,31 @@ impl RotationDiagnostic {
             return;
         };
         line.push(b'\n');
-        // Logging is best effort: inability to record diagnostics must not
-        // prevent settlement. File I/O stays off the async runtime, and a busy
-        // diagnostic writer never delays authentication on a separate lock.
-        if let Err(error) = self
-            .store
-            .blocking(move |store| {
+        // The future completes without yielding. A stalled diagnostic file
+        // must not delay the request or the durable publication of new tokens.
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let write = || -> Result<(), String> {
                 store.check_dir()?;
                 let mut file = private_open(&store.root.join("auth-refresh.jsonl"), true)?;
-                match FileExt::try_lock_exclusive(&file) {
-                    Ok(()) => (),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-                    Err(_) => return Err("cannot lock sign-in diagnostic file".into()),
+                // Detached records from the same rotation can briefly race.
+                // Give them a bounded chance to serialize without waiting in
+                // the credential path or hanging on another process's lock.
+                let lock_deadline = Instant::now() + std::time::Duration::from_millis(250);
+                loop {
+                    match FileExt::try_lock_exclusive(&file) {
+                        Ok(()) => break,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < lock_deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            return Ok(());
+                        }
+                        Err(_) => return Err("cannot lock sign-in diagnostic file".into()),
+                    }
                 }
                 if file
                     .metadata()
@@ -105,13 +118,13 @@ impl RotationDiagnostic {
                     .map_err(|_| "cannot seek sign-in diagnostics")?;
                 file.write_all(&line)
                     .map_err(|_| "cannot write sign-in diagnostics".into())
-            })
-            .await
-        {
-            tracing::warn!(component = "astra-credentials", operation = "token_refresh",
-                stage = "diagnostics", reason = "diagnostic_write_failed", %error,
-                "could not record sign-in diagnostics");
-        }
+            };
+            if let Err(error) = write() {
+                tracing::warn!(component = "astra-credentials", operation = "token_refresh",
+                    stage = "diagnostics", reason = "diagnostic_write_failed", %error,
+                    "could not record sign-in diagnostics");
+            }
+        });
     }
 }
 
@@ -150,7 +163,43 @@ pub(super) fn transport_cause(error: reqwest::Error) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{MetadataExt, symlink};
+    use std::{
+        future::Future,
+        os::unix::fs::{MetadataExt, symlink},
+    };
+
+    #[tokio::test]
+    async fn a_locked_diagnostic_file_does_not_delay_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = NativeStore::with_directory(directory.path().join("auth"));
+        store.prepare_for_login().unwrap();
+        let diagnostic = RotationDiagnostic {
+            store: store.clone(),
+            operation_id: "test-operation".into(),
+            environment: "environment-digest".into(),
+            generation: "generation".into(),
+            started: Instant::now(),
+        };
+        let path = store.root.join("auth-refresh.jsonl");
+        let file = private_open(&path, true).unwrap();
+        FileExt::lock_exclusive(&file).unwrap();
+        let mut record = Box::pin(diagnostic.record("http", "request_started", None, None, None));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(record.as_mut().poll(&mut context).is_ready());
+        FileExt::unlock(&file).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if std::fs::read_to_string(&path)
+                    .is_ok_and(|contents| contents.contains("request_started"))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn default_diagnostics_are_private_bounded_and_do_not_serialize_credentials() {
@@ -170,7 +219,17 @@ mod tests {
         diagnostic
             .record("http", "http_rejected", Some(400), Some("request-1"), None)
             .await;
-        let contents = std::fs::read(&path).unwrap();
+        let contents = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let contents = std::fs::read(&path).unwrap();
+                if serde_json::from_slice::<serde_json::Value>(&contents).is_ok() {
+                    break contents;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         let event: serde_json::Value = serde_json::from_slice(&contents).unwrap();
         assert_eq!(event["http_status"], 400);
         assert_eq!(event["request_id"], "request-1");
@@ -184,9 +243,7 @@ mod tests {
         let target = directory.path().join("untouched");
         std::fs::write(&target, "unchanged").unwrap();
         symlink(&target, &path).unwrap();
-        diagnostic
-            .record("http", "http_rejected", Some(400), None, None)
-            .await;
+        assert!(private_open(&path, true).is_err());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "unchanged");
     }
 }

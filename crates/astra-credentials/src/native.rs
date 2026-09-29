@@ -1216,6 +1216,30 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
+    async fn wait_for_diagnostics(store: &NativeStore, required: &[(&str, &str)]) -> String {
+        let path = store.root.join("auth-refresh.jsonl");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let log = fs::read_to_string(&path).unwrap_or_default();
+                if let Ok(events) = log
+                    .lines()
+                    .map(serde_json::from_str::<serde_json::Value>)
+                    .collect::<Result<Vec<_>, _>>()
+                    && required.iter().all(|(stage, reason)| {
+                        events
+                            .iter()
+                            .any(|event| event["stage"] == *stage && event["reason"] == *reason)
+                    })
+                {
+                    return log;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("refresh diagnostic was not written")
+    }
+
     struct RotationFixture {
         environment: Environment,
         rotations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1353,12 +1377,16 @@ mod tests {
         helper.await.unwrap().unwrap();
         assert_eq!(store.status().await.unwrap().1, SignInStatus::SignedIn);
         assert_eq!(fixture.rotations.load(Ordering::SeqCst), 1);
-        let log = std::fs::read_to_string(store.root.join("auth-refresh.jsonl")).unwrap();
+        let log = wait_for_diagnostics(
+            &store,
+            &[("signing_keys", "received"), ("settled", "success")],
+        )
+        .await;
         let events: Vec<serde_json::Value> = log
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(events.last().unwrap()["reason"], "success");
+        assert!(events.iter().any(|event| event["reason"] == "success"));
         assert!(events.iter().any(|event| event["stage"] == "signing_keys"));
         assert!(!log.contains("synthetic-refresh"));
         assert!(!log.contains("synthetic-rotated"));
@@ -1975,11 +2003,14 @@ mod tests {
             CredentialFailure::RotationRejected
         );
         request.await.unwrap();
-        let log = fs::read_to_string(store.root.join("auth-refresh.jsonl")).unwrap();
-        let last: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
-        assert_eq!(last["reason"], "http_rejected");
-        assert_eq!(last["http_status"], status[..3].parse::<u16>().unwrap());
-        assert_eq!(last["request_id"], "test-request-1");
+        let log = wait_for_diagnostics(&store, &[("http", "http_rejected")]).await;
+        let rejected: serde_json::Value = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .find(|event: &serde_json::Value| event["reason"] == "http_rejected")
+            .unwrap();
+        assert_eq!(rejected["http_status"], status[..3].parse::<u16>().unwrap());
+        assert_eq!(rejected["request_id"], "test-request-1");
         assert!(
             !log.contains("invalid_grant"),
             "response bodies are not diagnostics"
