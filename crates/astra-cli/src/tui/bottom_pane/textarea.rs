@@ -664,6 +664,32 @@ mod tests {
     }
 
     #[test]
+    fn shift_enter_inserts_newline_but_plain_enter_submits() {
+        let mut textarea = TextArea::new();
+        textarea.set_text("draft");
+
+        // This is the composer-side half of the Shift+Enter contract: it was
+        // already correct before the terminal-negotiation fix landed, but
+        // had no direct regression coverage locking in the behavior the rest
+        // of that fix depends on (crossterm never reporting SHIFT on Enter
+        // in the first place is the other half, covered by the
+        // `terminal_startup` PTY suite).
+        assert_eq!(
+            textarea.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            TextAreaAction::Changed
+        );
+        assert_eq!(textarea.text(), "draft\n");
+
+        assert_eq!(
+            textarea.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            TextAreaAction::Submit
+        );
+        // Submit does not consume or alter the draft; the caller reads it
+        // separately before clearing.
+        assert_eq!(textarea.text(), "draft\n");
+    }
+
+    #[test]
     fn ctrl_e_keeps_its_composer_line_end_contract() {
         let mut textarea = TextArea::new();
         textarea.set_text("first line\nsecond line");
