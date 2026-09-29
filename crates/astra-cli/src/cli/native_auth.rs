@@ -104,7 +104,7 @@ impl Binding {
 
 /// Resolve native auth before startup launches cloud work. The progress timer
 /// never cancels the credential future or starts another refresh.
-pub(crate) async fn startup_access_token(binding: &Binding) -> Result<String, String> {
+pub(crate) async fn startup_access_token(binding: &Binding) -> Result<String, native::AccessMiss> {
     let pending = binding.access_token();
     tokio::pin!(pending);
     let result = tokio::select! {
@@ -115,7 +115,7 @@ pub(crate) async fn startup_access_token(binding: &Binding) -> Result<String, St
             pending.await
         }
     };
-    result.map_err(|error| error.access_miss().startup_warning().to_owned())
+    result.map_err(|error| error.access_miss())
 }
 
 impl astra_thin_client::client::BearerProvider for Binding {
@@ -502,6 +502,12 @@ mod tests {
                 .access_token
                 .is_none()
         );
+        assert_eq!(
+            projection.profiles[&binding.profile_name()]
+                .username
+                .as_deref(),
+            Some("account-a")
+        );
         assert_eq!(cli_utils::stored_last_session_id(None), Some(last_session));
         assert_eq!(binding.account_id().unwrap(), "astra-a");
         assert!(
@@ -531,7 +537,7 @@ mod tests {
         );
         assert_eq!(
             startup_access_token(&binding).await.unwrap_err(),
-            native::AccessMiss::ReauthenticationRequired.startup_warning()
+            native::AccessMiss::ReauthenticationRequired
         );
     }
 

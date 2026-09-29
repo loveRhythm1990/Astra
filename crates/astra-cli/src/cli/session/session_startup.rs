@@ -685,18 +685,16 @@ pub(crate) async fn complete_session_startup(
     // Resolve native auth before optional cloud work. An unavailable issuer
     // should leave the local workbench usable and give the user a clear hint.
     let native_binding = crate::cli::native_auth::active();
-    let native_startup_token = if let Some(binding) = native_binding.as_ref() {
-        match crate::cli::native_auth::startup_access_token(binding).await {
-            Ok(token) => Some(token),
-            Err(message) => {
-                eprintln!("warning: {message}");
-                None
-            }
+    let native_startup_auth = if let Some(binding) = native_binding.as_ref() {
+        let result = crate::cli::native_auth::startup_access_token(binding).await;
+        if let Err(miss) = &result {
+            eprintln!("warning: {}", miss.startup_warning());
         }
+        Some(result)
     } else {
         None
     };
-    let native_auth_unavailable = native_binding.is_some() && native_startup_token.is_none();
+    let native_auth_unavailable = native_startup_auth.as_ref().is_some_and(Result::is_err);
 
     // --session-id: override with explicit session UUID
     if let Some(sid) = cli_context.session_id.as_deref() {
@@ -820,19 +818,24 @@ pub(crate) async fn complete_session_startup(
         &pref_keys_after_pull,
     );
 
-    let startup_token = match (native_binding.as_ref(), native_startup_token) {
-        (Some(binding), Some(_)) => {
+    let native_final_auth = match (native_binding.as_ref(), native_startup_auth) {
+        (Some(binding), Some(Ok(_))) => {
             // The early token may be near expiry after other startup work.
-            match crate::cli::native_auth::startup_access_token(binding).await {
-                Ok(token) => Some(token),
-                Err(message) => {
-                    eprintln!("warning: {message}");
-                    None
-                }
+            let result = crate::cli::native_auth::startup_access_token(binding).await;
+            if let Err(miss) = &result {
+                eprintln!("warning: {}", miss.startup_warning());
             }
+            Some(result)
         }
-        (Some(_), None) => None,
-        (None, _) => session_runtime::fresh_access_token(api, profile).await,
+        (_, result) => result,
+    };
+    let banner_native_auth = native_final_auth
+        .as_ref()
+        .map(|result| result.as_ref().map(|_| ()).map_err(|miss| *miss));
+    let startup_token = match native_final_auth {
+        Some(Ok(token)) => Some(token),
+        Some(Err(_)) => None,
+        None => session_runtime::fresh_access_token(api, profile).await,
     };
 
     // Keep startup on the same model-selection state machine used by turns and
@@ -861,7 +864,7 @@ pub(crate) async fn complete_session_startup(
         slash_session::restore_session_into_state(sid, profile, api, state).await?;
     }
 
-    print_session_banner(profile, state);
+    print_session_banner(profile, state, banner_native_auth);
     tracer.phase("banner");
 
     // Pending recovery is silently retained in state for /resume; no startup banner.

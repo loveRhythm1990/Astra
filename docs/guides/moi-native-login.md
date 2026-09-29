@@ -65,7 +65,10 @@ apply; 20 seconds is not an end-to-end startup deadline. A lock-wait timeout
 asks the user to retry starting Astra, not to sign in again. If credential
 acquisition fails, interactive Astra still opens with a warning and skips
 native cloud initialization for that startup. MOI requests still require a
-valid credential; this does not bypass authentication.
+valid credential; this does not bypass authentication. The startup card
+distinguishes a refresh still owned by another process from a rotation that
+needs a new login; neither is shown as a logout merely because its unsettled
+access token is withheld.
 
 `astra auth status` never refreshes tokens. While a pending refresh still owns
 the lock, its JSON state is `refresh_in_progress`. If the lock can be acquired
