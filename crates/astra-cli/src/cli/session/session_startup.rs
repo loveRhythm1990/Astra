@@ -677,6 +677,13 @@ pub(crate) async fn complete_session_startup(
     no_instructions: bool,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<SessionStartupArtifacts, String> {
+    // Resolve the native credential once, before cloud sync and memory startup
+    // can swallow its error or independently spend another lock-wait budget.
+    let native_startup_token = if let Some(binding) = crate::cli::native_auth::active() {
+        Some(crate::cli::native_auth::startup_access_token(&binding).await?)
+    } else {
+        None
+    };
     // Install panic hook to write session_end on unexpected crashes.
     install_session_panic_hook();
     // Install signal handlers so SIGTERM/SIGHUP can drain through normal REPL shutdown.
@@ -791,7 +798,10 @@ pub(crate) async fn complete_session_startup(
         &pref_keys_after_pull,
     );
 
-    let startup_token = session_runtime::fresh_access_token(api, profile).await;
+    let startup_token = match native_startup_token {
+        Some(token) => Some(token),
+        None => session_runtime::fresh_access_token(api, profile).await,
+    };
 
     // Keep startup on the same model-selection state machine used by turns and
     // account commands. The local flag carries the one UI-specific outcome
