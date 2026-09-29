@@ -30,6 +30,7 @@ pub(crate) struct StartupTerminal {
     raw_output_flags: Option<OutputFlags>,
     #[cfg(unix)]
     raw_local_flags: Option<LocalFlags>,
+    keyboard_enhancement_supported: bool,
 }
 
 fn should_query_colors(profile: Option<&str>, no_color: bool, background_override: bool) -> bool {
@@ -62,6 +63,7 @@ impl StartupTerminal {
                 interrupt: Some(interrupt),
                 raw_output_flags: None,
                 raw_local_flags: None,
+                keyboard_enhancement_supported: false,
             };
             match crate::cli::stream::output_sink::write_stdout_operation(|stdout| {
                 execute!(stdout, EnableBracketedPaste)
@@ -111,6 +113,12 @@ impl StartupTerminal {
             if let Some(supported) = sixel {
                 astra_tools::display_sixel::set_sixel_supported(supported);
             }
+            // Reuses the same quiet, pre-event-loop window as the color/sixel
+            // queries above. Without this, Shift+Enter is indistinguishable
+            // from plain Enter on terminals that need an explicit opt-in to
+            // report the modifier on a special key like Enter.
+            guard.keyboard_enhancement_supported =
+                crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
             Ok(guard)
         }
         #[cfg(not(unix))]
@@ -151,6 +159,13 @@ impl StartupTerminal {
         {
             self.owns_raw_mode = false;
         }
+    }
+
+    /// Whether the terminal answered the startup query for progressive
+    /// keyboard enhancement (Kitty protocol). `false` on non-unix targets,
+    /// where the startup query above never runs.
+    pub(crate) fn keyboard_enhancement_supported(&self) -> bool {
+        self.keyboard_enhancement_supported
     }
 }
 

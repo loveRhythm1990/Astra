@@ -133,7 +133,9 @@ fn probe_child() {
     }
     let sixel_before = astra_tools::display_sixel::cached_sixel_support();
     startup.prepare_tui().unwrap();
-    let mut guard = crate::tui::terminal::TerminalGuard::init().unwrap();
+    let mut guard =
+        crate::tui::terminal::TerminalGuard::init(startup.keyboard_enhancement_supported())
+            .unwrap();
     if case == "resize_missed" {
         // The shared reader is initialized by startup. Discard SIGWINCH to
         // exercise the size watchdog, without a synthetic resize event.
