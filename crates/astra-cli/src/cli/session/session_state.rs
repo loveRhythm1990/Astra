@@ -277,14 +277,6 @@ impl SessionModelChoice {
     }
 }
 
-/// Adaptive engine state persisted between sessions.
-/// Holds anti-flap dampening, experiment enrollment, and tuned config so the
-/// adaptive engine doesn't oscillate or lose progress on session restart.
-#[derive(Debug, Default, Clone)]
-pub(crate) struct PersistedAdaptiveState {
-    pub tuned_config_json: Option<String>,
-}
-
 // NOTE: SessionState is per-session and NOT shared across sessions. In future
 // server/multi-session mode, ensure each session gets its own SessionState
 // instance to prevent cross-session data leakage (permissions, history, tokens).
@@ -379,8 +371,8 @@ pub(crate) struct SessionState {
     /// and ConfigChange journal events so post-hoc audit can answer
     /// "what config did this session/turn run under".
     ///
-    /// `None` only for legacy code paths that don't walk through the
-    /// version front door yet (covered by follow-up commits).
+    /// The id may be computed without storing a configuration blob.
+    /// `None` means the session configuration has not yet been versioned.
     pub config_version_id: Option<String>,
     pub context_budget: prompts::ContextBudget,
     pub journal: Option<session_journal::JournalWriter>,
@@ -522,8 +514,8 @@ pub(crate) struct SessionState {
     pub observability_session: Option<
         std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     >,
-    /// Adaptive state restored from workspace, applied when ObservabilitySession is created.
-    pub pending_adaptive_state: Option<PersistedAdaptiveState>,
+    /// The observability projection needs the current authoritative runtime configuration.
+    pub observability_config_pending: bool,
 
     // ── User Profile (M5) ──
     /// User profile manager for preferences and scenario detection.
@@ -705,7 +697,7 @@ impl Default for SessionState {
             // Observability: hub is created at REPL startup, session on first turn
             observability_hub: None,
             observability_session: None,
-            pending_adaptive_state: None,
+            observability_config_pending: false,
             user_profile_manager: {
                 let store =
                     std::sync::Arc::new(astra_config::user_profile::UserProfileStore::new());
@@ -820,7 +812,9 @@ impl SessionState {
     /// Reset session-scoped runtime state after starting a new session.
     ///
     /// Intentionally preserves user preferences, model selection, project
-    /// instructions, runtime config, and long-lived registries/services.
+    /// instructions, and long-lived registries/services. This mechanical reset
+    /// does not select configuration: new-session boundaries must prepare and
+    /// install process/profile settings, while restore installs its snapshot.
     ///
     /// Call `prepare_for_session_rebind().await` before using this at a
     /// session boundary; this synchronous reset does not tear down the
@@ -867,7 +861,7 @@ impl SessionState {
         self.latest_turn_quality_feedback = None;
         self.cloud_plan_mirror = None;
         self.observability_session = None;
-        self.pending_adaptive_state = None;
+        self.observability_config_pending = false;
         self.csl_manager = None;
         self.perm_manager.clear_session_overrides();
         self.pending_bg_notifications.clear();
@@ -876,7 +870,7 @@ impl SessionState {
     /// Reset live state before restoring a different session into this REPL.
     ///
     /// Stronger than `reset_for_new_session()`: resume must also drop the
-    /// current session binding and any workspace-derived skill/adaptive state
+    /// current session binding and any workspace-derived skills and configuration
     /// so the next restore cannot inherit stale values from the previous
     /// session. Call `prepare_for_session_rebind().await` first so any
     /// root mailbox tied to the old session is unregistered before the

@@ -139,6 +139,32 @@ Scoped credentials drive login, refresh, memory proxy, explicit tools, recall, e
 
 ### Runtime tuning (optional)
 
+Runtime configuration exposes controls consumed by execution: compression,
+retrieval, token budgets, tool policy and tracing. The retired `verification`,
+`memory_pressure` and `context_window` sections are not supported. Model context
+window metadata and tool verification contracts retain their existing owners.
+
+Unknown top-level runtime fields are rejected by the configuration parser.
+`--settings` reports the parse error. A saved session configuration is a complete snapshot, not an overlay: restoring
+it replaces the execution configuration before deriving context budgets and the observability projection,
+including values equal to built-in defaults. The configuration version identifies the effective
+snapshot; an explicit `/explain --format` choice for the current CLI session retains precedence.
+Starting a new conversation with `/clear` selects the current process and profile configuration,
+rather than inheriting a restored session snapshot. Explicit CLI Explain preferences and the
+selected model remain in effect; budgets, configuration version and observability are derived again.
+Cold startup, new conversations, no-snapshot recovery and telemetry select profile identity from the
+account identity installed at entry, not ingestion metadata. An account without stored
+preferences uses its own default profile; only a CLI without an installed account identity uses
+anonymous preferences.
+Authentication changes select preferences for the verified target account after credentials are saved;
+re-authenticating the same account without resetting its conversation retains that session configuration.
+A saved snapshot must parse and satisfy the current invariants before resume changes the active session; invalid
+snapshots remain unchanged and are not migrated or filtered. This also rejects
+full snapshots that contain the retired sections, even if their values were defaults.
+The existing disk
+configuration loader reports a warning and skips an invalid user/project layer.
+
+
 - `ASTRA_MAX_TURNS` — optional positive ordinary execution-round cap. Bounded settlement/closing allowances remain separate, so this is not an absolute cap on all model calls or cost. Unset means renewable slices without an implicit round cap; it does not disable cancellation, execution-health checks, or individual operation timeouts.
 - `ASTRA_PLAN_SUBTASK_MAX_TURNS` — optional positive plan-subtask cap; unset inherits `ASTRA_MAX_TURNS`. Explicit zero or malformed round caps are rejected, not treated as unlimited.
 - `ASTRA_TURN_TIMEOUT_S`
