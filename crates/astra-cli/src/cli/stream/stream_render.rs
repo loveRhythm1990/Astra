@@ -1555,6 +1555,7 @@ fn durable_allow_was_acknowledged(result: &Result<(), PostApprovalError>) -> boo
     }
 }
 
+// Both callback handlers route 401 through mark_edge_auth_failure before this classifier.
 fn edge_callback_error_kind(error: &astra_thin_client::ThinClientError) -> astra_core::ErrorKind {
     match error {
         astra_thin_client::ThinClientError::Api { status, body }
@@ -1569,11 +1570,6 @@ fn edge_callback_error_kind(error: &astra_thin_client::ThinClientError) -> astra
         }
         astra_thin_client::ThinClientError::Api { status, .. } if status.is_server_error() => {
             astra_core::ErrorKind::ServerError
-        }
-        astra_thin_client::ThinClientError::Api { status, .. }
-            if *status == reqwest::StatusCode::UNAUTHORIZED =>
-        {
-            astra_core::ErrorKind::Auth
         }
         astra_thin_client::ThinClientError::Api { status, .. }
             if *status == reqwest::StatusCode::TOO_MANY_REQUESTS =>

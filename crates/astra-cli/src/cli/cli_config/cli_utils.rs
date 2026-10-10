@@ -845,14 +845,14 @@ pub(crate) fn read_api_error(status: u16, body: &str) -> String {
     // Gateways may return a whole block/login page instead of an API error.
     // Keep a bounded diagnostic ID, never render the page into the terminal.
     if body
-        .trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n'])
+        .trim_start_matches(|c: char| c == '\u{feff}' || c.is_whitespace())
         .starts_with('<')
     {
         static PAGE_REQUEST_ID: LazyLock<regex::Regex> = LazyLock::new(|| {
             regex::Regex::new(r#""(?:traceid|request_id)"\s*:\s*"([A-Za-z0-9_.:-]{1,128})""#)
                 .expect("valid page request ID pattern")
         });
-        let mut out = format!("request failed ({status}): HTML/markup response body omitted");
+        let mut out = format_error_with_context(status, "HTML/markup response body omitted");
         if let Some(id) = PAGE_REQUEST_ID.captures(body).and_then(|c| c.get(1)) {
             out.push_str(&format!("\n  request_id: {}", id.as_str()));
         }
@@ -897,7 +897,8 @@ pub(crate) fn read_api_error(status: u16, body: &str) -> String {
 }
 
 fn api_error_preview(text: &str, limit: usize) -> String {
-    let clean: String = text
+    let plain = crate::cli::terminal_region::strip_ansi_codes(text);
+    let clean: String = plain
         .chars()
         .filter(|c| !c.is_control() || c.is_whitespace())
         .collect();
@@ -1469,6 +1470,32 @@ mod tests {
         assert!(error.contains("body omitted"));
         assert!(!error.contains("request_id:"));
         assert!(!error.contains("proxy error"));
+    }
+
+    #[test]
+    fn read_api_error_markup_preserves_status_hints_and_auth_recognition() {
+        for status in [401, 403, 429, 503] {
+            for prefix in ["", "\u{000b}"] {
+                let body = format!("{prefix}<html>invalid token<script>page</script></html>");
+                let error = read_api_error(status, &body);
+                assert!(error.contains(status_hint(status).expect("status hint")));
+                assert!(error.contains("proxy/WAF"));
+                assert!(!error.contains("<html>"));
+                assert!(!error.contains("invalid token"));
+                assert_eq!(is_astra_session_auth_error(&error), status == 401);
+            }
+        }
+    }
+
+    #[test]
+    fn read_api_error_removes_complete_terminal_escape_sequences() {
+        let error = read_api_error(
+            409,
+            "\u{1b}[31mdenied\u{1b}[0m \u{1b}]0;window title\u{7}retry",
+        );
+        assert!(error.contains("denied retry"));
+        assert!(!error.contains("[31m"));
+        assert!(!error.contains("window title"));
     }
 
     #[test]
