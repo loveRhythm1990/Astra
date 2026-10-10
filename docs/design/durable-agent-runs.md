@@ -132,6 +132,15 @@ or evidence that same-run recovery is implemented.
   The persisted run remains subject to durable recovery, not pre-admission
   rejection. Logs identify the activation stage, session, run and expected
   generation; clients should inspect session status before another submission.
+- A zero-row database owner renewal records elapsed renewal time, configured
+  lease duration, and a best-effort exact-session authority snapshot using the
+  database clock. The diagnostic read has a 250 ms budget and reuses the
+  canonical authority reader/classifier. Snapshot labels distinguish missing
+  identity, changed owner/generation, inactive/cancelled state, expiry, and
+  authority that is current at the later observation. They describe a
+  post-update snapshot, not proof of which predicate rejected the earlier
+  update. Read failure/timeout retains the failed-renewal result and closes
+  its connection. The snapshot never renews, grants authority or auto-retries.
 - A local owner-lease deadline bounds an unconfirmed terminal attempt. If the
   store response stalls, the exact-generation durable status and event receipt
   are checked before reporting failure. The heartbeat allows this bounded

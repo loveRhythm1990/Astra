@@ -10546,6 +10546,7 @@ const FOREGROUND_RUN_CONTROL_DB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(
 // Orphan recovery is a retrying background worker. Keep each attempt short so
 // one contended run cannot starve the rest of the recovery scan.
 const BACKGROUND_RECOVERY_DB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+const OWNER_RENEWAL_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_millis(250);
 const RUN_START_TIMEOUT_RECEIPT_TIMEOUT: Duration = Duration::from_secs(2);
 const RUN_CONTROL_LOCK_WAIT_TIMEOUT_SECS: i64 = 3;
 
@@ -22390,6 +22391,7 @@ impl RunStateStore for DatabaseRunStateStore {
             return Ok(false);
         }
 
+        let started = std::time::Instant::now();
         let mut query =
             sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET owner_pod_id = ");
         query.push_bind(&self.owner_pod_id);
@@ -22430,6 +22432,60 @@ impl RunStateStore for DatabaseRunStateStore {
             .await
             .map_err(|source| db_error("renew_owner_lease", run_id, source).to_string())?;
         let renewed = result.rows_affected() > 0;
+        if !renewed {
+            let renewal_elapsed_ms = started.elapsed().as_millis() as u64;
+            // A later snapshot helps correlate a refused UPDATE, but cannot
+            // prove which predicate failed at its execution time. It never
+            // grants authority, retries the UPDATE, or changes its false result.
+            let observed = tokio::time::timeout(
+                OWNER_RENEWAL_DIAGNOSTIC_TIMEOUT,
+                load_exact_live_run_execution_authority(
+                    connection.connection_mut(),
+                    user_id,
+                    expected_session_id,
+                    run_id,
+                    expected_owner_generation,
+                    &self.owner_pod_id,
+                    expected_statuses,
+                ),
+            )
+            .await;
+            let snapshot_reason = match &observed {
+                Ok(Ok(ExactLiveRunExecutionAuthority::Live)) => "current_at_snapshot",
+                Ok(Ok(ExactLiveRunExecutionAuthority::Inactive { .. })) => {
+                    "inactive_or_cancellation_requested"
+                }
+                Ok(Ok(ExactLiveRunExecutionAuthority::OwnerGenerationMismatch { .. })) => {
+                    "generation_mismatch"
+                }
+                Ok(Ok(ExactLiveRunExecutionAuthority::OwnerMismatch { .. })) => "owner_mismatch",
+                Ok(Ok(ExactLiveRunExecutionAuthority::LeaseExpired)) => "lease_expired_at_snapshot",
+                Ok(Ok(ExactLiveRunExecutionAuthority::Missing)) => {
+                    "row_missing_or_session_mismatch"
+                }
+                Ok(Err(_)) => "snapshot_read_failed",
+                Err(_) => "snapshot_read_timed_out",
+            };
+            tracing::warn!(
+                target: "astra_services::runs",
+                operation = "renew_owner_lease",
+                user_id,
+                session_id = expected_session_id,
+                run_id,
+                expected_owner_generation,
+                renewal_elapsed_ms,
+                lease_ttl_ms = self.lease_ttl.as_millis() as u64,
+                snapshot_reason,
+                evidence = "post_update_snapshot",
+                "owner renewal matched no rows; snapshot is diagnostic only, not the cause of the refused update"
+            );
+            if !matches!(observed, Ok(Ok(_))) {
+                // A timed-out read may still be active on this physical
+                // connection. Dropping the guard closes it instead of lending
+                // a half-read protocol exchange to the shared pool.
+                return Ok(false);
+            }
+        }
         connection.release();
         Ok(renewed)
     }
@@ -28955,6 +29011,120 @@ mod tests {
             .execute(pool.get())
             .await
             .expect("clean owner renewal session");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn rejected_owner_renewal_retains_false_result_and_db_clock_diagnostics() {
+        let (_, pool) = setup_database_run_state_store_it().await;
+        let store = DatabaseRunStateStore::new(pool.clone())
+            .with_owner_pod_id("renewal-diagnostic-owner")
+            .with_lease_ttl(Duration::from_secs(300));
+        let nonce = Uuid::new_v4();
+        let user = format!("renewal-diagnostic-u-{nonce}");
+        let session = format!("renewal-diagnostic-s-{nonce}");
+        let run_id = format!("renewal-diagnostic-r-{nonce}");
+        insert_active_database_session_fixture(&pool, &user, &session).await;
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user.clone();
+        run.session_id = session.clone();
+        store.insert_run(run).await.expect("insert fresh owned run");
+        assert!(
+            store
+                .renew_owner_lease(&user, &session, &run_id, 0, &[STATUS_RUNNING])
+                .await
+                .expect("fresh first renewal")
+        );
+
+        for (mutation, expected) in [
+            (
+                "owner_pod_id = 'another-owner'",
+                ExactLiveRunExecutionAuthority::OwnerMismatch {
+                    actual_owner_pod_id: Some("another-owner".into()),
+                },
+            ),
+            (
+                "run_generation = 1",
+                ExactLiveRunExecutionAuthority::OwnerGenerationMismatch {
+                    actual_owner_generation: 1,
+                },
+            ),
+            (
+                "status = 'completed'",
+                ExactLiveRunExecutionAuthority::Inactive {
+                    status: STATUS_COMPLETED.into(),
+                },
+            ),
+            (
+                "cancellation_requested_at = NOW(6)",
+                ExactLiveRunExecutionAuthority::Inactive {
+                    status: STATUS_CANCELLED.into(),
+                },
+            ),
+            (
+                "owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND)",
+                ExactLiveRunExecutionAuthority::LeaseExpired,
+            ),
+            (
+                "session_id = 'different-session'",
+                ExactLiveRunExecutionAuthority::Missing,
+            ),
+        ] {
+            sqlx::query(
+                "UPDATE agent_runs SET owner_pod_id = 'renewal-diagnostic-owner',
+                 run_generation = 0, status = 'running', cancellation_requested_at = NULL,
+                 session_id = ?, owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL 300 SECOND)
+                 WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(&session)
+            .bind(&user)
+            .bind(&run_id)
+            .execute(pool.get())
+            .await
+            .expect("reset exact live authority");
+            sqlx::query(&format!(
+                "UPDATE agent_runs SET {mutation} WHERE user_id = ? AND run_id = ?"
+            ))
+            .bind(&user)
+            .bind(&run_id)
+            .execute(pool.get())
+            .await
+            .expect("invalidate one renewal predicate");
+            assert!(
+                !store
+                    .renew_owner_lease(&user, &session, &run_id, 0, &[STATUS_RUNNING])
+                    .await
+                    .expect("rejected renewal remains a resolved ownership conflict"),
+                "{mutation}"
+            );
+            let observed = load_exact_live_run_execution_authority(
+                pool.get(),
+                &user,
+                &session,
+                &run_id,
+                0,
+                "renewal-diagnostic-owner",
+                &[STATUS_RUNNING],
+            )
+            .await
+            .expect("read exact-session database-clock snapshot");
+            assert_eq!(observed, expected, "{mutation}");
+        }
+        cleanup_database_run_fixture(&pool, &user, &run_id).await;
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .expect("clean renewal diagnostic session");
+        sqlx::query(
+            "DELETE FROM agent_session_lifecycle_fences WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user)
+        .bind(&session)
+        .execute(pool.get())
+        .await
+        .expect("clean renewal diagnostic fence");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
