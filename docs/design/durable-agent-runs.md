@@ -134,13 +134,17 @@ or evidence that same-run recovery is implemented.
   generation; clients should inspect session status before another submission.
 - A zero-row database owner renewal records elapsed renewal time, configured
   lease duration, and a best-effort exact-session authority snapshot using the
-  database clock. The diagnostic read has a 250 ms budget and reuses the
+  database clock. Runtime callers pass their monotonic attempt deadline. The
+  diagnostic read uses at most 250 ms and one quarter of the remaining attempt
+  budget, and is skipped when that share is below 1 ms. It reuses the
   canonical authority reader/classifier. Snapshot labels distinguish missing
   identity, changed owner/generation, inactive/cancelled state, expiry, and
   authority that is current at the later observation. They describe a
   post-update snapshot, not proof of which predicate rejected the earlier
-  update. Read failure/timeout retains the failed-renewal result and closes
-  its connection. The snapshot never renews, grants authority or auto-retries.
+  update. Completed SQL errors retain the failed-renewal result and release
+  the synchronized connection; only a timed-out exchange discards it. A skipped
+  read also releases the checkout. The snapshot never renews, grants authority
+  or auto-retries.
 - A local owner-lease deadline bounds an unconfirmed terminal attempt. If the
   store response stalls, the exact-generation durable status and event receipt
   are checked before reporting failure. The heartbeat allows this bounded
