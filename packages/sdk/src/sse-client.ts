@@ -88,19 +88,23 @@ export class SSEClient {
   }
 
   async connect(): Promise<void> {
+    this.closed = false;
     this.retryCount = 0;
     await this.connectAttempt();
   }
 
   private async connectAttempt(): Promise<void> {
-    this.closed = false;
+    if (this.closed || this.options.signal?.aborted) return;
     this.sawTerminalEvent = false;
     this.options.onStateChange?.('connecting');
+    if (this.closed || this.options.signal?.aborted) return;
 
     this.controller = new AbortController();
-    const linkedSignal = this.options.signal
+    const linked = this.options.signal
       ? combineSignals(this.options.signal, this.controller.signal)
-      : this.controller.signal;
+      : { signal: this.controller.signal, dispose: () => {} };
+    const linkedSignal = linked.signal;
+    let retry = false;
 
     try {
       let headers = headersInitToRecord({
@@ -150,8 +154,11 @@ export class SSEClient {
         message: `Connection error: ${message}`,
         retryable: this.retryCount < this.options.maxRetries,
       } as StreamEvent);
-      await this.maybeRetry();
+      retry = await this.maybeRetry(linkedSignal);
+    } finally {
+      linked.dispose();
     }
+    if (retry) await this.connectAttempt();
   }
 
   close(): void {
@@ -260,24 +267,40 @@ export class SSEClient {
     }
   }
 
-  private async maybeRetry(): Promise<void> {
+  private async maybeRetry(signal: AbortSignal): Promise<boolean> {
     this.retryCount++;
-    if (this.closed || this.retryCount > this.options.maxRetries) return;
+    if (this.closed || signal.aborted || this.retryCount > this.options.maxRetries) return false;
 
     const delay = this.options.retryDelayMs * Math.pow(1.5, this.retryCount - 1);
-    await new Promise((r) => setTimeout(r, delay));
+    await new Promise<void>((resolve) => {
+      const finish = () => {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, delay);
+      signal.addEventListener('abort', finish, { once: true });
+      if (signal.aborted) finish();
+    });
 
-    if (!this.closed) {
-      await this.connectAttempt();
-    }
+    return !this.closed && !signal.aborted;
   }
 }
 
-function combineSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
+function combineSignals(a: AbortSignal, b: AbortSignal): {
+  signal: AbortSignal;
+  dispose: () => void;
+} {
   const controller = new AbortController();
   const onAbort = () => controller.abort();
   a.addEventListener('abort', onAbort, { once: true });
   b.addEventListener('abort', onAbort, { once: true });
   if (a.aborted || b.aborted) controller.abort();
-  return controller.signal;
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      a.removeEventListener('abort', onAbort);
+      b.removeEventListener('abort', onAbort);
+    },
+  };
 }
