@@ -36,6 +36,38 @@ for (const casing of ['Authorization', 'authorization', 'AUTHORIZATION']) {
   });
 }
 
+test('SSE custom header casing overrides default Accept and Cache-Control once', async () => {
+  const fetch = vi.fn().mockResolvedValue(new Response('data: {"type":"run_finished"}\n\n'));
+  vi.stubGlobal('fetch', fetch);
+  const client = new SSEClient({
+    url: 'https://example.test/stream', maxRetries: 0, onEvent: () => {},
+    headers: { accept: 'application/custom', 'CACHE-CONTROL': 'private' },
+  });
+  await client.connect();
+  client.close();
+  const headers = new Headers(fetch.mock.calls[0][1].headers);
+  expect(headers.get('accept')).toBe('application/custom');
+  expect(headers.get('cache-control')).toBe('private');
+});
+
+for (const headers of [
+  { authorization: 'Bearer request-token', 'content-type': 'application/octet-stream' },
+  new Headers({ authorization: 'Bearer request-token', 'content-type': 'application/octet-stream' }),
+]) {
+  test(`public fetch preserves per-request override precedence (${headers.constructor.name})`, async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response('{}', { headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetch);
+    const client = new AstraClient({
+      baseUrl: 'https://example.test', accessToken: 'current-token',
+      headers: { AUTHORIZATION: 'Bearer configured-token' },
+    });
+    await client.fetch('/synthetic', { method: 'POST', body: 'data', headers });
+    const sent = new Headers(fetch.mock.calls[0][1].headers);
+    expect(sent.get('authorization')).toBe('Bearer request-token');
+    expect(sent.get('content-type')).toBe('application/octet-stream');
+  });
+}
+
 for (const headers of [
   { authorization: 'Bearer override-token' },
   [['AUTHORIZATION', 'Bearer override-token']] as [string, string][],
