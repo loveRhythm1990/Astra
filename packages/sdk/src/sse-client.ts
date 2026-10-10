@@ -74,6 +74,7 @@ export class SSEClient {
   private options: Required<Pick<SSEClientOptions, 'url' | 'onEvent' | 'maxRetries' | 'retryDelayMs'>> &
     SSEClientOptions;
   private controller: AbortController | null = null;
+  private heartbeatController: AbortController | null = null;
   private retryCount = 0;
   private closed = false;
   private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
@@ -104,6 +105,10 @@ export class SSEClient {
       ? combineSignals(this.options.signal, this.controller.signal)
       : { signal: this.controller.signal, dispose: () => {} };
     const linkedSignal = linked.signal;
+    // Heartbeat aborts only the stalled fetch, not the cancellable retry wait.
+    const heartbeatController = new AbortController();
+    this.heartbeatController = heartbeatController;
+    const fetchSignal = combineSignals(linkedSignal, heartbeatController.signal);
     let retry = false;
 
     try {
@@ -122,7 +127,7 @@ export class SSEClient {
         method: this.options.method ?? 'GET',
         headers,
         body: this.options.body,
-        signal: linkedSignal,
+        signal: fetchSignal.signal,
       });
 
       if (!response.ok) {
@@ -141,21 +146,27 @@ export class SSEClient {
 
       this.options.onStateChange?.('connected');
       await this.readStream(response.body);
+      if (heartbeatController.signal.aborted && !this.sawTerminalEvent) {
+        throw new Error('Heartbeat timeout');
+      }
 
       if (!this.closed) {
         this.options.onStateChange?.('disconnected');
       }
     } catch (err) {
-      if (this.closed || linkedSignal.aborted) return;
+      if (this.closed || linkedSignal.aborted || this.sawTerminalEvent) return;
       const message = err instanceof Error ? err.message : 'Unknown error';
       this.options.onStateChange?.('error');
       this.options.onEvent({
         type: 'error',
-        message: `Connection error: ${message}`,
+        message: heartbeatController.signal.aborted
+          ? `Connection timed out after ${this.options.heartbeatTimeoutMs}ms without heartbeat`
+          : `Connection error: ${message}`,
         retryable: this.retryCount < this.options.maxRetries,
       } as StreamEvent);
       retry = await this.maybeRetry(linkedSignal);
     } finally {
+      fetchSignal.dispose();
       linked.dispose();
     }
     if (retry) await this.connectAttempt();
@@ -166,6 +177,7 @@ export class SSEClient {
     this.clearHeartbeatTimer();
     this.controller?.abort();
     this.controller = null;
+    this.heartbeatController = null;
     this.options.onStateChange?.('disconnected');
   }
 
@@ -250,13 +262,7 @@ export class SSEClient {
       // keeps the HTTP body open after it has published that event must not
       // turn an otherwise completed turn into a retryable heartbeat error.
       if (this.closed || this.sawTerminalEvent) return;
-      this.controller?.abort();
-      this.options.onStateChange?.('error');
-      this.options.onEvent({
-        type: 'error',
-        message: `Connection timed out after ${this.options.heartbeatTimeoutMs}ms without heartbeat`,
-        retryable: true,
-      } as StreamEvent);
+      this.heartbeatController?.abort();
     }, this.options.heartbeatTimeoutMs);
   }
 
