@@ -216,7 +216,11 @@ coordination authority inside the tool-writable workspace.
   within the caller's remaining monotonic deadline. Exhaustion returns typed
   `WorkspaceLeaseFailure::WatcherCapacity` facts with active/requested/limit
   counts, carried into tool result fields as `reason: watcher_capacity` and
-  `watcher_descriptors`. It does not instruct the caller to wait for an operation
+  `watcher_descriptors`. These are the last observed capacity counts. If a retry
+  uses the remaining deadline before reaching watcher admission, expiry retains
+  that observed refusal instead of reclassifying it as workspace contention.
+  A definitive cancellation, binding failure, or ownership failure still wins.
+  It does not instruct the caller to wait for an operation
   in this same workspace. A zero limit or a watcher larger than the budget
   rejects immediately with `retryable: false` and a resource repair action.
   Cancellation, failed registration, and lease drop

@@ -2328,12 +2328,34 @@ async fn acquire_workspace_lease_async(
     max_wait: Duration,
 ) -> Result<WorkspaceObservationLease, WorkspaceLeaseFailure> {
     let deadline = tokio::time::Instant::now() + max_wait;
+    wait_for_workspace_lease_capacity(workspace_root, cancel_token, deadline, || {
+        acquire_workspace_lease_attempt(workspace_root, cancel_token, deadline)
+    })
+    .await
+}
+
+/// Keep the most recent observed capacity refusal while a bounded retry is
+/// pending. A later deadline-only contention classification is not new
+/// evidence that workspace contention caused the original admission failure.
+async fn wait_for_workspace_lease_capacity<T, F, Fut>(
+    workspace_root: &Path,
+    cancel_token: Option<&CancellationToken>,
+    deadline: tokio::time::Instant,
+    mut attempt: F,
+) -> Result<T, WorkspaceLeaseFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, WorkspaceLeaseFailure>>,
+{
+    let mut last_capacity_failure = None;
     loop {
-        let failure =
-            match acquire_workspace_lease_attempt(workspace_root, cancel_token, deadline).await {
-                Ok(lease) => return Ok(lease),
-                Err(failure) => failure,
-            };
+        let failure = match attempt().await {
+            Ok(lease) => return Ok(lease),
+            Err(WorkspaceLeaseFailure::Contended) if tokio::time::Instant::now() >= deadline => {
+                last_capacity_failure.unwrap_or(WorkspaceLeaseFailure::Contended)
+            }
+            Err(failure) => failure,
+        };
         if !failure.transient_capacity() || tokio::time::Instant::now() >= deadline {
             if matches!(failure, WorkspaceLeaseFailure::WatcherCapacity { .. }) {
                 tracing::warn!(workspace_root = %workspace_root.display(), %failure,
@@ -2341,6 +2363,7 @@ async fn acquire_workspace_lease_async(
             }
             return Err(failure);
         }
+        last_capacity_failure = Some(failure);
         // An attempt has already released its locks and gate. Capacity may
         // belong to another workspace; wait within this same caller budget.
         let delay = tokio::time::sleep(
@@ -7225,6 +7248,62 @@ mod tests {
             .is_err()
         );
         assert!(!missing.join(".astra").exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capacity_wait_keeps_observed_failure_when_reacquisition_uses_remaining_deadline() {
+        let capacity = WorkspaceLeaseFailure::WatcherCapacity {
+            active: 64,
+            requested: 23,
+            limit: 64,
+        };
+        for final_failure in [
+            WorkspaceLeaseFailure::Contended,
+            WorkspaceLeaseFailure::Cancelled,
+            WorkspaceLeaseFailure::BindingUnavailable,
+            WorkspaceLeaseFailure::OwnershipUnsettled,
+            WorkspaceLeaseFailure::WatcherUnavailable,
+        ] {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+            let mut attempts = 0;
+            let result: Result<(), WorkspaceLeaseFailure> = wait_for_workspace_lease_capacity(
+                Path::new("unused-capacity-test-workspace"),
+                None,
+                deadline,
+                || {
+                    attempts += 1;
+                    let first_attempt = attempts == 1;
+                    async move {
+                        if first_attempt {
+                            return Err(capacity);
+                        }
+                        tokio::time::sleep_until(deadline).await;
+                        Err(final_failure)
+                    }
+                },
+            )
+            .await;
+            let expected = if final_failure == WorkspaceLeaseFailure::Contended {
+                capacity
+            } else {
+                final_failure
+            };
+            assert_eq!(
+                attempts, 2,
+                "must exercise deadline exhaustion during retry"
+            );
+            assert_eq!(result, Err(expected));
+        }
+
+        // No capacity refusal was observed: ordinary contention stays contention.
+        let result: Result<(), WorkspaceLeaseFailure> = wait_for_workspace_lease_capacity(
+            Path::new("unused-capacity-test-workspace"),
+            None,
+            tokio::time::Instant::now(),
+            || async { Err(WorkspaceLeaseFailure::Contended) },
+        )
+        .await;
+        assert_eq!(result, Err(WorkspaceLeaseFailure::Contended));
     }
 
     #[cfg(target_os = "macos")]

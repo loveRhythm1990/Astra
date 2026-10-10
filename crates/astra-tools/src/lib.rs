@@ -477,7 +477,7 @@ pub fn workspace_lease_failure_tool_result(
             let retryable = limit > 0 && requested <= limit;
             let message = if retryable {
                 format!(
-                    "Tool '{name}' was not executed because the process-wide workspace watcher descriptor budget remained full after its admission wait; wait for other workspace leases to finish before retrying"
+                    "Tool '{name}' was not executed because its admission wait expired after a process-wide workspace watcher descriptor capacity refusal; wait for other workspace leases to finish before retrying"
                 )
             } else {
                 format!(
