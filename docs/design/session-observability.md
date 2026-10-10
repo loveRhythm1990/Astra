@@ -113,6 +113,17 @@ different identity.
 
 Malformed non-critical stream events should be isolated when possible. Identity or cursor corruption should fail closed with structured error and should not corrupt durable run state.
 
+Edge callback HTTP failures are reported independently of tool execution and
+durable run state. A generic HTTP rejection, including a proxy/WAF HTML block
+page, is not evidence of a lifecycle contract violation. Structured callback
+conflicts retain their contract classification. CLI diagnostics retain the HTTP
+status and available request ID, omit HTML/markup pages, and bound other response
+previews. Live stderr, returned callback errors, and final detach messages use
+the same API error formatter. Detachment is distinct from confirmed Server run
+cancellation; existing surface-specific settlement and recovery remain
+authoritative. An ambiguous acknowledgement must not be treated as proof of
+rejection or used to justify re-executing a completed tool.
+
 ## Tool results and runtime guidance
 
 Tool result documents and runtime-authored guidance are distinct evidence.
