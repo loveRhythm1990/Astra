@@ -205,6 +205,17 @@ coordination authority inside the tool-writable workspace.
   Concurrent contenders can retreat together, but cannot both be admitted;
   process-diverse jitter restores progress without a machine-global admission
   gate.
+- macOS watcher admission atomically reserves the kqueue descriptor and every
+  duplicated witness or opened binding descriptor before opening any watcher
+  files. The process-wide budget is the minimum of 1,024 descriptors, one
+  quarter of the current `RLIMIT_NOFILE` soft limit, and the soft limit minus
+  64 descriptors of headroom. Watched paths consume that same budget; there is
+  no unbounded path subscription pool. Insufficient capacity fails closed
+  before tool execution. Cancellation, failed registration, and lease drop
+  close descriptors before releasing the reservation. The budget covers
+  watcher-owned descriptors, not all runtime files/sockets; unrelated resource
+  exhaustion still fails closed. Lowering the soft limit does not revoke
+  existing leases, but subsequent admission uses the new limit.
 - Kernel ownership must end automatically when the holder process exits.
   Replacing or unlinking a witness or workspace binding must not admit a second
   generation, and any observed tamper revokes receipt authority permanently

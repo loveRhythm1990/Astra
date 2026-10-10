@@ -641,11 +641,67 @@ struct GenerationTamperWatch {
 }
 
 #[cfg(target_os = "macos")]
+const MAX_MACOS_WATCH_DESCRIPTORS: usize = 1_024;
+#[cfg(target_os = "macos")]
+const MACOS_WATCH_DESCRIPTOR_HEADROOM: usize = 64;
+#[cfg(target_os = "macos")]
+static MACOS_WATCH_DESCRIPTORS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(target_os = "macos")]
+fn macos_watch_descriptor_limit(soft_limit: usize) -> usize {
+    MAX_MACOS_WATCH_DESCRIPTORS
+        .min(soft_limit / 4)
+        .min(soft_limit.saturating_sub(MACOS_WATCH_DESCRIPTOR_HEADROOM))
+}
+
+/// Account for the kqueue and every retained vnode description before opening
+/// any of them. This is a process resource budget, not workspace authority.
+#[cfg(target_os = "macos")]
+struct MacOsWatchDescriptorReservation {
+    descriptors: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl MacOsWatchDescriptorReservation {
+    fn reserve(descriptors: usize) -> std::io::Result<Self> {
+        let mut resource_limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut resource_limit) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let limit = macos_watch_descriptor_limit(
+            usize::try_from(resource_limit.rlim_cur).unwrap_or(usize::MAX),
+        );
+        MACOS_WATCH_DESCRIPTORS
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |active| active.checked_add(descriptors).filter(|next| *next <= limit),
+            )
+            .map_err(|active| {
+                std::io::Error::other(format!(
+                    "macOS workspace watcher capacity exceeded (active_descriptors={active}, requested_descriptors={descriptors}, limit={limit}); no receipt authority was granted"
+                ))
+            })?;
+        Ok(Self { descriptors })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacOsWatchDescriptorReservation {
+    fn drop(&mut self) {
+        MACOS_WATCH_DESCRIPTORS.fetch_sub(self.descriptors, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+#[cfg(target_os = "macos")]
 struct MacOsGenerationTamperWatch {
     kqueue: std::os::fd::OwnedFd,
     _watched_paths: Vec<std::fs::File>,
     tampered: std::sync::atomic::AtomicBool,
     poll_gate: std::sync::Mutex<()>,
+    // Last field: close all descriptors before making the capacity reusable.
+    _descriptor_reservation: MacOsWatchDescriptorReservation,
 }
 
 #[cfg(target_os = "macos")]
@@ -666,6 +722,21 @@ impl MacOsGenerationTamperWatch {
     ) -> std::io::Result<Self> {
         use std::os::fd::{AsRawFd, FromRawFd};
 
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "workspace generation watch registration was cancelled",
+            ));
+        }
+        let binding_paths = binding_paths.into_iter().collect::<Vec<_>>();
+        let requested = locks
+            .len()
+            .checked_add(binding_paths.len())
+            .and_then(|paths| paths.checked_add(1))
+            .ok_or_else(|| std::io::Error::other("macOS workspace watcher size overflow"))?;
+        // Declare the reservation before owned descriptors so every error path
+        // closes partial registrations before refunding their capacity.
+        let descriptor_reservation = MacOsWatchDescriptorReservation::reserve(requested)?;
         let lock_mask = libc::NOTE_ATTRIB
             | libc::NOTE_DELETE
             | libc::NOTE_EXTEND
@@ -744,6 +815,7 @@ impl MacOsGenerationTamperWatch {
             _watched_paths: watched_paths,
             tampered: std::sync::atomic::AtomicBool::new(false),
             poll_gate: std::sync::Mutex::new(()),
+            _descriptor_reservation: descriptor_reservation,
         })
     }
 
@@ -7008,6 +7080,199 @@ mod tests {
             .is_none()
         );
         assert!(!missing.join(".astra").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_watch_budget_preserves_headroom_at_small_limits() {
+        assert_eq!(macos_watch_descriptor_limit(32), 0);
+        assert_eq!(macos_watch_descriptor_limit(64), 0);
+        assert_eq!(macos_watch_descriptor_limit(80), 16);
+        assert_eq!(macos_watch_descriptor_limit(256), 64);
+        assert_eq!(macos_watch_descriptor_limit(4_096), 1_024);
+        assert_eq!(macos_watch_descriptor_limit(usize::MAX), 1_024);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_watch_budget_runs_with_a_low_fd_limit_in_an_isolated_process() {
+        let output = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("workspace_observation::tests::macos_watch_budget_low_fd_helper")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("ASTRA_TEST_MACOS_WATCH_BUDGET", "1")
+            .output()
+            .expect("run isolated descriptor-budget regression");
+        assert!(
+            output.status.success(),
+            "low-FD child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_watch_budget_low_fd_helper() {
+        use std::sync::atomic::Ordering;
+
+        if std::env::var_os("ASTRA_TEST_MACOS_WATCH_BUDGET").is_none() {
+            return;
+        }
+        // Only this child changes the process limit. Parallel parent tests
+        // must keep their own descriptor limits and reservations intact.
+        let mut resource_limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut resource_limit) },
+            0
+        );
+        resource_limit.rlim_cur = resource_limit.rlim_cur.min(256);
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const resource_limit) },
+            0
+        );
+        let soft_limit = usize::try_from(resource_limit.rlim_cur).unwrap();
+        let limit = macos_watch_descriptor_limit(soft_limit);
+        let fd_count = || {
+            (0..soft_limit)
+                .filter(|fd| unsafe { libc::fcntl(*fd as i32, libc::F_GETFD) } >= 0)
+                .count()
+        };
+        let parent = tempfile::tempdir().expect("workspace parent");
+        let roots = (0..64)
+            .map(|index| {
+                let root = parent.path().join(format!("workspace-{index}/a/b/c/d"));
+                fs::create_dir_all(&root).expect("deep workspace");
+                root
+            })
+            .collect::<Vec<_>>();
+        let baseline = fd_count();
+        let mut leases = Vec::new();
+        let mut refused_root = None;
+        for root in &roots {
+            match acquire_workspace_observation_lease_with_options(
+                root,
+                None,
+                Duration::from_millis(100),
+            )
+            .await
+            {
+                Some(lease) => leases.push(lease),
+                None => refused_root = Some(root.clone()),
+            }
+            assert!(MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire) <= limit);
+            assert!(
+                fd_count() < soft_limit.saturating_sub(32),
+                "watch admission must leave descriptors for unrelated operations"
+            );
+        }
+        assert!(!leases.is_empty(), "some workspace leases must be admitted");
+        let refused_root = refused_root.expect("64 live generations exceed the watcher budget");
+        assert!(
+            leases
+                .iter()
+                .all(WorkspaceObservationLease::integrity_valid)
+        );
+
+        // Saturating the resource budget is independent of workspace authority.
+        // A direct overflow refuses before invoking the registration hook.
+        let error = MacOsGenerationTamperWatch::arm_before_register(
+            &leases[0].locks,
+            std::iter::repeat_n(leases[0].binding_identity.path_components[0].clone(), limit),
+            None,
+            || panic!("capacity overflow must not register a watch"),
+        )
+        .err()
+        .expect("oversized registration must fail closed");
+        assert!(error.to_string().contains("watcher capacity exceeded"));
+        let active = MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire);
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(
+            MacOsGenerationTamperWatch::arm(&leases[0].locks, Vec::new(), Some(&cancelled))
+                .is_err()
+        );
+        assert_eq!(MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire), active);
+
+        // A tampered generation stays independently revoked under saturation.
+        fs::write(&leases[0].locks[0].path, "tamper").unwrap();
+        assert!(!leases[0].integrity_valid());
+        assert!(!leases[0].integrity_valid());
+        assert!(
+            leases
+                .iter()
+                .skip(1)
+                .all(WorkspaceObservationLease::integrity_valid)
+        );
+        drop(leases);
+        assert_eq!(MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire), 0);
+        assert_eq!(
+            fd_count(),
+            baseline,
+            "lease teardown must close all descriptors"
+        );
+
+        // Hold every successful reservation until all contenders have tried.
+        // Capacity must be shared atomically across independent callers.
+        let barrier = std::sync::Barrier::new(17);
+        let release = std::sync::Barrier::new(17);
+        let mut reserved_at_barrier = 0;
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let barrier = &barrier;
+                let release = &release;
+                scope.spawn(move || {
+                    let reservation = MacOsWatchDescriptorReservation::reserve(limit / 8).ok();
+                    barrier.wait();
+                    release.wait();
+                    drop(reservation);
+                });
+            }
+            barrier.wait();
+            reserved_at_barrier = MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire);
+            release.wait();
+        });
+        assert_eq!(reserved_at_barrier, limit);
+        assert_eq!(MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire), 0);
+
+        let fresh = acquire_workspace_observation_lease_with_options(
+            &refused_root,
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("refused workspace can reacquire after capacity is released");
+        assert!(fresh.integrity_valid());
+        let mut missing = WorkspacePathIdentity::capture(refused_root.clone()).unwrap();
+        missing.path = refused_root.join("missing-binding");
+        let before_failure = MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire);
+        assert!(MacOsGenerationTamperWatch::arm(&fresh.locks, [missing], None).is_err());
+        assert_eq!(
+            MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire),
+            before_failure
+        );
+        let cancel_during_registration = CancellationToken::new();
+        let error = MacOsGenerationTamperWatch::arm_before_register(
+            &fresh.locks,
+            Vec::new(),
+            Some(&cancel_during_registration),
+            || cancel_during_registration.cancel(),
+        )
+        .err()
+        .expect("registration cancellation must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(
+            MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire),
+            before_failure
+        );
+        drop(fresh);
+        assert_eq!(MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire), 0);
+        assert_eq!(
+            fd_count(),
+            baseline,
+            "failed admission must not leak descriptors"
+        );
     }
 
     #[cfg(target_os = "macos")]
