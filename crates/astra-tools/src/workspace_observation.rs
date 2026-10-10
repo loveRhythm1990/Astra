@@ -539,6 +539,49 @@ pub enum WorkspaceLeaseFailure {
     OwnershipUnsettled,
     BindingUnavailable,
     Contended,
+    Cancelled,
+    WatcherUnavailable,
+    WatcherCapacity {
+        active: usize,
+        requested: usize,
+        limit: usize,
+    },
+}
+
+impl std::fmt::Display for WorkspaceLeaseFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WatcherCapacity {
+                active,
+                requested,
+                limit,
+            } => write!(
+                formatter,
+                "macOS workspace watcher capacity exceeded (active_descriptors={active}, requested_descriptors={requested}, limit={limit}); no receipt authority was granted"
+            ),
+            other => write!(formatter, "workspace lease admission failed: {other:?}"),
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceLeaseFailure {}
+
+impl WorkspaceLeaseFailure {
+    fn from_watch_error(error: &std::io::Error) -> Self {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<Self>())
+            .copied()
+            .unwrap_or(if error.kind() == std::io::ErrorKind::Interrupted {
+                Self::Cancelled
+            } else {
+                Self::WatcherUnavailable
+            })
+    }
+
+    fn transient_capacity(self) -> bool {
+        matches!(self, Self::WatcherCapacity { requested, limit, .. } if requested <= limit && limit > 0)
+    }
 }
 
 pub fn classify_workspace_lease_failure(workspace_root: &Path) -> WorkspaceLeaseFailure {
@@ -562,11 +605,12 @@ pub async fn begin_workspace_writer_with_options(
     workspace_root: &Path,
     cancel_token: Option<&CancellationToken>,
     max_wait: Duration,
-) -> Option<WorkspaceWriterGuard> {
+) -> Result<WorkspaceWriterGuard, WorkspaceLeaseFailure> {
     let lease =
         acquire_workspace_mutation_lease_with_options(workspace_root, cancel_token, max_wait)
             .await?;
     begin_workspace_writer_after_lease(workspace_root, lease)
+        .ok_or(WorkspaceLeaseFailure::BindingUnavailable)
 }
 
 fn begin_workspace_writer_after_lease(
@@ -676,12 +720,18 @@ impl MacOsWatchDescriptorReservation {
             .fetch_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
-                |active| active.checked_add(descriptors).filter(|next| *next <= limit),
+                |active| {
+                    active
+                        .checked_add(descriptors)
+                        .filter(|next| *next <= limit)
+                },
             )
             .map_err(|active| {
-                std::io::Error::other(format!(
-                    "macOS workspace watcher capacity exceeded (active_descriptors={active}, requested_descriptors={descriptors}, limit={limit}); no receipt authority was granted"
-                ))
+                std::io::Error::other(WorkspaceLeaseFailure::WatcherCapacity {
+                    active,
+                    requested: descriptors,
+                    limit,
+                })
             })?;
         Ok(Self { descriptors })
     }
@@ -2248,14 +2298,13 @@ async fn acquire_cross_process_lock_async(
 }
 
 /// Acquire the per-workspace lease without allowing queueing to outlive the
-/// caller's cancellation/deadline. `None` means the workspace could not be
-/// canonicalized, the wait expired, or cancellation won; callers must return
-/// an error rather than executing unobserved.
+/// caller's cancellation/deadline. Failures retain their typed admission reason;
+/// callers must return an error rather than executing unobserved.
 pub async fn acquire_workspace_observation_lease_with_options(
     workspace_root: &Path,
     cancel_token: Option<&CancellationToken>,
     max_wait: Duration,
-) -> Option<WorkspaceObservationLease> {
+) -> Result<WorkspaceObservationLease, WorkspaceLeaseFailure> {
     acquire_workspace_lease_async(workspace_root, cancel_token, max_wait).await
 }
 
@@ -2269,7 +2318,7 @@ pub async fn acquire_workspace_mutation_lease_with_options(
     workspace_root: &Path,
     cancel_token: Option<&CancellationToken>,
     max_wait: Duration,
-) -> Option<WorkspaceObservationLease> {
+) -> Result<WorkspaceObservationLease, WorkspaceLeaseFailure> {
     acquire_workspace_lease_async(workspace_root, cancel_token, max_wait).await
 }
 
@@ -2277,24 +2326,76 @@ async fn acquire_workspace_lease_async(
     workspace_root: &Path,
     cancel_token: Option<&CancellationToken>,
     max_wait: Duration,
-) -> Option<WorkspaceObservationLease> {
+) -> Result<WorkspaceObservationLease, WorkspaceLeaseFailure> {
     let deadline = tokio::time::Instant::now() + max_wait;
-    let writer_state = writer_epoch_state(workspace_root)?;
+    loop {
+        let failure =
+            match acquire_workspace_lease_attempt(workspace_root, cancel_token, deadline).await {
+                Ok(lease) => return Ok(lease),
+                Err(failure) => failure,
+            };
+        if !failure.transient_capacity() || tokio::time::Instant::now() >= deadline {
+            if matches!(failure, WorkspaceLeaseFailure::WatcherCapacity { .. }) {
+                tracing::warn!(workspace_root = %workspace_root.display(), %failure,
+                    "workspace watcher capacity refused receipt authority after admission wait");
+            }
+            return Err(failure);
+        }
+        // An attempt has already released its locks and gate. Capacity may
+        // belong to another workspace; wait within this same caller budget.
+        let delay = tokio::time::sleep(
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(Duration::from_millis(5)),
+        );
+        tokio::pin!(delay);
+        if let Some(cancel) = cancel_token {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(WorkspaceLeaseFailure::Cancelled),
+                _ = &mut delay => {},
+            }
+        } else {
+            delay.await;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(workspace_root = %workspace_root.display(), %failure,
+                "workspace watcher capacity refused receipt authority after admission wait");
+            return Err(failure);
+        }
+    }
+}
+
+async fn acquire_workspace_lease_attempt(
+    workspace_root: &Path,
+    cancel_token: Option<&CancellationToken>,
+    deadline: tokio::time::Instant,
+) -> Result<WorkspaceObservationLease, WorkspaceLeaseFailure> {
+    let writer_state =
+        writer_epoch_state(workspace_root).ok_or(WorkspaceLeaseFailure::BindingUnavailable)?;
     if writer_state
         .ownership_unsettled
         .load(std::sync::atomic::Ordering::Acquire)
     {
-        return None;
+        return Err(WorkspaceLeaseFailure::OwnershipUnsettled);
     }
     let (lock_specifications, binding_identity) =
-        workspace_coordination_lock_specs(workspace_root, CoordinationLockKind::Observation)?;
-    let trusted_coordination_root = stable_coordination_root()?;
-    let gate = observation_gate(workspace_root)?;
+        workspace_coordination_lock_specs(workspace_root, CoordinationLockKind::Observation)
+            .ok_or(WorkspaceLeaseFailure::BindingUnavailable)?;
+    let trusted_coordination_root =
+        stable_coordination_root().ok_or(WorkspaceLeaseFailure::BindingUnavailable)?;
+    let gate = observation_gate(workspace_root).ok_or(WorkspaceLeaseFailure::BindingUnavailable)?;
     loop {
         if cancel_token.is_some_and(CancellationToken::is_cancelled)
             || tokio::time::Instant::now() >= deadline
         {
-            return None;
+            return Err(
+                if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+                    WorkspaceLeaseFailure::Cancelled
+                } else {
+                    classify_workspace_lease_failure(workspace_root)
+                },
+            );
         }
         if gate
             .compare_exchange(
@@ -2313,12 +2414,24 @@ async fn acquire_workspace_lease_async(
                 || tokio::time::Instant::now() >= deadline
             {
                 gate.store(false, std::sync::atomic::Ordering::Release);
-                return None;
+                return Err(
+                    if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+                        WorkspaceLeaseFailure::Cancelled
+                    } else {
+                        classify_workspace_lease_failure(workspace_root)
+                    },
+                );
             }
             break;
         }
         if tokio::time::Instant::now() >= deadline {
-            return None;
+            return Err(
+                if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+                    WorkspaceLeaseFailure::Cancelled
+                } else {
+                    classify_workspace_lease_failure(workspace_root)
+                },
+            );
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let delay = tokio::time::sleep(remaining.min(Duration::from_millis(5)));
@@ -2326,7 +2439,7 @@ async fn acquire_workspace_lease_async(
         if let Some(cancel_token) = cancel_token {
             tokio::select! {
                 biased;
-                _ = cancel_token.cancelled() => return None,
+                _ = cancel_token.cancelled() => return Err(WorkspaceLeaseFailure::Cancelled),
                 _ = &mut delay => {},
             }
         } else {
@@ -2344,7 +2457,13 @@ async fn acquire_workspace_lease_async(
         .await;
         let Some(lock) = lock else {
             gate.store(false, std::sync::atomic::Ordering::Release);
-            return None;
+            return Err(
+                if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+                    WorkspaceLeaseFailure::Cancelled
+                } else {
+                    classify_workspace_lease_failure(workspace_root)
+                },
+            );
         };
         locks.push(lock);
     }
@@ -2372,13 +2491,16 @@ async fn acquire_workspace_lease_async(
     let (tamper_watch, locks) = match tamper_watch {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => {
-            tracing::warn!(
+            let failure = WorkspaceLeaseFailure::from_watch_error(&error);
+            if !failure.transient_capacity() {
+                tracing::warn!(
                 workspace_root = %workspace_root.display(),
                 error = %error,
                 "workspace generation watcher refused receipt authority"
-            );
+                );
+            }
             gate.store(false, std::sync::atomic::Ordering::Release);
-            return None;
+            return Err(failure);
         }
         Err(error) => {
             tracing::warn!(
@@ -2387,7 +2509,7 @@ async fn acquire_workspace_lease_async(
                 "workspace generation watcher worker join failed; no receipt authority granted"
             );
             gate.store(false, std::sync::atomic::Ordering::Release);
-            return None;
+            return Err(WorkspaceLeaseFailure::WatcherUnavailable);
         }
     };
     let binding_unchanged = binding_identity.is_unchanged();
@@ -2399,9 +2521,13 @@ async fn acquire_workspace_lease_async(
         .load(std::sync::atomic::Ordering::Acquire);
     if !binding_unchanged || !tamper_untampered || ownership_unsettled {
         gate.store(false, std::sync::atomic::Ordering::Release);
-        return None;
+        return Err(if ownership_unsettled {
+            WorkspaceLeaseFailure::OwnershipUnsettled
+        } else {
+            WorkspaceLeaseFailure::BindingUnavailable
+        });
     }
-    Some(WorkspaceObservationLease {
+    Ok(WorkspaceObservationLease {
         gate,
         locks,
         binding_identity,
@@ -2527,25 +2653,40 @@ pub async fn acquire_external_effect_observation_lease_with_options(
     workspace_root: &Path,
     cancel_token: Option<&CancellationToken>,
     max_wait: Duration,
-) -> Result<Option<ExternalEffectObservationLease>, String> {
-    let Some(roots) = external_effect_observation_roots(args, workspace_root)? else {
+) -> Result<Option<ExternalEffectObservationLease>, ExternalEffectLeaseFailure> {
+    let Some(roots) = external_effect_observation_roots(args, workspace_root)
+        .map_err(ExternalEffectLeaseFailure::InvalidDeclaration)?
+    else {
         return Ok(None);
     };
     let deadline = tokio::time::Instant::now() + max_wait;
     let mut leases = Vec::with_capacity(roots.len());
     for root in roots {
-        let Some(lease) = acquire_workspace_observation_lease_with_options(
+        let lease = acquire_workspace_observation_lease_with_options(
             &root,
             cancel_token,
             deadline.saturating_duration_since(tokio::time::Instant::now()),
         )
         .await
-        else {
-            return Ok(None);
-        };
+        .map_err(ExternalEffectLeaseFailure::Admission)?;
         leases.push(lease);
     }
     Ok(Some(ExternalEffectObservationLease { leases }))
+}
+
+#[derive(Debug)]
+pub enum ExternalEffectLeaseFailure {
+    InvalidDeclaration(String),
+    Admission(WorkspaceLeaseFailure),
+}
+
+impl std::fmt::Display for ExternalEffectLeaseFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidDeclaration(message) => formatter.write_str(message),
+            Self::Admission(failure) => std::fmt::Display::fmt(failure, formatter),
+        }
+    }
 }
 
 fn external_effect_observation_roots(
@@ -5038,10 +5179,14 @@ mod tests {
             None,
             Duration::ZERO,
         )
-        .await
-        .expect("same valid external contract");
+        .await;
         assert!(
-            second.is_none(),
+            matches!(
+                second,
+                Err(ExternalEffectLeaseFailure::Admission(
+                    WorkspaceLeaseFailure::Contended
+                ))
+            ),
             "a competing session cannot observe the same external root"
         );
         assert!(first.integrity_valid());
@@ -5913,7 +6058,7 @@ mod tests {
                 Duration::from_secs(1)
             )
             .await
-            .is_none(),
+            .is_err(),
             "a writer whose descendants may still run must block later work admission"
         );
     }
@@ -5946,7 +6091,7 @@ mod tests {
                 Duration::from_millis(20)
             )
             .await
-            .is_none()
+            .is_err()
         );
 
         fs::remove_file(marker).expect("remove test marker");
@@ -6116,7 +6261,7 @@ mod tests {
                 Duration::from_secs(30),
             )
             .await
-            .is_some()
+            .is_ok()
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         cancel.cancel();
@@ -6137,7 +6282,7 @@ mod tests {
             )
             .await
             .expect("lease reacquisition timeout")
-            .is_some()
+            .is_ok()
         );
     }
 
@@ -6274,7 +6419,7 @@ mod tests {
                 Duration::from_secs(30),
             )
             .await
-            .is_none(),
+            .is_err(),
             "an existing kernel name is only contention and never trusted authority"
         );
         drop(blocker);
@@ -6285,7 +6430,7 @@ mod tests {
                 Duration::from_secs(1),
             )
             .await
-            .is_some(),
+            .is_ok(),
             "cancellation must release the in-process gate for a later clean acquisition"
         );
     }
@@ -6316,7 +6461,7 @@ mod tests {
                 Duration::from_millis(50)
             )
             .await
-            .is_none()
+            .is_err()
         );
 
         child.kill().unwrap();
@@ -6328,7 +6473,7 @@ mod tests {
                 Duration::from_secs(1)
             )
             .await
-            .is_some(),
+            .is_ok(),
             "kernel-owned names must disappear when a holder crashes"
         );
     }
@@ -6346,13 +6491,13 @@ mod tests {
         )
         .await;
         assert!(
-            nested.is_none(),
+            nested.is_err(),
             "only the authenticated task-local RPC route may reuse an opaque writer lease"
         );
         assert!(
             begin_workspace_writer_with_options(temp.path(), None, Duration::from_millis(50),)
                 .await
-                .is_none(),
+                .is_err(),
             "two top-level run_script writers must mutually exclude"
         );
 
@@ -6366,7 +6511,7 @@ mod tests {
                 Duration::from_secs(30),
             )
             .await
-            .is_some()
+            .is_ok()
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         cancel.cancel();
@@ -6496,7 +6641,7 @@ mod tests {
         let started = Instant::now();
         let mut leases = Vec::with_capacity(roots.len());
         while let Some(result) = acquisitions.join_next().await {
-            if let Some(lease) = result.expect("concurrent lease task must not panic") {
+            if let Ok(lease) = result.expect("concurrent lease task must not panic") {
                 leases.push(lease);
             }
         }
@@ -6880,7 +7025,7 @@ mod tests {
                 Duration::from_millis(50)
             )
             .await
-            .is_none(),
+            .is_err(),
             "canonical target must share a lock with its lexical symlink binding"
         );
         fs::remove_file(&binding).unwrap();
@@ -6963,7 +7108,7 @@ mod tests {
                 Duration::from_millis(50)
             )
             .await
-            .is_none(),
+            .is_err(),
             "a permissive/foreign-shaped predictable inode must be rejected, never trusted"
         );
     }
@@ -7077,7 +7222,7 @@ mod tests {
                 Duration::from_millis(20)
             )
             .await
-            .is_none()
+            .is_err()
         );
         assert!(!missing.join(".astra").exists());
     }
@@ -7109,6 +7254,10 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("ASTRA_MACOS_WATCH_BUDGET_VERIFIED"),
+            "the child must positively confirm every regression assertion ran"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -7126,7 +7275,11 @@ mod tests {
             unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut resource_limit) },
             0
         );
-        resource_limit.rlim_cur = resource_limit.rlim_cur.min(256);
+        assert!(
+            resource_limit.rlim_max >= 256,
+            "regression requires a hard limit of at least 256"
+        );
+        resource_limit.rlim_cur = 256;
         assert_eq!(
             unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const resource_limit) },
             0
@@ -7157,8 +7310,11 @@ mod tests {
             )
             .await
             {
-                Some(lease) => leases.push(lease),
-                None => refused_root = Some(root.clone()),
+                Ok(lease) => leases.push(lease),
+                Err(WorkspaceLeaseFailure::WatcherCapacity { .. }) => {
+                    refused_root = Some(root.clone())
+                }
+                Err(other) => panic!("unexpected admission refusal: {other}"),
             }
             assert!(MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire) <= limit);
             assert!(
@@ -7166,7 +7322,11 @@ mod tests {
                 "watch admission must leave descriptors for unrelated operations"
             );
         }
-        assert!(!leases.is_empty(), "some workspace leases must be admitted");
+        assert!(
+            leases.len() >= 2,
+            "the low-FD budget must admit at least two independent deep workspace generations, got {}",
+            leases.len()
+        );
         let refused_root = refused_root.expect("64 live generations exceed the watcher budget");
         assert!(
             leases
@@ -7273,6 +7433,106 @@ mod tests {
             baseline,
             "failed admission must not leak descriptors"
         );
+
+        // A transient process-wide shortage consumes the caller's wait and
+        // retains the observed capacity facts at the tool boundary.
+        let occupied = MacOsWatchDescriptorReservation::reserve(limit).unwrap();
+        let started = tokio::time::Instant::now();
+        let failure = acquire_workspace_observation_lease_with_options(
+            &refused_root,
+            None,
+            Duration::from_millis(50),
+        )
+        .await
+        .err()
+        .expect("full budget must reject after waiting");
+        assert!(tokio::time::Instant::now() - started >= Duration::from_millis(50));
+        assert!(
+            matches!(failure, WorkspaceLeaseFailure::WatcherCapacity { active, requested, limit: actual_limit }
+            if active == limit && requested <= limit && actual_limit == limit)
+        );
+        let result = crate::workspace_lease_failure_tool_result("bash", failure);
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["reason"],
+            "watcher_capacity"
+        );
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["watcher_descriptors"]["active"],
+            limit
+        );
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["next_action"],
+            "wait_for_process_watcher_capacity"
+        );
+
+        let cancel = CancellationToken::new();
+        let cancelled_wait = acquire_workspace_observation_lease_with_options(
+            &refused_root,
+            Some(&cancel),
+            Duration::from_secs(1),
+        );
+        tokio::pin!(cancelled_wait);
+        tokio::select! {
+            _ = &mut cancelled_wait => panic!("capacity shortage must wait within the caller budget"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {},
+        }
+        cancel.cancel();
+        assert!(matches!(
+            cancelled_wait.await,
+            Err(WorkspaceLeaseFailure::Cancelled)
+        ));
+        assert_eq!(MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire), limit);
+
+        let waiting = acquire_workspace_mutation_lease_with_options(
+            &refused_root,
+            None,
+            Duration::from_secs(1),
+        );
+        tokio::pin!(waiting);
+        tokio::select! {
+            _ = &mut waiting => panic!("another workspace's budget must cause a bounded wait"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {},
+        }
+        drop(occupied);
+        let admitted = waiting
+            .await
+            .expect("capacity release must admit the waiting writer");
+        assert!(admitted.integrity_valid());
+        drop(admitted);
+        assert_eq!(MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire), 0);
+        assert_eq!(fd_count(), baseline);
+
+        // A limit that cannot fit any watcher is a repairable configuration
+        // failure, never advice to retry the same workspace forever.
+        resource_limit.rlim_cur = 64;
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const resource_limit) },
+            0
+        );
+        let failure = tokio::time::timeout(
+            Duration::from_millis(100),
+            acquire_workspace_observation_lease_with_options(
+                &refused_root,
+                None,
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("a zero budget must not consume a transient wait")
+        .err()
+        .expect("zero budget refuses admission");
+        assert!(matches!(
+            failure,
+            WorkspaceLeaseFailure::WatcherCapacity { limit: 0, .. }
+        ));
+        let result = crate::workspace_lease_failure_tool_result("bash", failure);
+        assert_eq!(result.metadata.as_ref().unwrap()["retryable"], false);
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["next_action"],
+            "repair_process_watcher_capacity"
+        );
+        assert_eq!(MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire), 0);
+        println!("ASTRA_MACOS_WATCH_BUDGET_VERIFIED");
     }
 
     #[cfg(target_os = "macos")]
@@ -7418,7 +7678,7 @@ mod tests {
         child.kill().expect("stop parent-flock holder");
         let _ = child.wait().expect("reap parent-flock holder");
         assert!(
-            lease.is_some(),
+            lease.is_ok(),
             "an unrelated flock on /private must not block every workspace namespace"
         );
     }
@@ -7454,7 +7714,7 @@ mod tests {
                 Duration::from_millis(50)
             )
             .await
-            .is_none(),
+            .is_err(),
             "an externally held namespace byte must reject a second generation"
         );
         let independent_lease = acquire_workspace_observation_lease_with_options(
@@ -7466,7 +7726,7 @@ mod tests {
         child.kill().expect("crash raw record-lock holder");
         let _ = child.wait().expect("reap raw record-lock holder");
         assert!(
-            independent_lease.is_some(),
+            independent_lease.is_ok(),
             "a record lock must contend only its derived workspace byte"
         );
         assert!(
@@ -7476,7 +7736,7 @@ mod tests {
                 Duration::from_secs(1)
             )
             .await
-            .is_some(),
+            .is_ok(),
             "the raw record lock must disappear when its holder crashes"
         );
     }
@@ -7547,7 +7807,7 @@ mod tests {
                 Duration::from_millis(20)
             )
             .await
-            .is_none(),
+            .is_err(),
             "unsupported platforms must reject execution instead of claiming cross-user authority"
         );
     }
