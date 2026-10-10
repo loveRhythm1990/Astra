@@ -247,7 +247,8 @@ export class SSEClient {
 
   private async readStream(body: ReadableStream<Uint8Array>): Promise<void> {
     const reader = body.getReader();
-    const decoder = new TextDecoder();
+    // Preserve the BOM here; SseDataParser owns removing exactly one leading BOM.
+    const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
     const parser = new SseDataParser(
       (data) => this.processSSEData(data),
       this.options.onRawLine,
@@ -278,7 +279,7 @@ export class SSEClient {
       this.clearHeartbeatTimer();
       reader.releaseLock();
     }
-    if (streamFailed) throw streamError;
+    if (streamFailed && !this.sawTerminalEvent) throw streamError;
     if (this.options.requireTerminalEvent && !this.sawTerminalEvent) {
       throw new Error(
         'SSE stream ended before a terminal event (run_finished, turn_complete, or interruption)',

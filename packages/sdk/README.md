@@ -289,6 +289,10 @@ Both live streams and `parseSseDataEvents` accept LF, CRLF, and CR line endings.
 Live parsing preserves events across split line endings and UTF-8 byte chunks;
 multiple `data:` lines are joined with a newline. The SDK retains its tolerance
 for a final JSON event without a trailing blank line.
+The shared parser removes exactly one leading BOM for direct text, buffered
+HTTP, and live streams. Raw-line callbacks include blank event separators.
+Terminal events parsed during the final flush also suppress trailing socket
+errors and reconnect attempts.
 
 | Export | Description |
 |--------|-------------|

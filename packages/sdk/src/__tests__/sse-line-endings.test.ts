@@ -1,6 +1,7 @@
 import { afterEach, expect, test, vi } from 'vitest';
 import { parseSseDataEvents, SSEClient } from '../sse-client';
 import type { StreamEvent } from '../types';
+import { AstraClient } from '../client';
 
 afterEach(() => vi.unstubAllGlobals());
 const events = [
@@ -84,4 +85,73 @@ test('CR terminal is delivered before EOF or the next byte arrives', async () =>
     await pending;
     client.close();
   }
+});
+
+for (const ending of ['', '\n', '\r', '\r\n', '\r\r']) {
+  test(`terminal flushed after socket reset prevents retries (${JSON.stringify(ending)})`, async () => {
+    const fetch = vi.fn().mockImplementation(() => {
+      let sent = false;
+      return Promise.resolve(new Response(new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (sent) controller.error(new Error('socket reset'));
+          else {
+            sent = true;
+            controller.enqueue(new TextEncoder().encode(`data: {"type":"run_finished"}${ending}`));
+          }
+        },
+      })));
+    });
+    vi.stubGlobal('fetch', fetch);
+    const received: StreamEvent[] = [];
+    const client = new SSEClient({
+      url: 'https://example.test/stream', maxRetries: 1, retryDelayMs: 1,
+      requireTerminalEvent: true, onEvent: (event) => received.push(event),
+    });
+    await client.connect();
+    client.close();
+    expect(received).toEqual([{ type: 'run_finished' }]);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+}
+
+for (const count of [0, 1, 2]) {
+  test(`all SSE entrypoints remove exactly one of ${count} leading BOMs`, async () => {
+    const raw = '\uFEFF'.repeat(count) + 'data: {"type":"run_finished"}\n\n';
+    const expected = count === 2 ? [] : [{ type: 'run_finished' }];
+    expect(parseSseDataEvents(raw)).toEqual(expected);
+    const bytes = new TextEncoder().encode(raw);
+    const fetch = vi.fn().mockImplementation(() => Promise.resolve(new Response(bytes)));
+    vi.stubGlobal('fetch', fetch);
+    expect(await new AstraClient({ baseUrl: 'https://example.test' }).getRunEvents('synthetic-run'))
+      .toEqual(expected);
+    const received: StreamEvent[] = [];
+    const client = new SSEClient({
+      url: 'https://example.test/stream', maxRetries: 0, requireTerminalEvent: true,
+      onEvent: (event) => received.push(event),
+    });
+    // Split each UTF-8 BOM across bytes, not just text chunks.
+    fetch.mockImplementationOnce(() => Promise.resolve(new Response(new ReadableStream({
+      start(controller) {
+        for (const byte of bytes) controller.enqueue(Uint8Array.of(byte));
+        controller.close();
+      },
+    }))));
+    await client.connect();
+    client.close();
+    if (count === 2) {
+      expect(received).toEqual([expect.objectContaining({ type: 'error', retryable: false })]);
+    } else expect(received).toEqual(expected);
+  });
+}
+
+test('raw line callbacks include logical blank separators', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(': keepalive\r\ndata: {"type":"run_finished"}\r\n\r\n')));
+  const lines: string[] = [];
+  const client = new SSEClient({
+    url: 'https://example.test/stream', maxRetries: 0,
+    onEvent: () => {}, onRawLine: (line) => lines.push(line),
+  });
+  await client.connect();
+  client.close();
+  expect(lines).toEqual([': keepalive', 'data: {"type":"run_finished"}', '']);
 });
