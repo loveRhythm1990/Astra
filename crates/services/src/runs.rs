@@ -2864,8 +2864,8 @@ pub enum DurableRunInteractionResolveOutcome {
     },
     /// Newer user intent superseded the execution epoch that opened this wait.
     /// The callback remains auditable, but cannot authorize the stale action.
-    /// An exact, live AskUser wait is released so its owner can consume guidance;
-    /// the superseded answer still has no resumed decision authority.
+    /// The exact live wait is released so its owner can consume guidance;
+    /// the superseded response still has no resumed decision authority.
     Superseded {
         event: serde_json::Value,
         user_intent_event_index: i64,
@@ -9502,10 +9502,9 @@ impl RunStateStore for InMemoryRunStateStore {
                                 && extract_event_type(event) == "user_intent"
                         })
                     {
-                        // Release only this live questionnaire's exact wait. The
-                        // superseded receipt still fences its stale answer; the
+                        // Release only this interaction's exact live wait. The
+                        // superseded receipt still fences its stale response; the
                         // executor must consume guidance before its next action.
-                        resume_wait = kind == DurableRunInteractionKind::AskUser;
                         superseded_by = Some(index as i64);
                     }
                 } else {
@@ -21379,6 +21378,9 @@ impl RunStateStore for DatabaseRunStateStore {
                             authority_loss =
                                 Some(DurableRunInteractionAuthorityLoss::OwnerLeaseExpired);
                         } else {
+                            // Keep the exact live wait release. Supersession
+                            // fences the stale response, not consumption of the
+                            // new guidance before the owner's next action.
                             superseded_by = sqlx::query_scalar(
                                 "SELECT event_idx FROM agent_run_events
                                  WHERE user_id = ? AND run_id = ? AND event_type = 'user_intent'
@@ -21393,13 +21395,6 @@ impl RunStateStore for DatabaseRunStateStore {
                                 db_error("resolve_run_interaction_newer_intent", run_id, source)
                                     .to_string()
                             })?;
-                            if superseded_by.is_some() {
-                                // A superseded questionnaire no longer owns an
-                                // input wait. Keep its superseded receipt, but
-                                // release the exact live frontier atomically so
-                                // guidance can be applied before the next action.
-                                resume_wait = kind == DurableRunInteractionKind::AskUser;
-                            }
                         }
                     }
                 }
@@ -41990,21 +41985,25 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(durable.status, STATUS_WAITING);
-        assert!(
+        assert_eq!(durable.status, STATUS_RUNNING);
+        assert_eq!(durable.waiting_for, None);
+        assert_eq!(
             durable
                 .events
                 .iter()
-                .all(|event| extract_event_type(event) != "run_resumed")
+                .filter(|event| extract_event_type(event) == "run_resumed")
+                .count(),
+            1
         );
     }
 
-    async fn assert_superseded_questionnaire_releases_wait_for_guidance(
+    async fn assert_superseded_interaction_releases_wait_for_guidance(
         store: &dyn RunStateStore,
         user_id: &str,
         session_id: &str,
         run_id: &str,
         outcome: &str,
+        kind: DurableRunInteractionKind,
     ) {
         let mut run = durable_run_record(run_id);
         run.user_id = user_id.to_string();
@@ -42012,10 +42011,17 @@ mod tests {
         store.insert_run(run).await.unwrap();
         let run = store.load_run(user_id, run_id).await.unwrap().unwrap();
         let epoch = run.last_event_idx;
-        let required = [ask_user_prompted_event(
-            "superseded-questionnaire",
-            session_id,
-        )];
+        let required = [match kind {
+            DurableRunInteractionKind::AskUser => {
+                ask_user_prompted_event("superseded-questionnaire", session_id)
+            }
+            DurableRunInteractionKind::Approval => {
+                approval_required_event("superseded-questionnaire", "bash", session_id)
+            }
+            DurableRunInteractionKind::Provider => {
+                provider_interaction_required_event("superseded-questionnaire", session_id)
+            }
+        }];
         assert_eq!(
             store
                 .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
@@ -42037,7 +42043,7 @@ mod tests {
                     run_id,
                     expected_session_id: session_id,
                     request_id: "superseded-questionnaire",
-                    kind: DurableRunInteractionKind::AskUser,
+                    kind,
                     expected_control_epoch: epoch,
                     expected_owner_generation: run.run_generation,
                 })
@@ -42065,14 +42071,16 @@ mod tests {
             panic!("guidance must be accepted while waiting: {admission:?}");
         };
         let response = json!({"request_id": "superseded-questionnaire", "outcome": outcome,
-            "answers": {"answers": []}});
+            "decision": if outcome == "timed_out" { "timeout" } else { "allow" },
+            "tool": "bash", "approval_kind": "standard",
+            "payload": {"selected": "stale-option"}, "answers": {"answers": []}});
         let resolution = store
             .resolve_run_interaction(
                 user_id,
                 session_id,
                 run_id,
                 "superseded-questionnaire",
-                DurableRunInteractionKind::AskUser,
+                kind,
                 response.clone(),
             )
             .await
@@ -42088,7 +42096,7 @@ mod tests {
         let resolved = resumed
             .events
             .iter()
-            .find(|event| extract_event_type(event) == "ask_user_resolved")
+            .find(|event| extract_event_type(event) == kind.resolved_event_type())
             .unwrap();
         assert_eq!(
             resolved["data"]["_durable_resolution"]["disposition"], "superseded",
@@ -42110,7 +42118,7 @@ mod tests {
                     session_id,
                     run_id,
                     "superseded-questionnaire",
-                    DurableRunInteractionKind::AskUser,
+                    kind,
                     response,
                 )
                 .await
@@ -42142,7 +42150,17 @@ mod tests {
                 .count(),
             1
         );
-        let next = [ask_user_prompted_event("next-questionnaire", session_id)];
+        let next = [match kind {
+            DurableRunInteractionKind::AskUser => {
+                ask_user_prompted_event("next-questionnaire", session_id)
+            }
+            DurableRunInteractionKind::Approval => {
+                approval_required_event("next-questionnaire", "bash", session_id)
+            }
+            DurableRunInteractionKind::Provider => {
+                provider_interaction_required_event("next-questionnaire", session_id)
+            }
+        }];
         assert_eq!(
             store
                 .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
@@ -42161,15 +42179,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn superseded_questionnaire_releases_wait_for_guidance() {
-        for outcome in ["submitted", "timed_out"] {
+    async fn superseded_interaction_releases_wait_for_guidance() {
+        for (kind, outcome) in [
+            (DurableRunInteractionKind::AskUser, "submitted"),
+            (DurableRunInteractionKind::AskUser, "timed_out"),
+            (DurableRunInteractionKind::Approval, "approved"),
+            (DurableRunInteractionKind::Approval, "timed_out"),
+            (DurableRunInteractionKind::Provider, "submitted"),
+            (DurableRunInteractionKind::Provider, "timed_out"),
+        ] {
             let store = InMemoryRunStateStore::new();
-            assert_superseded_questionnaire_releases_wait_for_guidance(
+            assert_superseded_interaction_releases_wait_for_guidance(
                 &store,
                 "u1",
                 "s1",
                 &format!("questionnaire-{outcome}"),
                 outcome,
+                kind,
             )
             .await;
         }
@@ -42177,20 +42203,28 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn database_superseded_questionnaire_releases_wait_for_guidance() {
+    async fn database_superseded_interaction_releases_wait_for_guidance() {
         let (store, pool) = setup_database_run_state_store_it().await;
-        for outcome in ["submitted", "timed_out"] {
+        for (kind, outcome) in [
+            (DurableRunInteractionKind::AskUser, "submitted"),
+            (DurableRunInteractionKind::AskUser, "timed_out"),
+            (DurableRunInteractionKind::Approval, "approved"),
+            (DurableRunInteractionKind::Approval, "timed_out"),
+            (DurableRunInteractionKind::Provider, "submitted"),
+            (DurableRunInteractionKind::Provider, "timed_out"),
+        ] {
             let nonce = Uuid::new_v4();
             let user_id = format!("questionnaire-u-{nonce}");
             let session_id = format!("questionnaire-s-{nonce}");
             let run_id = format!("questionnaire-r-{nonce}");
             insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
-            assert_superseded_questionnaire_releases_wait_for_guidance(
+            assert_superseded_interaction_releases_wait_for_guidance(
                 &store,
                 &user_id,
                 &session_id,
                 &run_id,
                 outcome,
+                kind,
             )
             .await;
             cleanup_database_run_fixture(&pool, &user_id, &run_id).await;

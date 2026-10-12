@@ -1285,6 +1285,11 @@ impl DurableHostInteractionSink {
                 && data.get("tool").and_then(Value::as_str) == Some(tool_name)
                 && let Some(recorded) = recorded
             {
+                if interaction_is_superseded(data) {
+                    // Supersession is a durable rejection, never authority for
+                    // the originally allowed action, even on callback replay.
+                    return Ok(server_loop_host::EdgeApprovalSettlement::Deny);
+                }
                 if data
                     .pointer("/_durable_resolution/disposition")
                     .and_then(Value::as_str)
@@ -1335,6 +1340,12 @@ impl DurableHostInteractionSink {
                 let data = existing.get("data").unwrap_or(&existing);
                 if data.get("request_id").and_then(Value::as_str) == Some(request_id)
                     && data.get("tool").and_then(Value::as_str) == Some(tool_name)
+                    && interaction_is_superseded(data)
+                {
+                    return Ok(server_loop_host::EdgeApprovalSettlement::Deny);
+                }
+                if data.get("request_id").and_then(Value::as_str) == Some(request_id)
+                    && data.get("tool").and_then(Value::as_str) == Some(tool_name)
                     && data
                         .pointer("/_durable_resolution/disposition")
                         .and_then(Value::as_str)
@@ -1369,14 +1380,8 @@ impl DurableHostInteractionSink {
                     self.run_id
                 ));
             }
-            astra_services::runs::DurableRunInteractionResolveOutcome::Superseded {
-                user_intent_event_index,
-                ..
-            } => {
-                return Err(format!(
-                    "run {} recorded approval {request_id} but newer user guidance at event {user_intent_event_index} superseded it",
-                    self.run_id
-                ));
+            astra_services::runs::DurableRunInteractionResolveOutcome::Superseded { .. } => {
+                return Ok(server_loop_host::EdgeApprovalSettlement::Deny);
             }
         }
 
@@ -1956,6 +1961,14 @@ fn approval_decision_from_shared_event(
     event: &Value,
 ) -> Result<astra_tools::ApprovalDecision, String> {
     let data = event.get("data").unwrap_or(event);
+    if interaction_is_superseded(data) {
+        return Ok(astra_tools::ApprovalDecision::Denied {
+            reason: Some(
+                "newer user guidance superseded this approval request; the stale tool was not executed"
+                    .to_string(),
+            ),
+        });
+    }
     if !interaction_has_durable_resume_authority(data) {
         return Err(
             "approval was recorded without durable resume authority; the stale run must stop"
@@ -1981,11 +1994,7 @@ fn approval_decision_from_shared_event(
 
 fn ask_user_decision_from_shared_event(event: &Value) -> astra_tools::AskUserDecision {
     let data = event.get("data").unwrap_or(event);
-    if data
-        .pointer("/_durable_resolution/disposition")
-        .and_then(Value::as_str)
-        == Some("superseded")
-    {
+    if interaction_is_superseded(data) {
         return astra_tools::AskUserDecision::Error(
             "newer user guidance superseded this questionnaire; its answer was not applied"
                 .to_string(),
@@ -2024,6 +2033,12 @@ fn provider_interaction_decision_from_shared_event(
     event: &Value,
 ) -> astra_tools::ProviderInteractionDecision {
     let data = event.get("data").unwrap_or(event);
+    if interaction_is_superseded(data) {
+        return astra_tools::ProviderInteractionDecision::Error(
+            "newer user guidance superseded this provider interaction; its response was not applied"
+                .to_string(),
+        );
+    }
     match data
         .get("outcome")
         .and_then(Value::as_str)
@@ -2058,6 +2073,12 @@ fn interaction_has_durable_resume_authority(data: &Value) -> bool {
     data.pointer("/_durable_resolution/disposition")
         .and_then(Value::as_str)
         == Some("resumed")
+}
+
+fn interaction_is_superseded(data: &Value) -> bool {
+    data.pointer("/_durable_resolution/disposition")
+        .and_then(Value::as_str)
+        == Some("superseded")
 }
 
 enum DurableServerInteractionWaitStart {
@@ -2825,7 +2846,11 @@ impl astra_tools::ToolApprovalGate for DurableRunApprovalGate {
         {
             Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(event))
             | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Idempotent(event))
-            | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(event)) => {
+            | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(event))
+            | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Superseded {
+                event,
+                ..
+            }) => {
                 project_shared_run_interaction_resolution(
                     &self.run_engine,
                     &self.runs,
@@ -2846,9 +2871,6 @@ impl astra_tools::ToolApprovalGate for DurableRunApprovalGate {
             | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Queued(_))
             | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::NoLongerWaiting)
             | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::AuthorityLost {
-                ..
-            })
-            | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Superseded {
                 ..
             }) => Self::denied_due_to_no_longer_active(),
             Err(error) => {
@@ -3302,7 +3324,11 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
         {
             Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(event))
             | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Idempotent(event))
-            | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(event)) => {
+            | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(event))
+            | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Superseded {
+                event,
+                ..
+            }) => {
                 project_shared_run_interaction_resolution(
                     &self.run_engine,
                     &self.runs,
@@ -3319,9 +3345,6 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
             | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Queued(_))
             | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::NoLongerWaiting)
             | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::AuthorityLost {
-                ..
-            })
-            | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Superseded {
                 ..
             }) => astra_tools::ProviderInteractionDecision::Error(
                 "provider interaction is no longer waiting for a response".to_string(),

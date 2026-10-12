@@ -9619,6 +9619,13 @@ impl FaultInjectedRunStateStore {
 
 #[async_trait]
 impl RunStateStore for FaultInjectedRunStateStore {
+    async fn apply_run_user_intents(
+        &self,
+        request: astra_services::runs::AtomicRunUserIntentApplyRequest<'_>,
+    ) -> Result<astra_services::runs::AtomicRunUserIntentApply, String> {
+        self.inner.apply_run_user_intents(request).await
+    }
+
     async fn authorize_execution_boundary(
         &self,
         request: astra_services::runs::RunExecutionBoundaryAuthorizationRequest<'_>,
@@ -24041,7 +24048,7 @@ async fn wait_for_durable_run_status(
 }
 
 #[test]
-fn durable_interaction_consumers_require_resumed_authority_for_all_decisions() {
+fn durable_interaction_consumers_reject_stale_responses() {
     let authority_lost_approval = json!({
         "event_type": "approval_resolved",
         "data": {
@@ -24084,6 +24091,14 @@ fn durable_interaction_consumers_require_resumed_authority_for_all_decisions() {
     assert!(matches!(
         ask_user_decision_from_shared_event(&superseded_answer),
         astra_tools::AskUserDecision::Error(_)
+    ));
+    let superseded_allow = json!({
+        "event_type": "approval_resolved",
+        "data": {"decision": "allow", "_durable_resolution": {"disposition": "superseded"}}
+    });
+    assert!(matches!(
+        approval_decision_from_shared_event(&superseded_allow),
+        Ok(astra_tools::ApprovalDecision::Denied { .. })
     ));
 }
 
@@ -24786,6 +24801,116 @@ enum RejectedProviderResolution {
     OwnerGenerationLost,
 }
 
+async fn assert_runtime_guidance_applied(
+    svc: &AgenticRunLifecycleService,
+    session_id: &str,
+    run_id: &str,
+    owner_generation: u64,
+) {
+    use crate::turn::run_control::{UserIntentAdmissionAuthority, UserIntentApplyAck};
+    let poll = svc.run_engine.poll_user_intents("user-1", run_id, 0).await;
+    assert_eq!(poll.inputs.len(), 1, "{poll:?}");
+    let indices = [poll.inputs[0].event_index];
+    for _ in 0..2 {
+        assert_eq!(
+            svc.run_engine
+                .mark_user_intents_applied(
+                    "user-1",
+                    session_id,
+                    run_id,
+                    &indices,
+                    UserIntentAdmissionAuthority::DurableOwnerGeneration(owner_generation),
+                )
+                .await
+                .unwrap(),
+            UserIntentApplyAck::Applied
+        );
+    }
+    let run = svc
+        .run_engine
+        .load_run("user-1", run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.status, STATUS_RUNNING);
+    assert_eq!(run.waiting_for, None);
+    assert_eq!(
+        run.events
+            .iter()
+            .filter(|event| event["event_type"] == "user_intent_applied")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn superseded_server_approval_releases_wait_without_cancelling_or_allowing_tool() {
+    let svc = test_service();
+    let authority = svc
+        .run_engine
+        .start_run("approval-guidance", "user-1", "approval-session")
+        .await
+        .unwrap();
+    let cancellation = Arc::new(CancellationToken::new());
+    let gate = DurableRunApprovalGate::new(
+        "user-1".into(),
+        "approval-session".into(),
+        "approval-guidance".into(),
+        None,
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        None,
+    )
+    .with_cancel_token(cancellation.clone())
+    .with_timeout(Duration::from_secs(2));
+    let waiting = tokio::spawn(async move {
+        astra_tools::ToolApprovalGate::request_approval(
+            &gate,
+            "approval-request",
+            "bash",
+            &json!({"command": "must-not-run"}),
+        )
+        .await
+    });
+    wait_for_durable_run_status(
+        &svc.run_engine,
+        "user-1",
+        "approval-guidance",
+        STATUS_WAITING,
+    )
+    .await;
+    svc.run_engine
+        .append_event(
+            "user-1",
+            "approval-session",
+            "approval-guidance",
+            json!({
+                "event_type": "user_intent", "idempotency_key": "user_intent:approval-guide",
+                "data": {"intent_id": "approval-guide", "delivery": "guide_current_run",
+                    "input": {"content": "do not run that tool"}}
+            }),
+        )
+        .await
+        .unwrap();
+    let decision = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        decision,
+        astra_tools::ApprovalDecision::Denied { .. }
+    ));
+    assert!(!cancellation.is_cancelled());
+    assert_runtime_guidance_applied(
+        &svc,
+        "approval-session",
+        "approval-guidance",
+        authority.owner_generation,
+    )
+    .await;
+}
+
 async fn assert_rejected_provider_submission_fails_closed(rejection: RejectedProviderResolution) {
     let suffix = match rejection {
         RejectedProviderResolution::Superseded => "superseded",
@@ -24801,7 +24926,8 @@ async fn assert_rejected_provider_submission_fails_closed(rejection: RejectedPro
         }
     };
     let svc = test_service_with_store(Arc::new(store));
-    svc.run_engine
+    let authority = svc
+        .run_engine
         .start_run(&run_id, "user-1", "provider-session")
         .await
         .unwrap();
@@ -24843,7 +24969,8 @@ async fn assert_rejected_provider_submission_fails_closed(rejection: RejectedPro
                 json!({
                     "event_type": "user_intent",
                     "idempotency_key": format!("user-intent:{run_id}"),
-                    "data": {"intent_id": "newer-user-intent"},
+                    "data": {"intent_id": "newer-user-intent", "delivery": "guide_current_run",
+                        "input": {"content": "discard the stale selection"}},
                 }),
             )
             .await
@@ -24887,18 +25014,26 @@ async fn assert_rejected_provider_submission_fails_closed(rejection: RejectedPro
         .await
         .expect("provider gate must observe the rejected durable response")
         .expect("provider interaction task must not panic");
-    assert!(matches!(
-        decision,
-        astra_tools::ProviderInteractionDecision::Error(ref error)
-            if error.contains("without durable resume authority")
-    ));
+    assert!(
+        matches!(decision, astra_tools::ProviderInteractionDecision::Error(ref error)
+        if error.contains(match rejection {
+            RejectedProviderResolution::Superseded => "newer user guidance superseded",
+            RejectedProviderResolution::OwnerGenerationLost => "without durable resume authority",
+        }))
+    );
     let durable = svc
         .run_engine
         .load_run("user-1", &run_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(durable.status, STATUS_WAITING);
+    assert_eq!(
+        durable.status,
+        match rejection {
+            RejectedProviderResolution::Superseded => STATUS_RUNNING,
+            RejectedProviderResolution::OwnerGenerationLost => STATUS_WAITING,
+        }
+    );
     let resolution = durable
         .events
         .iter()
@@ -24916,16 +25051,28 @@ async fn assert_rejected_provider_submission_fails_closed(rejection: RejectedPro
             RejectedProviderResolution::OwnerGenerationLost => "authority_lost",
         }
     );
-    assert!(
-        durable
-            .events
-            .iter()
-            .all(|event| event.get("event_type").and_then(Value::as_str) != Some("run_resumed"))
-    );
+    let resumed = durable
+        .events
+        .iter()
+        .filter(|event| event["event_type"] == "run_resumed")
+        .count();
+    match rejection {
+        RejectedProviderResolution::Superseded => {
+            assert_eq!(resumed, 1);
+            assert_runtime_guidance_applied(
+                &svc,
+                "provider-session",
+                &run_id,
+                authority.owner_generation,
+            )
+            .await;
+        }
+        RejectedProviderResolution::OwnerGenerationLost => assert_eq!(resumed, 0),
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn superseded_provider_submission_is_audited_without_resuming_execution() {
+async fn superseded_provider_submission_releases_wait_without_applying_response() {
     assert_rejected_provider_submission_fails_closed(RejectedProviderResolution::Superseded).await;
 }
 
@@ -25978,7 +26125,7 @@ async fn durable_edge_host_sink_closes_guidance_superseded_approval_wait() {
         )
         .await
         .unwrap();
-    let error = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(1),
         crate::server::server_loop_host::HostInteractionSink::resolve_superseded_approval(
             &sink,
@@ -25988,25 +26135,34 @@ async fn durable_edge_host_sink_closes_guidance_superseded_approval_wait() {
     )
     .await
     .expect("guidance must fence the approval without waiting for the client deadline")
-    .expect_err("superseded approval must not manufacture a local resume");
-    assert!(error.contains("newer user guidance"), "{error}");
+    .expect("superseded approval must release its exact wait without allowing the tool");
     let resumed = svc
         .run_engine
         .load_run("user-1", "edge-approval-guidance")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(resumed.status, STATUS_WAITING);
-    assert_eq!(resumed.waiting_for.as_deref(), Some("tool_approval"));
+    assert_eq!(resumed.status, STATUS_RUNNING);
+    assert_eq!(resumed.waiting_for, None);
     assert!(resumed.events.iter().any(|event| {
         event.get("event_type").and_then(Value::as_str) == Some("approval_resolved")
             && event.pointer("/data/outcome").and_then(Value::as_str) == Some("denied")
     }));
-    assert!(
-        resumed.events.iter().all(|event| {
-            event.get("event_type").and_then(Value::as_str) != Some("run_resumed")
-        })
+    assert_eq!(
+        resumed
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == "run_resumed")
+            .count(),
+        1
     );
+    assert_runtime_guidance_applied(
+        &svc,
+        "edge-approval-session",
+        "edge-approval-guidance",
+        authority.owner_generation,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
