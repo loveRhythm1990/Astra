@@ -25031,7 +25031,9 @@ async fn server_only_user_prompt_wait_resumes_from_shared_interaction_state() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn superseded_questionnaire_timeout_releases_wait_and_applies_guidance() {
-    use crate::turn::run_control::{RunControl, UserIntentAdmissionAuthority, UserIntentApplyAck};
+    use crate::turn::run_control::{
+        UserIntentAdmissionAuthority, UserIntentApplyAck, UserIntentProvider,
+    };
 
     let svc = test_service();
     let authority = svc
