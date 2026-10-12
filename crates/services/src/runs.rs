@@ -2863,7 +2863,9 @@ pub enum DurableRunInteractionResolveOutcome {
         reason: DurableRunInteractionAuthorityLoss,
     },
     /// Newer user intent superseded the execution epoch that opened this wait.
-    /// The callback remains auditable, but cannot resume the stale frontier.
+    /// The callback remains auditable, but cannot authorize the stale action.
+    /// An exact, live AskUser wait is released so its owner can consume guidance;
+    /// the superseded answer still has no resumed decision authority.
     Superseded {
         event: serde_json::Value,
         user_intent_event_index: i64,
@@ -9500,7 +9502,10 @@ impl RunStateStore for InMemoryRunStateStore {
                                 && extract_event_type(event) == "user_intent"
                         })
                     {
-                        resume_wait = false;
+                        // Release only this live questionnaire's exact wait. The
+                        // superseded receipt still fences its stale answer; the
+                        // executor must consume guidance before its next action.
+                        resume_wait = kind == DurableRunInteractionKind::AskUser;
                         superseded_by = Some(index as i64);
                     }
                 } else {
@@ -21389,7 +21394,11 @@ impl RunStateStore for DatabaseRunStateStore {
                                     .to_string()
                             })?;
                             if superseded_by.is_some() {
-                                resume_wait = false;
+                                // A superseded questionnaire no longer owns an
+                                // input wait. Keep its superseded receipt, but
+                                // release the exact live frontier atomically so
+                                // guidance can be applied before the next action.
+                                resume_wait = kind == DurableRunInteractionKind::AskUser;
                             }
                         }
                     }
@@ -41988,6 +41997,204 @@ mod tests {
                 .iter()
                 .all(|event| extract_event_type(event) != "run_resumed")
         );
+    }
+
+    async fn assert_superseded_questionnaire_releases_wait_for_guidance(
+        store: &dyn RunStateStore,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        outcome: &str,
+    ) {
+        let mut run = durable_run_record(run_id);
+        run.user_id = user_id.to_string();
+        run.session_id = session_id.to_string();
+        store.insert_run(run).await.unwrap();
+        let run = store.load_run(user_id, run_id).await.unwrap().unwrap();
+        let epoch = run.last_event_idx;
+        let required = [ask_user_prompted_event(
+            "superseded-questionnaire",
+            session_id,
+        )];
+        assert_eq!(
+            store
+                .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+                    user_id,
+                    run_id,
+                    expected_session_id: session_id,
+                    expected_control_epoch: epoch,
+                    expected_owner_generation: run.run_generation,
+                    events: &required,
+                })
+                .await
+                .unwrap(),
+            AtomicRunInteractionBatchRegistration::Registered
+        );
+        assert_eq!(
+            store
+                .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+                    user_id,
+                    run_id,
+                    expected_session_id: session_id,
+                    request_id: "superseded-questionnaire",
+                    kind: DurableRunInteractionKind::AskUser,
+                    expected_control_epoch: epoch,
+                    expected_owner_generation: run.run_generation,
+                })
+                .await
+                .unwrap(),
+            DurableRunInteractionWaitOutcome::Waiting
+        );
+        let guidance = json!({
+            "event_type": "user_intent", "idempotency_key": "user_intent:new-questionnaire-guidance",
+            "data": {"intent_id": "new-questionnaire-guidance", "delivery": "guide_current_run",
+                "input": {"content": "use the production environment"}}
+        });
+        let admission = store
+            .admit_run_guidance(AtomicRunGuidanceAdmissionRequest {
+                user_id,
+                run_id,
+                expected_session_id: session_id,
+                intent_id: "new-questionnaire-guidance",
+                event: &guidance,
+                process_local_execution_live: true,
+            })
+            .await
+            .unwrap();
+        let AtomicRunGuidanceAdmission::Committed { event_index } = admission else {
+            panic!("guidance must be accepted while waiting: {admission:?}");
+        };
+        let response = json!({"request_id": "superseded-questionnaire", "outcome": outcome,
+            "answers": {"answers": []}});
+        let resolution = store
+            .resolve_run_interaction(
+                user_id,
+                session_id,
+                run_id,
+                "superseded-questionnaire",
+                DurableRunInteractionKind::AskUser,
+                response.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(resolution, DurableRunInteractionResolveOutcome::Superseded {
+            user_intent_event_index, ..
+        } if user_intent_event_index == event_index)
+        );
+        let resumed = store.load_run(user_id, run_id).await.unwrap().unwrap();
+        assert_eq!(resumed.status, STATUS_RUNNING);
+        assert_eq!(resumed.waiting_for, None);
+        let resolved = resumed
+            .events
+            .iter()
+            .find(|event| extract_event_type(event) == "ask_user_resolved")
+            .unwrap();
+        assert_eq!(
+            resolved["data"]["_durable_resolution"]["disposition"], "superseded",
+            "releasing the wait must not authorize the stale answer"
+        );
+        assert_eq!(
+            resumed
+                .events
+                .iter()
+                .filter(|event| extract_event_type(event) == "run_resumed")
+                .count(),
+            1
+        );
+        // An exact callback retry cannot reopen the questionnaire or double-resume.
+        assert!(matches!(
+            store
+                .resolve_run_interaction(
+                    user_id,
+                    session_id,
+                    run_id,
+                    "superseded-questionnaire",
+                    DurableRunInteractionKind::AskUser,
+                    response,
+                )
+                .await
+                .unwrap(),
+            DurableRunInteractionResolveOutcome::Superseded { .. }
+        ));
+        let indices = [event_index];
+        let apply = AtomicRunUserIntentApplyRequest {
+            user_id,
+            run_id,
+            expected_session_id: session_id,
+            expected_owner_generation: run.run_generation,
+            source_event_indices: &indices,
+        };
+        assert!(matches!(
+            store.apply_run_user_intents(apply).await.unwrap(),
+            AtomicRunUserIntentApply::Applied { .. }
+        ));
+        assert!(matches!(
+            store.apply_run_user_intents(apply).await.unwrap(),
+            AtomicRunUserIntentApply::AlreadyApplied { .. }
+        ));
+        let applied = store.load_run(user_id, run_id).await.unwrap().unwrap();
+        assert_eq!(
+            applied
+                .events
+                .iter()
+                .filter(|event| extract_event_type(event) == "user_intent_applied")
+                .count(),
+            1
+        );
+        let next = [ask_user_prompted_event("next-questionnaire", session_id)];
+        assert_eq!(
+            store
+                .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+                    user_id,
+                    run_id,
+                    expected_session_id: session_id,
+                    expected_control_epoch: applied.last_event_idx,
+                    expected_owner_generation: applied.run_generation,
+                    events: &next,
+                })
+                .await
+                .unwrap(),
+            AtomicRunInteractionBatchRegistration::Registered,
+            "the same run must admit its next fresh action after applying guidance"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_questionnaire_releases_wait_for_guidance() {
+        for outcome in ["submitted", "timed_out"] {
+            let store = InMemoryRunStateStore::new();
+            assert_superseded_questionnaire_releases_wait_for_guidance(
+                &store,
+                "u1",
+                "s1",
+                &format!("questionnaire-{outcome}"),
+                outcome,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_superseded_questionnaire_releases_wait_for_guidance() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        for outcome in ["submitted", "timed_out"] {
+            let nonce = Uuid::new_v4();
+            let user_id = format!("questionnaire-u-{nonce}");
+            let session_id = format!("questionnaire-s-{nonce}");
+            let run_id = format!("questionnaire-r-{nonce}");
+            insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+            assert_superseded_questionnaire_releases_wait_for_guidance(
+                &store,
+                &user_id,
+                &session_id,
+                &run_id,
+                outcome,
+            )
+            .await;
+            cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+        }
     }
 
     #[tokio::test]

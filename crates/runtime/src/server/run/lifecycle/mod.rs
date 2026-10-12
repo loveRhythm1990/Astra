@@ -1981,6 +1981,16 @@ fn approval_decision_from_shared_event(
 
 fn ask_user_decision_from_shared_event(event: &Value) -> astra_tools::AskUserDecision {
     let data = event.get("data").unwrap_or(event);
+    if data
+        .pointer("/_durable_resolution/disposition")
+        .and_then(Value::as_str)
+        == Some("superseded")
+    {
+        return astra_tools::AskUserDecision::Error(
+            "newer user guidance superseded this questionnaire; its answer was not applied"
+                .to_string(),
+        );
+    }
     match data
         .get("outcome")
         .and_then(Value::as_str)
@@ -3134,7 +3144,11 @@ impl astra_tools::AskUserGate for DurableRunUserPromptGate {
         {
             Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(event))
             | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Idempotent(event))
-            | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(event)) => {
+            | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(event))
+            | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Superseded {
+                event,
+                ..
+            }) => {
                 project_shared_run_interaction_resolution(
                     &self.run_engine,
                     &self.runs,
@@ -3151,9 +3165,6 @@ impl astra_tools::AskUserGate for DurableRunUserPromptGate {
             | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Queued(_))
             | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::NoLongerWaiting)
             | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::AuthorityLost {
-                ..
-            })
-            | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Superseded {
                 ..
             }) => Self::no_longer_active(),
             Err(error) => astra_tools::AskUserDecision::Error(format!(

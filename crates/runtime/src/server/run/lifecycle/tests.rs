@@ -25030,6 +25030,100 @@ async fn server_only_user_prompt_wait_resumes_from_shared_interaction_state() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn superseded_questionnaire_timeout_releases_wait_and_applies_guidance() {
+    use crate::turn::run_control::{RunControl, UserIntentAdmissionAuthority, UserIntentApplyAck};
+
+    let svc = test_service();
+    let authority = svc
+        .run_engine
+        .start_run("prompt-guidance", "user-1", "session-guidance")
+        .await
+        .unwrap();
+    let gate = DurableRunUserPromptGate::new(
+        "user-1".into(),
+        "session-guidance".into(),
+        "prompt-guidance".into(),
+        None,
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        None,
+    )
+    .with_timeout(Duration::from_millis(200));
+    let prompt = astra_tools::AskUserPrompt {
+        context: None,
+        questions: vec![astra_tools::AskUserQuestion {
+            header: "Scope".into(),
+            question: "Which environment?".into(),
+            options: vec![],
+            multi_select: false,
+            allow_freeform: true,
+        }],
+        timeout_ms: None,
+    };
+    let waiting = tokio::spawn(async move {
+        astra_tools::AskUserGate::request_questionnaire(&gate, "question-guidance", &prompt).await
+    });
+    wait_for_durable_run_status(&svc.run_engine, "user-1", "prompt-guidance", STATUS_WAITING).await;
+    svc.run_engine
+        .append_event(
+            "user-1",
+            "session-guidance",
+            "prompt-guidance",
+            json!({
+                "event_type": "user_intent", "idempotency_key": "user_intent:prompt-guidance",
+                "data": {"intent_id": "prompt-guidance", "delivery": "guide_current_run",
+                    "input": {"content": "use production"}}
+            }),
+        )
+        .await
+        .unwrap();
+    let source = svc
+        .run_engine
+        .load_run("user-1", "prompt-guidance")
+        .await
+        .unwrap()
+        .unwrap()
+        .last_event_idx;
+    let decision = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(decision, astra_tools::AskUserDecision::Error(ref error)
+        if error.contains("newer user guidance superseded"))
+    );
+    assert_eq!(
+        svc.run_engine
+            .mark_user_intents_applied(
+                "user-1",
+                "session-guidance",
+                "prompt-guidance",
+                &[source as usize],
+                UserIntentAdmissionAuthority::DurableOwnerGeneration(authority.owner_generation),
+            )
+            .await
+            .unwrap(),
+        UserIntentApplyAck::Applied
+    );
+    let run = svc
+        .run_engine
+        .load_run("user-1", "prompt-guidance")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.status, STATUS_RUNNING);
+    assert_eq!(run.waiting_for, None);
+    assert_eq!(
+        run.events
+            .iter()
+            .filter(|event| event["event_type"] == "user_intent_applied")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn server_only_user_prompt_projects_required_event_to_active_stream() {
     let svc = test_service();
     svc.run_engine

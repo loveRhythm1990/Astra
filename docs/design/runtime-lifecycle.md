@@ -172,6 +172,13 @@ its exact combined canonical user message and preceding response. An earlier
 turn's source or the batch's last individual input cannot own its observations.
 Failed acknowledgements and replay without new guidance retain the prior source.
 
+When newer guidance supersedes an Ask User questionnaire, resolution releases
+only that exact live wait under its original owner, generation and lease. The
+resolution receipt remains `superseded`: an old answer is not applied or treated
+as resumed decision authority. The owner consumes the durable guidance before
+admitting a fresh action. This release does not apply to approval or provider
+interaction waits, stale frontiers, lost ownership, cancellation or terminal runs.
+
 ### Bounded continuation and completion
 
 An execution slice is a capacity checkpoint, not a task-completion boundary.
