@@ -284,9 +284,17 @@ pub fn confirmed_memory_id(response: &serde_json::Value) -> Result<String, Strin
     let id = response
         .get("memory_id")
         .and_then(serde_json::Value::as_str)
-        .filter(|id| !id.trim().is_empty() && id.trim() == *id)
         .ok_or_else(|| "memory backend did not return a valid memory_id receipt".to_string())?;
+    validate_memory_id(id)?;
     Ok(id.to_string())
+}
+
+/// Validate a receipt returned by any transport, including non-HTTP ports.
+pub fn validate_memory_id(id: &str) -> Result<(), String> {
+    if id.trim().is_empty() || id.trim() != id {
+        return Err("memory backend did not return a valid memory_id receipt".into());
+    }
+    Ok(())
 }
 
 /// Provider-neutral Memoria operations used by runtime orchestration.
@@ -484,6 +492,25 @@ pub fn parse_reflect_candidates(data: &Value) -> Vec<ReflectCandidate> {
             })
         })
         .collect()
+}
+
+/// Decode the same reflection response for direct and Server-proxied transports.
+/// A successful cooldown skip is an empty best-effort result, not a failure.
+pub fn parse_reflect_summary(data: &Value) -> ReflectSummary {
+    let candidate_payloads = parse_reflect_candidates(data);
+    ReflectSummary {
+        synthesized: data
+            .get("synthesized")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        candidates: (candidate_payloads.len() as u64).max(
+            data.get("scenes_created")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        ),
+        candidate_payloads,
+        diagnostics: data.to_string().chars().take(200).collect(),
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1015,6 +1042,15 @@ mod tests {
                 .poll(&mut context),
             Poll::Ready(Err(_))
         ));
+    }
+
+    #[test]
+    fn reflect_cooldown_skip_is_a_successful_empty_optional_result() {
+        let summary =
+            parse_reflect_summary(&json!({"skipped": true, "cooldown_remaining_s": 3600}));
+        assert_eq!(summary.candidates, 0);
+        assert!(!summary.synthesized);
+        assert!(summary.candidate_payloads.is_empty());
     }
 
     #[test]

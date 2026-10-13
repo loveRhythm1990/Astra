@@ -7,9 +7,8 @@
 //!    learnings, and structured [`SessionFacts`] (deterministic, no LLM call).
 //! 3. **Purge working memory** tied to the session only after the snapshot read
 //!    succeeds and any required episode is durable.
-//! 4. **Trigger reflection** so Memoria's graph-consolidation picks up
-//!    recent memories into scene nodes. Respects the backend's cooldown
-//!    (v1 defaults to 1h), so hot sessions won't thrash.
+//! 4. **Request reflection candidates** and persist optional semantic scenes.
+//!    Reflection is best-effort and does not control consolidation cooldown.
 //!
 //! Governance is best-effort. A failed snapshot read stops subsequent work;
 //! a failed episode write retains working memory while reflection may proceed.
@@ -210,22 +209,22 @@ pub async fn run_session_end_governance(
     if let Some(overview) =
         build_episode_overview_with_narrative(facts, snapshot.as_ref().map(|s| &s.narrative))
     {
-        match client.store_episode(session_id, &overview).await {
-            Ok(memory_id) if !memory_id.trim().is_empty() && memory_id.trim() == memory_id => {
+        let episode_receipt =
+            client
+                .store_episode(session_id, &overview)
+                .await
+                .and_then(|memory_id| {
+                    astra_memoria::validate_memory_id(&memory_id)?;
+                    Ok(memory_id)
+                });
+        match episode_receipt {
+            Ok(memory_id) => {
                 report.episode_memory_id = Some(memory_id);
                 report.episode_chars = overview.chars().count();
                 tracing::debug!(
                     session_id,
                     episode_chars = report.episode_chars,
                     "session-end episode stored"
-                );
-            }
-            Ok(_) => {
-                safe_to_purge_working = false;
-                report.working_retained_due_to_episode_failure = true;
-                tracing::warn!(
-                    session_id,
-                    "episode write returned no valid receipt; retaining working memory"
                 );
             }
             Err(e) => {
@@ -281,16 +280,17 @@ pub async fn run_session_end_governance(
             report.reflect_candidates = summary.candidates;
             report.reflect_synthesized = summary.synthesized;
             for cand in &summary.candidate_payloads {
-                match client
+                let scene_receipt = client
                     .store_scene(session_id, &cand.signal, &cand.summary)
                     .await
-                {
-                    Ok(memory_id)
-                        if !memory_id.trim().is_empty() && memory_id.trim() == memory_id =>
-                    {
+                    .and_then(|memory_id| {
+                        astra_memoria::validate_memory_id(&memory_id)?;
+                        Ok(memory_id)
+                    });
+                match scene_receipt {
+                    Ok(_) => {
                         report.scenes_stored += 1;
                     }
-                    Ok(_) => report.scene_persist_failures += 1,
                     Err(e) => {
                         report.scene_persist_failures += 1;
                         tracing::warn!(
@@ -304,8 +304,8 @@ pub async fn run_session_end_governance(
         }
         Err(e) => {
             report.reflection_failed = true;
-            // Cooldown rejection is expected under hot activity; keep it in
-            // structured debug logs and continue without user-facing noise.
+            // Reflection is optional. Preserve diagnostics without making a
+            // later close replay already completed episode/purge stages.
             tracing::debug!(
                 session_id,
                 error = %e,
@@ -339,18 +339,16 @@ pub struct SessionEndReport {
     pub scenes_stored: usize,
     /// Scene candidates that could not be persisted after reflection.
     pub scene_persist_failures: usize,
-    /// Reflection could not finish; the run must not start a success cooldown.
+    /// Optional reflection failed; this does not invalidate durable consolidation.
     pub reflection_failed: bool,
 }
 
 impl SessionEndReport {
-    /// Partial failures retain retry eligibility instead of becoming successful
-    /// completion merely because the best-effort operation returned a report.
-    pub fn is_complete(&self) -> bool {
-        !self.working_purge_failed
-            && !self.working_retained_due_to_episode_failure
-            && self.scene_persist_failures == 0
-            && !self.reflection_failed
+    /// Only required episode persistence and working cleanup govern the success
+    /// cooldown. Repeating those destructive stages to retry optional reflection
+    /// or scene synthesis would replay already completed consolidation.
+    pub fn consolidation_complete(&self) -> bool {
+        !self.working_purge_failed && !self.working_retained_due_to_episode_failure
     }
 }
 
@@ -622,7 +620,7 @@ mod tests {
             .unwrap();
         assert_eq!(report.scenes_stored, 0);
         assert_eq!(report.scene_persist_failures, 1);
-        assert!(!report.is_complete());
+        assert!(report.consolidation_complete());
     }
 
     #[tokio::test]
@@ -718,6 +716,7 @@ mod tests {
         fail_episode: bool,
         episode_receipt: Option<String>,
         fail_purge: bool,
+        fail_reflect: bool,
     }
 
     #[async_trait::async_trait]
@@ -789,6 +788,9 @@ mod tests {
             _force: bool,
         ) -> Result<super::super::memoria_compact::ReflectSummary, String> {
             self.operations.lock().unwrap().push("reflect".into());
+            if self.fail_reflect {
+                return Err("reflection unavailable".into());
+            }
             Ok(Default::default())
         }
     }
@@ -892,7 +894,7 @@ mod tests {
         );
         assert_eq!(report.working_purged, 0);
         assert!(report.working_retained_due_to_episode_failure);
-        assert!(!report.is_complete());
+        assert!(!report.consolidation_complete());
     }
 
     #[tokio::test]
@@ -907,7 +909,7 @@ mod tests {
                     .await
                     .unwrap();
             assert!(report.working_retained_due_to_episode_failure);
-            assert!(!report.is_complete());
+            assert!(!report.consolidation_complete());
             assert!(report.episode_memory_id.is_none());
             assert_eq!(report.episode_chars, 0);
             assert!(
@@ -919,6 +921,39 @@ mod tests {
                     .any(|operation| operation == "purge")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn completed_consolidation_starts_cooldown_after_optional_reflection_failure() {
+        let client = LifecycleOrderClient {
+            fail_reflect: true,
+            ..Default::default()
+        };
+        let debouncer = crate::turn::session_end_debounce::SessionEndDebouncer::new();
+        let permit = debouncer.try_begin("owner", "session-lifecycle").unwrap();
+        let report =
+            run_session_end_governance(&SessionFacts::default(), "session-lifecycle", &client)
+                .await
+                .unwrap();
+        assert!(report.reflection_failed);
+        assert_eq!(report.episode_memory_id.as_deref(), Some("episode-1"));
+        assert_eq!(report.working_purged, 1);
+        assert!(report.consolidation_complete());
+        permit.complete();
+        assert!(debouncer.try_begin("owner", "session-lifecycle").is_none());
+        assert_eq!(
+            client.operations.lock().unwrap().as_slice(),
+            ["retrieve", "store_episode", "purge", "reflect"]
+        );
+    }
+
+    #[test]
+    fn optional_scene_failures_do_not_replay_completed_consolidation() {
+        let report = SessionEndReport {
+            scene_persist_failures: 1,
+            ..Default::default()
+        };
+        assert!(report.consolidation_complete());
     }
 
     #[test]
@@ -934,21 +969,13 @@ mod tests {
                 working_retained_due_to_episode_failure: true,
                 ..Default::default()
             },
-            SessionEndReport {
-                scene_persist_failures: 1,
-                ..Default::default()
-            },
-            SessionEndReport {
-                reflection_failed: true,
-                ..Default::default()
-            },
         ] {
             let permit = debouncer.try_begin("owner", "session").unwrap();
-            assert!(!report.is_complete());
+            assert!(!report.consolidation_complete());
             drop(permit);
         }
         let permit = debouncer.try_begin("owner", "session").unwrap();
-        assert!(SessionEndReport::default().is_complete());
+        assert!(SessionEndReport::default().consolidation_complete());
         permit.complete();
         assert!(debouncer.try_begin("owner", "session").is_none());
     }

@@ -1895,10 +1895,10 @@ fn schedule_session_end_governance(state: &AppState, owner_id: String, session_i
                     episode_write_failed = report.working_retained_due_to_episode_failure,
                     scene_persist_failures = report.scene_persist_failures,
                     reflection_failed = report.reflection_failed,
-                    complete = report.is_complete(),
+                    consolidation_complete = report.consolidation_complete(),
                     "session-end governance finished"
                 );
-                if report.is_complete() {
+                if report.consolidation_complete() {
                     governance_permit.complete();
                 }
             }
