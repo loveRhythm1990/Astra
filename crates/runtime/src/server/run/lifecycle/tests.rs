@@ -26420,11 +26420,35 @@ async fn newer_guidance_fences_an_approved_stale_tool_before_execution() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(durable.status, STATUS_WAITING);
-    assert!(durable.events.iter().any(|event| {
-        event.get("event_type").and_then(Value::as_str) == Some("approval_resolved")
-            && event.pointer("/data/outcome").and_then(Value::as_str) == Some("denied")
-    }));
+    assert_eq!(durable.status, STATUS_RUNNING);
+    assert_eq!(durable.waiting_for, None);
+    let resolution = durable
+        .events
+        .iter()
+        .find(|event| event["event_type"] == "approval_resolved")
+        .expect("the stale approval must remain durably denied");
+    assert_eq!(resolution["data"]["outcome"], "denied");
+    assert_eq!(resolution["data"]["decision"], "deny");
+    assert_eq!(
+        resolution["data"]["_durable_resolution"]["disposition"],
+        "superseded"
+    );
+    assert_eq!(
+        durable
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == "run_resumed")
+            .count(),
+        1,
+        "release only the exact approval wait, without approving the stale tool"
+    );
+    assert_runtime_guidance_applied(
+        &svc,
+        "approval-guidance-session",
+        "approval-guidance",
+        authority.owner_generation,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
