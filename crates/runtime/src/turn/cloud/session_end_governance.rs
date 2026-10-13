@@ -5,14 +5,14 @@
 //! 1. **Read the final canonical session snapshot** while it still exists.
 //! 2. **Write an `episodic` memory** summarising goals, outcomes, corrections,
 //!    learnings, and structured [`SessionFacts`] (deterministic, no LLM call).
-//! 3. **Purge working memory** tied to the session only after the episode is
-//!    durable or the write was attempted.
+//! 3. **Purge working memory** tied to the session only after the snapshot read
+//!    succeeds and any required episode is durable.
 //! 4. **Trigger reflection** so Memoria's graph-consolidation picks up
 //!    recent memories into scene nodes. Respects the backend's cooldown
 //!    (v1 defaults to 1h), so hot sessions won't thrash.
 //!
-//! All three are best-effort — a failure in any step logs a warning and
-//! moves on; the rest still runs.
+//! Governance is best-effort. A failed snapshot read stops subsequent work;
+//! a failed episode write retains working memory while reflection may proceed.
 
 use astra_turn_types::session_facts::SessionFacts;
 
@@ -202,7 +202,8 @@ pub async fn run_session_end_governance(
     // consolidation input and working-memory cleanup must not destroy it.
     let snapshot =
         crate::session_memory::runner::load_current_session_memory_snapshot(client, session_id)
-            .await;
+            .await
+            .map_err(|error| format!("session-end snapshot retrieval failed: {error}"))?;
 
     // ── 1. Persist episodic summary ────────────────────────────────
     let mut safe_to_purge_working = true;
@@ -667,6 +668,8 @@ mod tests {
     struct LifecycleOrderClient {
         operations: Mutex<Vec<String>>,
         episode: Mutex<Option<String>>,
+        read_error: Option<astra_memoria::MemoriaOperationError>,
+        empty_snapshot: bool,
         fail_episode: bool,
         fail_purge: bool,
     }
@@ -684,6 +687,12 @@ mod tests {
             astra_memoria::MemoriaOperationError,
         > {
             self.operations.lock().unwrap().push("retrieve".into());
+            if let Some(error) = &self.read_error {
+                return Err(error.clone());
+            }
+            if self.empty_snapshot {
+                return Ok(Vec::new());
+            }
             Ok(vec![super::super::memoria_compact::MemoriaMemory {
                 memory_id: "working-final".into(),
                 content: crate::session_memory::runner::encode_session_memory_entry(
@@ -733,6 +742,59 @@ mod tests {
             self.operations.lock().unwrap().push("reflect".into());
             Ok(Default::default())
         }
+    }
+
+    #[tokio::test]
+    async fn governance_retains_working_memory_when_snapshot_read_fails() {
+        use astra_memoria::MemoriaOperationError;
+
+        for read_error in [
+            MemoriaOperationError::Failed("transient read failure".into()),
+            MemoriaOperationError::AuthorityUnavailable("authority unavailable".into()),
+            MemoriaOperationError::Disabled("memory disabled during closure".into()),
+        ] {
+            // Closure uses empty facts; nonempty facts must not authorize cleanup
+            // of an unread snapshot either.
+            for turn in [0, 3] {
+                let client = LifecycleOrderClient {
+                    read_error: Some(read_error.clone()),
+                    ..Default::default()
+                };
+                let error = run_session_end_governance(
+                    &SessionFacts {
+                        turn,
+                        ..Default::default()
+                    },
+                    "session-lifecycle",
+                    &client,
+                )
+                .await
+                .expect_err("an unread snapshot must prevent destructive governance");
+
+                assert!(error.contains("session-end snapshot retrieval failed"));
+                assert_eq!(client.operations.lock().unwrap().as_slice(), ["retrieve"]);
+                assert!(client.episode.lock().unwrap().is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn governance_allows_cleanup_after_a_successful_empty_snapshot_read() {
+        let client = LifecycleOrderClient {
+            empty_snapshot: true,
+            ..Default::default()
+        };
+        let report =
+            run_session_end_governance(&SessionFacts::default(), "session-lifecycle", &client)
+                .await
+                .expect("a successful empty read is not a read failure");
+
+        assert_eq!(
+            client.operations.lock().unwrap().as_slice(),
+            ["retrieve", "purge", "reflect"]
+        );
+        assert_eq!(report.working_purged, 1);
+        assert!(report.episode_memory_id.is_none());
     }
 
     #[tokio::test]

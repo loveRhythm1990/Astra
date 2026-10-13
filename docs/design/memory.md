@@ -94,6 +94,12 @@ transport failures retain downstream summary behavior. Cleanup maps every read
 error to purge failure. Write admission before expensive work and fresh final
 write checks remain required.
 
+Session-end governance must distinguish a successful empty snapshot read from
+a failed or denied read. Any snapshot read error stops destructive governance
+and retains working memories for a later retry. Session-start recall applies
+each profile/episode cap only after typed prompt admission, so invalid or
+inactive rows cannot displace valid evidence already returned by the backend.
+
 The bounded admitted authority-resolution counts are message recall 2 → 1,
 session-start recall 3 → 2, snapshot loading 2 → 1, and applicable compaction
 2 → 1. Independent session-start lanes deliberately resolve twice even when
