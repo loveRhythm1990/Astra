@@ -2012,7 +2012,7 @@ impl BottomPane {
         None
     }
 
-    /// Slash menu navigation. Enter with no matches falls through to
+    /// Slash menu navigation. Submit keys with no matches fall through to
     /// the composer so the raw draft gets submitted as-is (avoids a
     /// silent no-op).
     fn handle_slash_menu_key(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
@@ -2082,7 +2082,17 @@ impl BottomPane {
                 }
                 Some(BottomPaneAction::Consumed)
             }
-            KeyCode::Enter => {
+            _ if key.code == KeyCode::Enter || ChatComposer::is_explicit_followup_key(key) => {
+                let explicit_followup = ChatComposer::is_explicit_followup_key(key);
+                if explicit_followup {
+                    // Apply the same paste guard as ordinary composer queueing.
+                    // A due burst can change the completion or add arguments;
+                    // refresh the menu before choosing a command from it.
+                    if self.composer.handle_key(key) != ComposerAction::QueueFollowUp {
+                        return Some(BottomPaneAction::Consumed);
+                    }
+                    self.sync_popups();
+                }
                 if let Some(picked) = self
                     .slash_menu
                     .as_ref()
@@ -2091,7 +2101,11 @@ impl BottomPane {
                 {
                     self.composer.clear_draft();
                     self.slash_menu = None;
-                    return Some(BottomPaneAction::SubmitInput(picked));
+                    return Some(if explicit_followup {
+                        BottomPaneAction::QueueFollowUp(picked)
+                    } else {
+                        BottomPaneAction::SubmitInput(picked)
+                    });
                 }
                 None
             }

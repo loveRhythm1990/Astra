@@ -3088,11 +3088,12 @@ fn queue_explicit_active_followup(
     if !submission_starts_conversation(text) {
         return false;
     }
-    if bottom_pane.queue_next_turn_submission(text.clone()) {
-        chat_widget.commit_system(history_cell::system::SystemCell::info(
-            "Queued for the next turn in this client; starts after a safe handoff.".to_string(),
-        ));
+    if !bottom_pane.queue_next_turn_submission(text.clone()) {
+        return false;
     }
+    chat_widget.commit_system(history_cell::system::SystemCell::info(
+        "Queued for the next turn in this client; starts after a safe handoff.".to_string(),
+    ));
     true
 }
 

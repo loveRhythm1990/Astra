@@ -44,6 +44,124 @@ fn explicit_followup_is_a_composer_action_and_enter_stays_distinct() {
 }
 
 #[test]
+fn explicit_followup_accepts_additional_control_modifiers() {
+    for code in [KeyCode::Char('q'), KeyCode::Char('Q')] {
+        for modifiers in [
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SUPER,
+        ] {
+            let mut pane = BottomPane::new();
+            pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+            pane.composer.set_text("next task");
+            assert!(matches!(
+                pane.handle_key(KeyEvent::new(code, modifiers)),
+                BottomPaneAction::QueueFollowUp(text) if text == "next task"
+            ));
+            assert!(pane.composer.is_empty());
+        }
+    }
+
+    for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT, KeyModifiers::ALT] {
+        let mut pane = BottomPane::new();
+        pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+        pane.composer.set_text("draft");
+        assert!(!matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Char('q'), modifiers)),
+            BottomPaneAction::QueueFollowUp(_)
+        ));
+        assert!(!pane.composer.is_empty());
+    }
+}
+
+#[test]
+fn explicit_followup_uses_the_highlighted_slash_completion() {
+    for modifiers in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ] {
+        for select_second in [false, true] {
+            let mut pane = BottomPane::new();
+            pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+            pane.set_slash_items(vec![
+                crate::tui::slash_menu::SlashItem::simple("/work", "work hub"),
+                crate::tui::slash_menu::SlashItem::simple("/workspace", "workspace"),
+            ]);
+            pane.composer.set_text("/wor");
+            pane.sync_popups();
+            assert_eq!(pane.slash_menu_selected_name(), Some("/work"));
+            if select_second {
+                pane.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            }
+            let expected = if select_second { "/workspace" } else { "/work" };
+            assert_eq!(pane.slash_menu_selected_name(), Some(expected));
+            assert!(matches!(
+                pane.handle_key(KeyEvent::new(KeyCode::Char('q'), modifiers)),
+                BottomPaneAction::QueueFollowUp(text) if text == expected
+            ));
+            assert!(pane.composer.is_empty());
+            assert!(!pane.slash_menu_is_open());
+        }
+    }
+}
+
+#[test]
+fn explicit_followup_preserves_slash_arguments_and_unmatched_drafts() {
+    for text in ["/work resume existing", "/zzz_no_such_command"] {
+        let mut pane = BottomPane::new();
+        pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+        pane.set_slash_items(vec![crate::tui::slash_menu::SlashItem::simple(
+            "/work", "work hub",
+        )]);
+        pane.composer.set_text(text);
+        pane.sync_popups();
+        if text.starts_with("/zzz") {
+            assert!(pane.slash_menu_is_open());
+            assert_eq!(pane.slash_menu_len(), 0);
+        } else {
+            assert!(!pane.slash_menu_is_open());
+        }
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            BottomPaneAction::QueueFollowUp(actual) if actual == text
+        ));
+        assert!(pane.composer.is_empty());
+        assert!(!pane.slash_menu_is_open());
+    }
+}
+
+#[test]
+fn explicit_followup_slash_completion_preserves_paste_custody() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.set_slash_items(vec![crate::tui::slash_menu::SlashItem::simple(
+        "/work", "work hub",
+    )]);
+    pane.composer.set_text("/wor");
+    pane.sync_popups();
+    assert_eq!(pane.slash_menu_selected_name(), Some("/work"));
+
+    let suffix = "k resume existing";
+    pane.composer.force_pending_paste_burst_for_test(
+        suffix,
+        Instant::now() + std::time::Duration::from_secs(1),
+    );
+    let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+    assert!(matches!(pane.handle_key(key), BottomPaneAction::Consumed));
+    assert_eq!(pane.composer.text(), "/wor");
+    assert!(pane.slash_menu_is_open());
+
+    pane.composer
+        .force_pending_paste_burst_for_test(suffix, Instant::now());
+    assert!(matches!(
+        pane.handle_key(key),
+        BottomPaneAction::QueueFollowUp(text) if text == "/work resume existing"
+    ));
+    assert!(pane.composer.is_empty());
+    assert!(!pane.slash_menu_is_open());
+}
+
+#[test]
 fn explicit_followup_preserves_whitespace_and_expands_pasted_blobs() {
     let mut pane = BottomPane::new();
     pane.composer = super::chat_composer::ChatComposer::new_ephemeral();

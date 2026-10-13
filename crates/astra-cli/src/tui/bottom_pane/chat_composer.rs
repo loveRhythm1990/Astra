@@ -370,10 +370,15 @@ impl ChatComposer {
             .clamp(2, 4)
     }
 
+    pub(super) fn is_explicit_followup_key(key: KeyEvent) -> bool {
+        matches!(key.code, crossterm::event::KeyCode::Char('q' | 'Q'))
+            && key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> ComposerAction {
-        if matches!(key.code, crossterm::event::KeyCode::Char('q' | 'Q'))
-            && key.modifiers == crossterm::event::KeyModifiers::CONTROL
-        {
+        if Self::is_explicit_followup_key(key) {
             // Never clear a draft while part of a non-bracketed paste is
             // still buffered. A due burst can join this submission; an
             // ongoing burst stays in the composer for a later keypress.

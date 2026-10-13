@@ -32,7 +32,9 @@ changes, or a draft being edited retain input for review instead of sending it
 automatically. Queueing is local to this client process; it is not a durable
 Server acknowledgement and does not survive closing the client. When idle,
 Ctrl+Q submits normally. Slash/shell controls keep their ordinary dispatcher
-semantics, and a focused modal retains its keyboard input.
+semantics, and a focused modal retains its keyboard input. With the slash menu
+open, Enter and Ctrl+Q both use the highlighted completion; command arguments
+and drafts with no matching completion are submitted unchanged.
 
 ## Common
 
