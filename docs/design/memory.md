@@ -96,7 +96,14 @@ write checks remain required.
 
 Session-end governance must distinguish a successful empty snapshot read from
 a failed or denied read. Any snapshot read error stops destructive governance
-and retains working memories for a later retry. Session-start recall applies
+and retains working memories for a later retry. Required writes must return an
+exact, nonempty memory ID: an empty successful HTTP response or an unsupported
+transport operation is not proof of storage. Unconfirmed episodes retain working
+memory; unconfirmed scenes are failed writes. Partial episode, purge, reflection,
+or scene failures do not start the successful session-end debounce cooldown.
+Retry eligibility is not an automatic durable retry queue.
+
+Session-start recall applies
 each profile/episode cap only after typed prompt admission, so invalid or
 inactive rows cannot displace valid evidence already returned by the backend.
 

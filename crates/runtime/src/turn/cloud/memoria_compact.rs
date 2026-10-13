@@ -867,10 +867,7 @@ impl MemoriaPort for HttpMemoriaPort {
             .await
             .map_err(|e| format!("Memoria store parse failed: {e}"))?;
 
-        data.get("memory_id")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .ok_or_else(|| "Memoria store: no memory_id in response".to_string())
+        astra_memoria::confirmed_memory_id(&data)
     }
 
     /// Purge working memories for a session.
@@ -990,11 +987,7 @@ impl MemoriaPort for HttpMemoriaPort {
             .json()
             .await
             .map_err(|e| format!("Memoria store_episode parse failed: {e}"))?;
-        Ok(data
-            .get("memory_id")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .unwrap_or_default())
+        astra_memoria::confirmed_memory_id(&data)
     }
 
     /// Persist a reflect scene candidate as a semantic memory with a stable
@@ -1037,11 +1030,7 @@ impl MemoriaPort for HttpMemoriaPort {
             .json()
             .await
             .map_err(|e| format!("Memoria store_scene parse failed: {e}"))?;
-        Ok(data
-            .get("memory_id")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .unwrap_or_default())
+        astra_memoria::confirmed_memory_id(&data)
     }
 
     async fn reflect_session(
@@ -2721,6 +2710,44 @@ mod tests {
         let body: Value = serde_json::from_str(body).unwrap();
         assert_eq!(body["memory_ids"], json!(["memory-42"]));
         assert!(body.get("user_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn all_store_paths_reject_invalid_http_write_receipts() {
+        for body in [
+            "{}",
+            r#"{"memory_id":""}"#,
+            r#"{"memory_id":" "}"#,
+            r#"{"memory_id":12}"#,
+            "not-json",
+        ] {
+            for operation in ["store", "episode", "scene"] {
+                let (address, _, server) =
+                    capture_one_http_request("201 Created", body.as_bytes()).await;
+                let client =
+                    HttpMemoriaPort::new_master(format!("http://{address}"), "test-key".into())
+                        .with_owner_user_id("owner-7");
+                let result = match operation {
+                    "store" => {
+                        client
+                            .store("a durable fact", "semantic", Some("session-9"), Some("T3"))
+                            .await
+                    }
+                    "episode" => {
+                        client
+                            .store_episode("session-9", "completed the migration")
+                            .await
+                    }
+                    _ => {
+                        client
+                            .store_scene("session-9", "pattern", "a recurring pattern")
+                            .await
+                    }
+                };
+                assert!(result.is_err(), "operation={operation}, body={body}");
+                server.await.unwrap();
+            }
+        }
     }
 
     #[tokio::test]

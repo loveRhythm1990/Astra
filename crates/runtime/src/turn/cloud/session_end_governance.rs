@@ -211,7 +211,7 @@ pub async fn run_session_end_governance(
         build_episode_overview_with_narrative(facts, snapshot.as_ref().map(|s| &s.narrative))
     {
         match client.store_episode(session_id, &overview).await {
-            Ok(memory_id) if !memory_id.is_empty() => {
+            Ok(memory_id) if !memory_id.trim().is_empty() && memory_id.trim() == memory_id => {
                 report.episode_memory_id = Some(memory_id);
                 report.episode_chars = overview.chars().count();
                 tracing::debug!(
@@ -221,9 +221,12 @@ pub async fn run_session_end_governance(
                 );
             }
             Ok(_) => {
-                // store succeeded but response didn't include a memory_id;
-                // count it as a write but leave id blank.
-                report.episode_chars = overview.chars().count();
+                safe_to_purge_working = false;
+                report.working_retained_due_to_episode_failure = true;
+                tracing::warn!(
+                    session_id,
+                    "episode write returned no valid receipt; retaining working memory"
+                );
             }
             Err(e) => {
                 safe_to_purge_working = false;
@@ -282,10 +285,12 @@ pub async fn run_session_end_governance(
                     .store_scene(session_id, &cand.signal, &cand.summary)
                     .await
                 {
-                    Ok(memory_id) if !memory_id.is_empty() => {
+                    Ok(memory_id)
+                        if !memory_id.trim().is_empty() && memory_id.trim() == memory_id =>
+                    {
                         report.scenes_stored += 1;
                     }
-                    Ok(_) => report.scenes_stored += 1,
+                    Ok(_) => report.scene_persist_failures += 1,
                     Err(e) => {
                         report.scene_persist_failures += 1;
                         tracing::warn!(
@@ -298,6 +303,7 @@ pub async fn run_session_end_governance(
             }
         }
         Err(e) => {
+            report.reflection_failed = true;
             // Cooldown rejection is expected under hot activity; keep it in
             // structured debug logs and continue without user-facing noise.
             tracing::debug!(
@@ -333,6 +339,19 @@ pub struct SessionEndReport {
     pub scenes_stored: usize,
     /// Scene candidates that could not be persisted after reflection.
     pub scene_persist_failures: usize,
+    /// Reflection could not finish; the run must not start a success cooldown.
+    pub reflection_failed: bool,
+}
+
+impl SessionEndReport {
+    /// Partial failures retain retry eligibility instead of becoming successful
+    /// completion merely because the best-effort operation returned a report.
+    pub fn is_complete(&self) -> bool {
+        !self.working_purge_failed
+            && !self.working_retained_due_to_episode_failure
+            && self.scene_persist_failures == 0
+            && !self.reflection_failed
+    }
 }
 
 #[cfg(test)]
@@ -523,6 +542,7 @@ mod tests {
         episodes: Mutex<Vec<String>>,
         reflect_response: Mutex<ReflectSummary>,
         fail_scene: bool,
+        empty_scene_receipt: bool,
     }
 
     #[async_trait::async_trait]
@@ -571,6 +591,9 @@ mod tests {
             if self.fail_scene {
                 return Err("scene store unavailable".into());
             }
+            if self.empty_scene_receipt {
+                return Ok(String::new());
+            }
             self.scenes.lock().unwrap().push((
                 sid.to_string(),
                 signal.to_string(),
@@ -578,6 +601,28 @@ mod tests {
             ));
             Ok("scene_1".into())
         }
+    }
+
+    #[tokio::test]
+    async fn governance_does_not_count_unconfirmed_scenes_as_stored() {
+        let client = SceneCaptureClient {
+            empty_scene_receipt: true,
+            ..Default::default()
+        };
+        *client.reflect_response.lock().unwrap() = ReflectSummary {
+            candidate_payloads: vec![ReflectCandidate {
+                signal: "pattern".into(),
+                summary: "recurring evidence".into(),
+                importance: 1.0,
+            }],
+            ..Default::default()
+        };
+        let report = run_session_end_governance(&SessionFacts::default(), "scene-receipt", &client)
+            .await
+            .unwrap();
+        assert_eq!(report.scenes_stored, 0);
+        assert_eq!(report.scene_persist_failures, 1);
+        assert!(!report.is_complete());
     }
 
     #[tokio::test]
@@ -671,6 +716,7 @@ mod tests {
         read_error: Option<astra_memoria::MemoriaOperationError>,
         empty_snapshot: bool,
         fail_episode: bool,
+        episode_receipt: Option<String>,
         fail_purge: bool,
     }
 
@@ -721,7 +767,10 @@ mod tests {
             if self.fail_episode {
                 Err("episode store unavailable".into())
             } else {
-                Ok("episode-1".into())
+                Ok(self
+                    .episode_receipt
+                    .clone()
+                    .unwrap_or_else(|| "episode-1".into()))
             }
         }
 
@@ -843,6 +892,65 @@ mod tests {
         );
         assert_eq!(report.working_purged, 0);
         assert!(report.working_retained_due_to_episode_failure);
+        assert!(!report.is_complete());
+    }
+
+    #[tokio::test]
+    async fn governance_retains_working_on_unconfirmed_episode_receipts() {
+        for receipt in ["", " ", " episode-1"] {
+            let client = LifecycleOrderClient {
+                episode_receipt: Some(receipt.into()),
+                ..Default::default()
+            };
+            let report =
+                run_session_end_governance(&SessionFacts::default(), "session-lifecycle", &client)
+                    .await
+                    .unwrap();
+            assert!(report.working_retained_due_to_episode_failure);
+            assert!(!report.is_complete());
+            assert!(report.episode_memory_id.is_none());
+            assert_eq!(report.episode_chars, 0);
+            assert!(
+                !client
+                    .operations
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|operation| operation == "purge")
+            );
+        }
+    }
+
+    #[test]
+    fn partial_governance_does_not_start_a_success_cooldown() {
+        use crate::turn::session_end_debounce::SessionEndDebouncer;
+        let debouncer = SessionEndDebouncer::new();
+        for report in [
+            SessionEndReport {
+                working_purge_failed: true,
+                ..Default::default()
+            },
+            SessionEndReport {
+                working_retained_due_to_episode_failure: true,
+                ..Default::default()
+            },
+            SessionEndReport {
+                scene_persist_failures: 1,
+                ..Default::default()
+            },
+            SessionEndReport {
+                reflection_failed: true,
+                ..Default::default()
+            },
+        ] {
+            let permit = debouncer.try_begin("owner", "session").unwrap();
+            assert!(!report.is_complete());
+            drop(permit);
+        }
+        let permit = debouncer.try_begin("owner", "session").unwrap();
+        assert!(SessionEndReport::default().is_complete());
+        permit.complete();
+        assert!(debouncer.try_begin("owner", "session").is_none());
     }
 
     #[tokio::test]
