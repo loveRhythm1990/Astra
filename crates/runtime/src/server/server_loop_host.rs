@@ -4665,6 +4665,12 @@ impl EdgeApprovalSettlement {
 }
 
 #[derive(Debug)]
+enum SharedEdgeApproval {
+    Decision(Value),
+    Superseded,
+}
+
+#[derive(Debug)]
 enum EdgeApprovalWait {
     Allowed,
     PermissionModeChanged,
@@ -14056,7 +14062,10 @@ impl ServerAgenticLoopHost {
         }
     }
 
-    async fn load_shared_edge_approval(&self, tool_call: &Value) -> Result<Option<Value>, String> {
+    async fn load_shared_edge_approval(
+        &self,
+        tool_call: &Value,
+    ) -> Result<Option<SharedEdgeApproval>, String> {
         let Some(sink) = self.interaction_sink.as_ref() else {
             return Ok(None);
         };
@@ -14086,15 +14095,6 @@ impl ServerAgenticLoopHost {
             .ok_or_else(|| {
                 format!("shared approval resolution {request_id} has invalid decision")
             })?;
-        if data
-            .pointer("/_durable_resolution/disposition")
-            .and_then(Value::as_str)
-            != Some("resumed")
-        {
-            return Err(format!(
-                "shared approval resolution {request_id} was recorded without durable resume authority"
-            ));
-        }
         let approval_kind = data
             .get("approval_kind")
             .and_then(Value::as_str)
@@ -14102,7 +14102,22 @@ impl ServerAgenticLoopHost {
             .ok_or_else(|| {
                 format!("shared approval resolution {request_id} has invalid approval kind")
             })?;
-        Ok(Some(json!({
+        match data
+            .pointer("/_durable_resolution/disposition")
+            .and_then(Value::as_str)
+        {
+            Some("resumed") => {}
+            // The committed receipt may become visible before the guidance
+            // poll wakes. Supersession is control flow, never authority to
+            // consume the old decision or execute the pending tool.
+            Some("superseded") => return Ok(Some(SharedEdgeApproval::Superseded)),
+            _ => {
+                return Err(format!(
+                    "shared approval resolution {request_id} was recorded without durable resume authority"
+                ));
+            }
+        }
+        Ok(Some(SharedEdgeApproval::Decision(json!({
             "kind": "approval_respond",
             "body": {
                 "request_id": request_id,
@@ -14113,16 +14128,19 @@ impl ServerAgenticLoopHost {
                 "tool_name": tool_name,
                 "approval_kind": approval_kind,
             }
-        })))
+        }))))
     }
 
-    async fn wait_for_shared_edge_approval(&self, tool_call: &Value) -> Result<Value, String> {
+    async fn wait_for_shared_edge_approval(
+        &self,
+        tool_call: &Value,
+    ) -> Result<SharedEdgeApproval, String> {
         if !self
             .interaction_sink
             .as_ref()
             .is_some_and(|sink| sink.has_shared_edge_approval_authority())
         {
-            return std::future::pending::<Result<Value, String>>().await;
+            return std::future::pending::<Result<SharedEdgeApproval, String>>().await;
         }
         let mut poll_interval = Duration::from_millis(100);
         let max_poll_interval = Duration::from_secs(1);
@@ -14138,10 +14156,14 @@ impl ServerAgenticLoopHost {
     async fn classify_shared_edge_approval(
         &self,
         tool_call: &Value,
-        entry: Value,
+        approval: SharedEdgeApproval,
     ) -> EdgeApprovalWait {
         use astra_turn_core::cloud_tool_delivery::wait_approval_ledger_for_tool;
 
+        let entry = match approval {
+            SharedEdgeApproval::Decision(entry) => entry,
+            SharedEdgeApproval::Superseded => return EdgeApprovalWait::Superseded,
+        };
         if entry.pointer("/body/decision").and_then(Value::as_str) == Some("timeout") {
             return EdgeApprovalWait::TimedOut(
                 astra_turn_core::cloud_tool_delivery::approval_timeout_delivery(tool_call),
@@ -25715,6 +25737,81 @@ mod tests {
         let outcome = wait.await.expect("shared approval poll task");
         assert!(matches!(outcome, EdgeApprovalWait::Allowed));
         assert_eq!(polls.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_superseded_approval_wins_before_guidance_poll_wakes() {
+        // Cover both the ordinary shared wait and the nested wait entered
+        // after a local callback hint. Even an old allow cannot authorize work.
+        for local_hint in [false, true] {
+            for decision in ["allow", "deny", "timeout"] {
+                let mut host =
+                    test_host_builder("u-shared-superseded", "s-shared-superseded").build();
+                host.set_approval_audit_context(test_approval_audit_context(
+                    "u-shared-superseded",
+                    "s-shared-superseded",
+                ));
+                let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                host.set_interaction_sink(Arc::new(PolledApprovalInteractionSink {
+                    polls: polls.clone(),
+                    resolve_after_poll: 2,
+                    resolution: json!({
+                        "event_type": "approval_resolved",
+                        "data": {
+                            "request_id": "write-superseded",
+                            "decision": decision,
+                            "tool": "write_file",
+                            "approval_kind": "standard",
+                            "_durable_resolution": {"disposition": "superseded"},
+                        }
+                    }),
+                }));
+                let context = test_edge_action_context("u-shared-superseded", "test-run").await;
+                let tool_call = json!({
+                    "id": "write-superseded",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                });
+                if local_hint {
+                    host.edge_callback_ledger.lock().await.insert(
+                        test_approval_key(
+                            "u-shared-superseded",
+                            "s-shared-superseded",
+                            "write-superseded",
+                        ),
+                        approval_allow_entry("s-shared-superseded", "write-superseded"),
+                    );
+                }
+
+                let wait = tokio::spawn(async move {
+                    host.wait_edge_approval_or_guidance(
+                        &context,
+                        &tool_call,
+                        Duration::from_secs(300),
+                    )
+                    .await
+                });
+                tokio::task::yield_now().await;
+                assert_eq!(polls.load(Ordering::SeqCst), 1);
+                assert!(!wait.is_finished());
+
+                // Guidance is asleep for 250 ms after an empty poll. The
+                // shared receipt becomes visible at 100 ms and must win,
+                // independent of the biased select's guidance-first ordering.
+                tokio::time::advance(Duration::from_millis(100)).await;
+                tokio::task::yield_now().await;
+                assert!(
+                    wait.is_finished(),
+                    "shared supersession must not await guidance"
+                );
+                let outcome = wait.await.expect("shared approval poll task");
+                assert!(
+                    matches!(outcome, EdgeApprovalWait::Superseded),
+                    "decision={decision}, local_hint={local_hint}: {outcome:?}"
+                );
+                assert_eq!(polls.load(Ordering::SeqCst), 2);
+            }
+        }
     }
 
     #[tokio::test]

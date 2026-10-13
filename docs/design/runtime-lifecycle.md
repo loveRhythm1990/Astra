@@ -178,6 +178,10 @@ resolution receipt remains `superseded`: an old answer, approval or provider
 response is not applied or treated as resumed decision authority. The owner
 consumes the durable guidance before admitting a fresh action. Stale frontiers,
 lost ownership, cancellation and terminal runs never grant this wait release.
+An Edge approval reader that observes the shared `superseded` receipt before
+its guidance poll wakes takes that same supersession continuation path; it
+does not classify the receipt as lost authority or replay the old decision.
+An `authority_lost` receipt still fails closed.
 
 ### Bounded continuation and completion
 
