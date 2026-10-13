@@ -2147,12 +2147,17 @@ impl BottomPane {
     }
 
     fn route_to_composer(&mut self, key: KeyEvent) -> BottomPaneAction {
-        let action = match self.composer.handle_key(key) {
-            ComposerAction::Submit => {
+        let composer_action = self.composer.handle_key(key);
+        let action = match composer_action {
+            ComposerAction::Submit | ComposerAction::QueueFollowUp => {
                 let text = self.composer.clear_and_submit();
                 self.slash_menu = None;
                 self.close_mention();
-                BottomPaneAction::SubmitInput(text)
+                if composer_action == ComposerAction::QueueFollowUp {
+                    BottomPaneAction::QueueFollowUp(text)
+                } else {
+                    BottomPaneAction::SubmitInput(text)
+                }
             }
             ComposerAction::OpenExternalEditor => {
                 if self.task_status.is_active() {
@@ -2638,6 +2643,10 @@ pub(crate) enum ApprovalActivation {
 #[derive(Debug)]
 pub(crate) enum BottomPaneAction {
     SubmitInput(String),
+    /// A composer-only delivery choice. The active loop retains conversational
+    /// input in its existing local FIFO; idle input and local controls use the
+    /// ordinary dispatcher. This does not transfer custody to the Server.
+    QueueFollowUp(String),
     OpenExternalEditor(String),
     /// The shortcut was pressed while a turn owns the event loop. Opening the
     /// editor here would stop polling that turn, so the dispatcher must show a

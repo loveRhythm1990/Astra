@@ -17,6 +17,23 @@ Commands without a native workbench action are omitted from TUI completion.
 Typing one shows an unavailable message. There is no separate console slash
 frontend; non-interactive commands use the [CLI routes](cli-commands.md).
 
+## Input delivery
+
+While a run is active, **Enter** submits conversational input as guidance when
+the run still admits it; startup and settlement fallback rules may instead queue
+it. **Ctrl+Q** explicitly queues conversational input for the next turn, so the
+current run does not receive that message as guidance. You can still use Enter
+to guide the current run after queueing a follow-up. **Shift+Enter** and
+**Alt+Enter** insert a newline.
+
+The next-turn queue runs in FIFO order through ordinary submission after the
+existing lifecycle permits a safe handoff. Failed/interrupted turns, session
+changes, or a draft being edited retain input for review instead of sending it
+automatically. Queueing is local to this client process; it is not a durable
+Server acknowledgement and does not survive closing the client. When idle,
+Ctrl+Q submits normally. Slash/shell controls keep their ordinary dispatcher
+semantics, and a focused modal retains its keyboard input.
+
 ## Common
 
 | Command | What it does |

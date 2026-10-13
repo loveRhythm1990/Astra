@@ -18,6 +18,138 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 
 #[test]
+fn explicit_followup_is_a_composer_action_and_enter_stays_distinct() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.set_task_status(TaskStatus::TurnRunning {
+        started_at: Instant::now(),
+    });
+    let text = "also update documentation\nwith examples";
+    pane.composer.set_text(text);
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        BottomPaneAction::QueueFollowUp(queued) if queued == text
+    ));
+    assert!(pane.composer.is_empty());
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        BottomPaneAction::Consumed
+    ));
+
+    pane.composer.set_text("use the existing helper");
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        BottomPaneAction::SubmitInput(text) if text == "use the existing helper"
+    ));
+}
+
+#[test]
+fn explicit_followup_preserves_whitespace_and_expands_pasted_blobs() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+    pane.composer.set_text("  \n\t");
+    assert!(matches!(pane.handle_key(key), BottomPaneAction::Consumed));
+    assert_eq!(pane.composer.text(), "  \n\t");
+
+    pane.composer.set_text("");
+    let pasted = "long pasted line\n".repeat(100);
+    pane.handle_paste(&pasted);
+    assert!(matches!(
+        pane.handle_key(key), BottomPaneAction::QueueFollowUp(text) if text == pasted
+    ));
+}
+
+#[test]
+fn explicit_followup_keeps_shift_and_alt_enter_as_newlines() {
+    for modifiers in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+        let mut pane = BottomPane::new();
+        pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+        pane.composer.set_text("first line");
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Enter, modifiers)),
+            BottomPaneAction::Consumed
+        ));
+        assert_eq!(pane.composer.text(), "first line\n");
+    }
+}
+
+#[test]
+fn explicit_followup_does_not_submit_a_draft_beneath_a_modal() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.composer.set_text("draft underneath the picker");
+    pane.push_view(Box::new(
+        crate::tui::slash_dispatch::build_permission_mode_picker(
+            crate::cli::permission_manager::PermissionMode::Prompt,
+        ),
+    ));
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        BottomPaneAction::Consumed
+    ));
+    assert_eq!(pane.composer.text(), "draft underneath the picker");
+    assert!(pane.has_active_view());
+    assert_eq!(pane.queued_next_turn_submission_count(), 0);
+}
+
+#[test]
+fn explicit_followup_does_not_resolve_a_pending_approval() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let (tx, mut rx) = oneshot::channel::<ApprovalResponse>();
+    pane.enqueue_approval(
+        "bash".into(),
+        "Need approval".into(),
+        None,
+        "testing".into(),
+        serde_json::Value::Null,
+        tx,
+    );
+    pane.composer.set_text("afterwards summarize");
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        BottomPaneAction::QueueFollowUp(text) if text == "afterwards summarize"
+    ));
+    assert!(pane.has_pending_approvals());
+    assert!(matches!(
+        rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn explicit_followup_does_not_escape_an_ask_user_view() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.composer.set_text("draft behind the question");
+    let prompt = serde_json::from_value(serde_json::json!({
+        "context": null,
+        "questions": [{
+            "header": "Scope",
+            "question": "Which scope?",
+            "options": [{"label": "Core", "description": null, "preview": null}],
+            "multi_select": false,
+            "allow_freeform": false
+        }]
+    }))
+    .unwrap();
+    let (tx, mut rx) = oneshot::channel();
+    pane.enqueue_ask_user(prompt, tx);
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        BottomPaneAction::Consumed
+    ));
+    assert!(pane.has_active_view());
+    assert_eq!(pane.composer.text(), "draft behind the question");
+    assert!(matches!(
+        rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert_eq!(pane.queued_next_turn_submission_count(), 0);
+}
+
+#[test]
 fn binding_retained_root_preserves_child_and_navigator_focus() {
     for durable in [false, true] {
         for child_visible in [false, true] {
