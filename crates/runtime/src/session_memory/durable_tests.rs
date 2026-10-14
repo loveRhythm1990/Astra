@@ -3,7 +3,7 @@ use super::*;
 use astra_core::{MatrixOneSettings, SharedPool};
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{delete, get, post},
 };
@@ -40,6 +40,7 @@ async fn store_memory(
     let mut backend = state.lock().unwrap();
     assert_authority(&headers, &backend);
     assert_eq!(body["session_id"], backend.session);
+    assert_eq!(body["branch"], "main");
     if backend.unsupported_idempotency {
         return (StatusCode::NOT_FOUND, Json(json!({})));
     }
@@ -66,9 +67,14 @@ async fn store_memory(
     }
     (StatusCode::CREATED, Json(memory))
 }
-async fn list_memory(State(state): State<Arc<Mutex<Backend>>>, headers: HeaderMap) -> Json<Value> {
+async fn list_memory(
+    State(state): State<Arc<Mutex<Backend>>>,
+    Query(query): Query<BTreeMap<String, String>>,
+    headers: HeaderMap,
+) -> Json<Value> {
     let mut backend = state.lock().unwrap();
     assert_authority(&headers, &backend);
+    assert_eq!(query.get("branch").map(String::as_str), Some("main"));
     *backend.calls.entry("list".into()).or_default() += 1;
     Json(
         json!({"items":if backend.working_active {vec![backend.snapshot.clone()]} else {vec![]},"next_cursor":null}),
@@ -78,9 +84,11 @@ async fn delete_memory(
     State(state): State<Arc<Mutex<Backend>>>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(query): Query<BTreeMap<String, String>>,
 ) -> StatusCode {
     let mut backend = state.lock().unwrap();
     assert_authority(&headers, &backend);
+    assert_eq!(query.get("branch").map(String::as_str), Some("main"));
     assert_eq!(id, "working-final");
     *backend.calls.entry("delete".into()).or_default() += 1;
     if !std::mem::replace(&mut backend.working_active, false) {
@@ -95,9 +103,11 @@ async fn delete_memory(
 async fn reflect(
     State(state): State<Arc<Mutex<Backend>>>,
     headers: HeaderMap,
+    Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     let mut backend = state.lock().unwrap();
     assert_authority(&headers, &backend);
+    assert_eq!(body["branch"], "main");
     *backend.calls.entry("reflect".into()).or_default() += 1;
     if std::mem::take(&mut backend.fail_reflection) {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));

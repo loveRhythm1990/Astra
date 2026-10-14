@@ -37,7 +37,10 @@ impl DurableMemoriaPort {
             .await?
             .ok_or("durable memory work requires an owner-bound HTTP provider")?;
         let owner = transport.owner_user_id.clone();
-        Ok((HttpMemoriaPort::from_transport(transport), owner))
+        Ok((
+            HttpMemoriaPort::from_transport(transport).for_durable_session(),
+            owner,
+        ))
     }
 
     pub async fn prepare_plan(&self) -> Result<FinalizationPlan, String> {

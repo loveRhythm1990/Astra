@@ -154,9 +154,23 @@ pub struct HttpMemoriaPort {
     owner_user_id: Option<String>,
     owner_binding_required: bool,
     owner_scoped_master: bool,
+    durable_main_branch: bool,
 }
 
 impl HttpMemoriaPort {
+    /// Durable receipts use main, independently of a user's Memoria checkout.
+    pub(crate) fn for_durable_session(mut self) -> Self {
+        self.durable_main_branch = true;
+        self
+    }
+
+    fn scoped_body(&self, mut body: Value) -> Value {
+        if self.durable_main_branch {
+            body["branch"] = json!("main");
+        }
+        body
+    }
+
     pub(crate) fn from_transport(transport: MemoriaToolTransport) -> Self {
         let mut client = Self::new(transport.base_url, transport.credential)
             .with_owner_user_id(transport.owner_user_id);
@@ -214,7 +228,7 @@ impl HttpMemoriaPort {
             .request(reqwest::Method::POST, &url, None)?
             .json(
                 &json!({"content": content, "memory_type": memory_type, "session_id": session_id,
-                "trust_tier": trust_tier, "idempotency_key": key}),
+                "trust_tier": trust_tier, "idempotency_key": key, "branch": "main"}),
             )
             .send()
             .await
@@ -244,6 +258,7 @@ impl HttpMemoriaPort {
             owner_user_id: None,
             owner_binding_required: false,
             owner_scoped_master: false,
+            durable_main_branch: false,
         }
     }
 
@@ -307,7 +322,7 @@ impl HttpMemoriaPort {
         } else {
             "Bearer"
         };
-        let request = self
+        let mut request = self
             .http
             .request(method, url)
             .header(
@@ -315,6 +330,9 @@ impl HttpMemoriaPort {
                 format!("{authorization_scheme} {}", self.api_key),
             )
             .header("X-Memoria-Tool", "astra");
+        if self.durable_main_branch {
+            request = request.query(&[("branch", "main")]);
+        }
         Ok(match owner {
             Some(owner) => request.header("X-User-Id", owner),
             None => request,
@@ -767,7 +785,7 @@ impl MemoriaPort for HttpMemoriaPort {
 
         let resp = self
             .request(reqwest::Method::POST, &url, Some(user_id))?
-            .json(&body)
+            .json(&self.scoped_body(body))
             .send()
             .await
             .map_err(|e| format!("Memoria prompt retrieve failed: {e}"))?;
@@ -819,7 +837,7 @@ impl MemoriaPort for HttpMemoriaPort {
         }
         let resp = self
             .request(reqwest::Method::POST, &url, None)?
-            .json(&body)
+            .json(&self.scoped_body(body))
             .send()
             .await
             .map_err(|e| format!("Memoria retrieve failed: {e}"))?;
@@ -920,7 +938,7 @@ impl MemoriaPort for HttpMemoriaPort {
 
         let resp = self
             .request(reqwest::Method::POST, &url, None)?
-            .json(&body)
+            .json(&self.scoped_body(body))
             .send()
             .await
             .map_err(|e| format!("Memoria store failed: {e}"))?;
@@ -982,7 +1000,7 @@ impl MemoriaPort for HttpMemoriaPort {
 
         let resp = self
             .request(reqwest::Method::POST, &url, Some(&scope.user_id))?
-            .json(&body)
+            .json(&self.scoped_body(body))
             .send()
             .await
             .map_err(|e| format!("Memoria purge failed: {e}"))?;
@@ -1013,10 +1031,10 @@ impl MemoriaPort for HttpMemoriaPort {
         let url = format!("{}/v1/memories/purge", self.base_url.trim_end_matches('/'));
         let resp = self
             .request(reqwest::Method::POST, &url, None)?
-            .json(&json!({
+            .json(&self.scoped_body(json!({
                 "memory_ids": [memory_id],
                 "reason": "superseded session memory",
-            }))
+            })))
             .send()
             .await
             .map_err(|e| format!("Memoria delete failed: {e}"))?;
@@ -1052,7 +1070,7 @@ impl MemoriaPort for HttpMemoriaPort {
         });
         let resp = self
             .request(reqwest::Method::POST, &url, Some(&scope.user_id))?
-            .json(&body)
+            .json(&self.scoped_body(body))
             .send()
             .await
             .map_err(|e| format!("Memoria store_episode failed: {e}"))?;
@@ -1095,7 +1113,7 @@ impl MemoriaPort for HttpMemoriaPort {
         }
         let resp = self
             .request(reqwest::Method::POST, &url, None)?
-            .json(&body)
+            .json(&self.scoped_body(body))
             .send()
             .await
             .map_err(|e| format!("Memoria store_scene failed: {e}"))?;
@@ -1131,7 +1149,7 @@ impl MemoriaPort for HttpMemoriaPort {
         }
         let resp = self
             .request(reqwest::Method::POST, &url, None)?
-            .json(&body)
+            .json(&self.scoped_body(body))
             .send()
             .await
             .map_err(|e| format!("Memoria reflect failed: {e}"))?;
@@ -1174,7 +1192,7 @@ impl MemoriaPort for HttpMemoriaPort {
         }
         let resp = self
             .request(reqwest::Method::POST, &url, None)?
-            .json(&body)
+            .json(&self.scoped_body(body))
             .send()
             .await
             .map_err(|e| format!("Memoria feedback failed: {e}"))?;

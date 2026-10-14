@@ -143,8 +143,10 @@ required/optional completion, failure flags and retry timing to the Session owne
 it does not expose queued prompts, credentials or snapshot content.
 
 Durable working/episode/scene writes require Memoria's dedicated
-`POST /v1/memories/idempotent` protocol. The authenticated owner, branch and stable
-key determine a receipt ID; the backend atomically arbitrates inserts and rejects
+`POST /v1/memories/idempotent` protocol. Durable extraction and finalization
+explicitly pin reads, writes and cleanup to Memoria `main`; a user checkout cannot
+retarget this journal or change its expected receipt identity. The authenticated
+owner, branch and stable key determine a receipt ID; the backend atomically arbitrates inserts and rejects
 key reuse with another payload. Old servers reject the dedicated endpoint before
 writing, so Astra retains working state and reports unavailable maintenance until
 the matching backend is deployed. Similarity deduplication is not a substitute for
