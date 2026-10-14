@@ -6901,7 +6901,22 @@ mod tests {
                 .collect();
             let mut capture = crate::execution_capture::tests::tool_capture();
             capture.run_tree.runs.truncate(1);
+            let spawn_arguments = if name == "flash_missing_child_model_fail_closed" {
+                serde_json::json!({
+                    "action": "spawn",
+                    "description": "Missing configured model admission probe",
+                    "prompt": "Reply ASTRA-MISSING-MODEL-MUST-NOT-RUN",
+                    "requested_model_policy": {
+                        "mode": "fixed",
+                        "selector": {"kind": "configured_name", "model_name": "glm-99.99"}
+                    }
+                })
+                .to_string()
+            } else {
+                r#"{"action":"spawn"}"#.into()
+            };
             let page = capture.transcript.as_mut().unwrap();
+            page.items[0].tool_calls[0].arguments = spawn_arguments.clone();
             page.items[1].tool_result.as_mut().unwrap().status = Some("rejected".into());
             page.items[1].content = r#"{"error_kind":"invalid_request","status":"failed"}"#.into();
             let append = |capture: &mut crate::execution_capture::SessionExecutionCapture,
@@ -6939,7 +6954,7 @@ mod tests {
                 append(
                     &mut capture,
                     "agent",
-                    r#"{"action":"spawn"}"#,
+                    &spawn_arguments,
                     r#"{"error_kind":"invalid_request","status":"failed"}"#,
                     "rejected",
                 );
@@ -6964,8 +6979,24 @@ mod tests {
                     .all(|result| result.passed),
                 "{name}"
             );
+            if name == "flash_missing_child_model_fail_closed" {
+                let mut wrong_selector = baseline.clone();
+                let mut args: serde_json::Value = serde_json::from_str(&spawn_arguments).unwrap();
+                args["requested_model_policy"]["selector"] = serde_json::json!({
+                    "kind": "offering_id", "offering_id": "glm-99.99"
+                });
+                wrong_selector.transcript.as_mut().unwrap().items[0].tool_calls[0].arguments =
+                    args.to_string();
+                outcome.stream_capture.as_mut().unwrap().execution = Some(wrong_selector);
+                assert!(
+                    evaluate_deterministic(&criteria, &outcome)
+                        .iter()
+                        .any(|result| !result.passed),
+                    "an Offering ID rejection must not certify the configured-name probe"
+                );
+            }
             for (extra_name, arguments) in [
-                ("agent", r#"{"action":"spawn"}"#),
+                ("agent", spawn_arguments.as_str()),
                 ("agent", r#"{"action":"get_status"}"#),
                 ("model_catalog", "{}"),
             ] {
