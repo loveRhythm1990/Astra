@@ -192,6 +192,12 @@ pub async fn run_session_end_governance(
     session_id: &str,
     client: &dyn super::memoria_compact::MemoriaPort,
 ) -> Result<SessionEndReport, String> {
+    if client.schedule_session_finalization(session_id).await? {
+        return Ok(SessionEndReport {
+            scheduled: true,
+            ..Default::default()
+        });
+    }
     if !client.admits_operation(true).await? {
         return Ok(SessionEndReport::default());
     }
@@ -318,8 +324,9 @@ pub async fn run_session_end_governance(
 }
 
 /// Report from session-end governance.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SessionEndReport {
+    pub scheduled: bool,
     pub working_purged: u64,
     /// The episode was safe (or unnecessary), but working-memory purge failed.
     pub working_purge_failed: bool,
@@ -348,7 +355,9 @@ impl SessionEndReport {
     /// cooldown. Repeating those destructive stages to retry optional reflection
     /// or scene synthesis would replay already completed consolidation.
     pub fn consolidation_complete(&self) -> bool {
-        !self.working_purge_failed && !self.working_retained_due_to_episode_failure
+        !self.scheduled
+            && !self.working_purge_failed
+            && !self.working_retained_due_to_episode_failure
     }
 }
 
@@ -961,6 +970,10 @@ mod tests {
         use crate::turn::session_end_debounce::SessionEndDebouncer;
         let debouncer = SessionEndDebouncer::new();
         for report in [
+            SessionEndReport {
+                scheduled: true,
+                ..Default::default()
+            },
             SessionEndReport {
                 working_purge_failed: true,
                 ..Default::default()

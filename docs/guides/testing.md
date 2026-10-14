@@ -660,6 +660,26 @@ make test-offline
 make test-online
 ```
 
+## Durable session-memory regressions
+
+Use a designated isolated MatrixOne database and the environment described in
+this guide; these tests must not run against QA, production or a populated local
+database. The runtime fixture uses a loopback Memoria backend and synthetic
+identities, with no live model or Memoria credentials.
+
+```bash
+ASTRA_TEST_DB_IT=1 ASTRA_TEST_DATABASE="$ASTRA_DATABASE" \
+  cargo test -p astra-services --test session_memory_lifecycle_db_it -- --ignored --test-threads=1
+ASTRA_TEST_DB_IT=1 ASTRA_TEST_DATABASE="$ASTRA_DATABASE" \
+  cargo test -p astra-runtime --lib session_memory::durable::tests -- --ignored --test-threads=1
+cargo test -p astra-cli --bin astra cli::session::session_startup::tests::cli_ -- --test-threads=1
+```
+
+The database tests cover canonical-context handoff recovery, shared fencing and
+lease takeover. Runtime tests exercise authenticated exit/close/status HTTP
+routes and partial-stage retry after lost receipts. CLI tests cover distinct
+Astra/Memoria owners and unsuccessful queue acknowledgments without purge.
+
 ## What "done" Means
 
 A change is not complete until:

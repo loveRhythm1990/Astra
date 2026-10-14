@@ -679,7 +679,7 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     // Background session-memory extraction. Fire-and-forget; service
     // handles LLM vs. rule-based decision, event emission, UX broker,
     // and debounce. See `crate::session_memory::MemoryExtractionService`.
-    maybe_run_memory_extraction(state);
+    maybe_run_memory_extraction(state).await;
 
     // Desired-state convergence authority is deliberately live-only. A
     // terminal turn (successful, interrupted, or cancelled) must not leave a
@@ -999,7 +999,7 @@ fn update_session_facts_from_turn(state: &mut super::host::AgenticLoopState) {
 /// immediately — the service owns the per-session debounce state,
 /// decides whether to spawn, emits the gate/skip/extracted/errored
 /// journal event inline, and runs the background worker.
-fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
+async fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
     let Some(svc) = state.memory_extraction_service.clone() else {
         return;
     };
@@ -1041,6 +1041,18 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
             .is_some_and(|intent| intent.reanchors_current_objective()),
     };
 
+    match tokio::time::timeout(std::time::Duration::from_secs(1), svc.prepare_request(&req)).await {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => return,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "session memory durable handoff failed");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!("session memory durable handoff timed out");
+            return;
+        }
+    }
     match svc.maybe_spawn(req) {
         crate::session_memory::SpawnDecision::Spawned => {}
         crate::session_memory::SpawnDecision::Queued => {}

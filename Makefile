@@ -1330,6 +1330,7 @@ test-online:
 	if [ "$$ONLINE_LANE" = "all" ] || [ "$$ONLINE_LANE" = "core" ] || [ "$$ONLINE_LANE" = "core-runtime" ]; then \
 		echo "Running astra-runtime ignored unit/bin tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE); real provider calls disabled)..."; \
 		RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+			ASTRA_TEST_DATABASE=$$RUNTIME_IGNORED_DB \
 			ASTRA_TEST_DB_IT=1 \
 			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \

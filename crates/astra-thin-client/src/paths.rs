@@ -195,6 +195,10 @@ pub fn session(id: &str) -> String {
 }
 
 #[inline]
+pub fn session_memory_finalize(id: &str) -> String {
+    format!("/sessions/{}/memory/finalize", model_segment(id))
+}
+
 pub fn session_close(id: &str) -> String {
     format!("/sessions/{id}/close")
 }

@@ -1,0 +1,288 @@
+//! Shared session fence, restart recovery, and owner-scoped durable work.
+use astra_core::{MatrixOneSettings, SharedPool};
+use astra_services::{
+    auth::{DatabaseSessionService, SessionService, SessionUpdateRequestData},
+    session_memory_lifecycle::SessionMemoryLifecycleStore,
+};
+use serde_json::json;
+use std::sync::Arc;
+#[path = "common/isolated_database.rs"]
+mod isolated_database;
+
+async fn setup() -> (SharedPool, MatrixOneSettings, String, String) {
+    let settings = MatrixOneSettings::from_env();
+    isolated_database::require_isolated_database(&settings.database);
+    static SCHEMA: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    SCHEMA
+        .get_or_init(|| async {
+            astra_services::storage::ensure_core_schema(&settings, "mysql")
+                .await
+                .unwrap();
+        })
+        .await;
+    let pool = SharedPool::new(&settings).await.unwrap();
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let user = format!("memory-user-{nonce}");
+    let session = format!("memory-session-{nonce}");
+    sqlx::query("INSERT INTO agent_sessions (user_id, session_id, status) VALUES (?, ?, 'active')")
+        .bind(&user)
+        .bind(&session)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    (pool, settings, user, session)
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn close_enqueues_pending_generation_and_restart_recovers_exact_prepared_write() {
+    let (pool, settings, user, session) = setup().await;
+    let store = SessionMemoryLifecycleStore::new(pool.clone());
+    store
+        .publish(
+            &user,
+            &session,
+            json!({"session_facts":{"turn":3}}),
+            "generation-3".into(),
+        )
+        .await
+        .unwrap();
+    store.request_extraction(&user, &session).await.unwrap();
+    let claim = store.claim(&user, &session).await.unwrap().unwrap();
+    assert!(store.claim(&user, &session).await.unwrap().is_none());
+    store
+        .with_fenced_state(&user, &session, Some(&claim.token), false, |work| {
+            Box::pin(async move {
+                work.prepared_working =
+                    Some(json!({"content":"frozen-final-turn", "key":"stable-operation"}));
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    let sessions = DatabaseSessionService::new(settings).with_pool(pool.clone());
+    sessions
+        .update_session(
+            session.clone(),
+            user.clone(),
+            SessionUpdateRequestData {
+                title: None,
+                metadata: None,
+                metadata_patch: None,
+                status: Some("closed".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let status = store.status(&user, &session).await.unwrap();
+    assert_eq!(status["requested"], true);
+    assert_eq!(status["extraction_pending"], true);
+    sqlx::query("UPDATE agent_session_memory_work SET lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE user_id = ? AND session_id = ?")
+        .bind(&user).bind(&session).execute(pool.get()).await.unwrap();
+    let restarted = SessionMemoryLifecycleStore::new(pool.clone());
+    let recovered = restarted.claim(&user, &session).await.unwrap().unwrap();
+    assert_ne!(recovered.token, claim.token);
+    assert_eq!(
+        recovered.work.prepared_working.as_ref().unwrap()["content"],
+        "frozen-final-turn"
+    );
+    assert!(restarted.finish_extraction(&claim, true, 3).await.is_err());
+    restarted
+        .finish_extraction(&recovered, true, 3)
+        .await
+        .unwrap();
+    let governance = restarted.claim(&user, &session).await.unwrap().unwrap();
+    assert!(governance.work.active_request.is_none());
+    assert!(governance.work.finalize_requested);
+    assert_eq!(governance.work.completed_turn, Some(3));
+    assert!(restarted.claim("foreign-user", &session).await.is_err());
+    restarted.release(&governance, false).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn mutation_fence_serializes_follow_up_and_exit_does_not_close_resumable_session() {
+    let (pool, _settings, user, session) = setup().await;
+    let store = SessionMemoryLifecycleStore::new(pool.clone());
+    store
+        .publish(
+            &user,
+            &session,
+            json!({"session_facts":{"turn":1}}),
+            "generation-1".into(),
+        )
+        .await
+        .unwrap();
+    store.request_finalization(&user, &session).await.unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let driver = store.clone();
+    let task_user = user.clone();
+    let task_session = session.clone();
+    let started_inner = started.clone();
+    let release_inner = release.clone();
+    let mutation = tokio::spawn(async move {
+        driver
+            .with_fenced_state(&task_user, &task_session, None, false, move |work| {
+                Box::pin(async move {
+                    started_inner.notify_one();
+                    release_inner.notified().await;
+                    work.receipts.insert("episode".into(), "receipt-1".into());
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+    });
+    started.notified().await;
+    let driver = store.clone();
+    let task_user = user.clone();
+    let task_session = session.clone();
+    let publication = tokio::spawn(async move {
+        driver
+            .publish(
+                &task_user,
+                &task_session,
+                json!({"session_facts":{"turn":2}}),
+                "generation-2".into(),
+            )
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert!(!publication.is_finished());
+    release.notify_one();
+    mutation.await.unwrap();
+    publication.await.unwrap();
+    let status = store.status(&user, &session).await.unwrap();
+    assert_eq!(status["requested"], false);
+    let session_status: String = sqlx::query_scalar(
+        "SELECT status FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user)
+    .bind(&session)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(session_status, "active");
+    store.request_finalization(&user, &session).await.unwrap();
+    let claim = store.claim(&user, &session).await.unwrap().unwrap();
+    assert_eq!(
+        claim.work.active_fingerprint.as_deref(),
+        Some("generation-2")
+    );
+    store.finish_extraction(&claim, false, 2).await.unwrap();
+    assert!(
+        store.status(&user, &session).await.unwrap()["pending"]
+            .as_bool()
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn missed_handoff_recovers_from_canonical_context_and_preserves_close_intent() {
+    use astra_services::{
+        AcquireWriterAndReserveTurnOutcome, DatabaseSessionContextCoordinator,
+        SessionContextCoordinator,
+    };
+    use astra_turn_types::{
+        ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+        CanonicalDeltaModeV1, CanonicalTurnDeltaV1, SessionKeyV1, SessionSurfaceV1,
+    };
+    let (pool, _settings, user, session) = setup().await;
+    let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+    let key = SessionKeyV1::owner_session("server", &user, &session, "main");
+    let actor = ActorContextV1::owner_user(
+        &user,
+        "memory-recovery-db-it",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Server,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+    for turn in 1..=4 {
+        let head = coordinator.load_head(&key).await.unwrap();
+        let ready = coordinator
+            .acquire_writer_and_reserve_turn(
+                &key,
+                head.as_ref().map(|head| &head.cursor),
+                &actor,
+                std::time::Duration::from_secs(30),
+                &format!("writer-{turn}"),
+                &format!("reservation-{turn}"),
+                None,
+            )
+            .await
+            .unwrap();
+        let AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } = ready else {
+            panic!("canonical writer must be ready: {ready:?}")
+        };
+        coordinator
+            .commit_turn(
+                &reservation,
+                CanonicalTurnDeltaV1 {
+                    schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+                    completed_turn: turn,
+                    journal_event_seq: u64::from(turn),
+                    conversation_seq: u64::from(turn),
+                    compaction_generation: 0,
+                    config_version_id: None,
+                    mode: CanonicalDeltaModeV1::Append,
+                    logical_segments: vec![vec![
+                        json!({"role":"user","content":format!("canonical-turn-{turn}")}),
+                        json!({"role":"assistant","content":"durable reply"}),
+                    ]],
+                },
+                &format!("commit-{turn}"),
+            )
+            .await
+            .unwrap();
+        coordinator.release_writer(&lease).await.unwrap();
+    }
+    let store = SessionMemoryLifecycleStore::new(pool.clone());
+    store
+        .publish(
+            &user,
+            &session,
+            json!({"session_facts":{"turn":1}}),
+            "old-generation".into(),
+        )
+        .await
+        .unwrap();
+    store.request_finalization(&user, &session).await.unwrap();
+    let claim = store.claim(&user, &session).await.unwrap().unwrap();
+    let head = store
+        .missing_input_head(&user, &session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.cursor.completed_turn, 4);
+    let materialized = coordinator.materialize(&head).await.unwrap();
+    assert!(
+        materialized
+            .messages
+            .iter()
+            .any(|message| message["content"] == "canonical-turn-4")
+    );
+    let request = json!({"inference_scope":{"turn":4},"session_facts":{"turn":4},"messages":materialized.messages});
+    store
+        .publish_recovery(&claim, request, "recovered-generation".into(), 4)
+        .await
+        .unwrap();
+    let current = store.load_claim_work(&claim).await.unwrap();
+    assert!(current.finalize_requested);
+    assert_eq!(current.finalize_turn, Some(4));
+    // The older active attempt remains frozen until acknowledged; only then
+    // does the final generation become executable.
+    store.finish_extraction(&claim, true, 1).await.unwrap();
+    let next = store.claim(&user, &session).await.unwrap().unwrap();
+    assert_eq!(
+        next.work.active_fingerprint.as_deref(),
+        Some("recovered-generation")
+    );
+    store.finish_extraction(&next, true, 4).await.unwrap();
+    let finalization = store.claim(&user, &session).await.unwrap().unwrap();
+    assert!(!finalization.work.extraction_pending());
+    assert!(finalization.work.finalize_requested);
+}

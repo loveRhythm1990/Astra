@@ -50,15 +50,15 @@ The design does not require one physical backend. Vector, fulltext, graph, tabul
 
 ## Credential authority and admission
 
-Per-turn memory extraction is Server-owned. CLI exit uses the authenticated
-`MemoriaPort` session-end governance operation directly, without constructing a
-local extraction service, background broker or duplicate snapshot/writer caches.
-Without a bound memory port and session identity, exit skips remote maintenance;
-it never substitutes global or default-profile credentials.
-The CLI memory inference adapter remains available for lesson relevance checks.
-Signal-derived lessons are checkpointed as working memory during turns. The CLI
-does not run a separate LLM lesson synthesizer or promote fixed signal templates
-to semantic memory on exit.
+Per-turn extraction and remote session-end maintenance are Server-owned. CLI
+exit hands off through `POST /sessions/{session_id}/memory/finalize` using the
+selected profile's fresh access token; it preserves the resumable Session and
+never falls back to a client-side purge if the handoff fails. Explicit session
+close enqueues the same maintenance within the canonical close transaction.
+Direct/in-process providers continue to use the same governance algorithm.
+Without a bound memory provider and session identity, CLI exit skips maintenance.
+The CLI memory inference adapter remains available for lesson relevance checks;
+it does not introduce a second extraction service or lesson synthesizer.
 
 The Server composes one per-user memory authority policy. Prompt recall, background extraction, explicit `memory` tools, HTTP memory routes and session-end governance must use that same policy.
 
@@ -94,23 +94,71 @@ transport failures retain downstream summary behavior. Cleanup maps every read
 error to purge failure. Write admission before expensive work and fresh final
 write checks remain required.
 
-Session-end governance must distinguish a successful empty snapshot read from
-a failed or denied read. Any snapshot read error stops destructive governance
-and retains working memories for a later retry. Required writes must return an
-exact, nonempty memory ID: an empty successful HTTP response or an unsupported
-transport operation is not proof of storage. Unconfirmed episodes retain working
-memory; unconfirmed scenes are failed writes. Only required episode persistence
-and working cleanup determine the consolidation success cooldown. Optional
-reflection/scene failures remain observable but do not replay those completed
-stages. Failed episode persistence or cleanup retains retry eligibility; this
-is not an automatic durable retry queue.
+## Finalization, recovery and owner boundaries
 
-The CLI transport persists typed episodes and scenes through the authenticated
-Server memory proxy, sharing the direct transport's encoding and receipt
-validation. It requests reflection candidates through the same proxy; successful
-backend cooldown skips are empty results. CLI exit retains its shared five-second
-maintenance budget and cancels/drains unfinished work rather than granting purge
-on a timeout. A required archive must be confirmed before working cleanup.
+Strict HTTP recall responses include a fresh `memory_scope` attestation with
+`astra_user_id`, `memoria_owner_id` and `session_id`. Authentication authorizes the
+Session using Astra identity; the proxy validates backend rows using the resolved
+Memoria owner before overwriting any backend-supplied attestation. CLI validates
+that attestation against its selected Astra account and requested Session, then
+validates every row against the attested Memoria owner. UC and personal Memoria
+namespaces need not equal `/auth/me.user_id`; an absent, malformed or mismatched
+attestation fails closed. No owner or grant cache is shared between operations.
+
+`agent_session_memory_work` is the durable journal for the existing extraction
+and governance algorithms. Normal turn finalization performs a one-second bounded
+handoff of authenticated canonical extraction input before terminal completion;
+expensive inference and Memoria work remain background operations. A missed
+handoff is recovered from immutable canonical context using the existing Session
+context coordinator. Destructive stages verify the canonical completed-turn
+watermark and wait for execution settlement. If freshness cannot be verified or
+materialization fails, working memory is retained.
+
+Worker selection uses a database lease (90 seconds), with owner/session-specific
+fencing through the existing Session write fence. Short preparation/checkpoint transactions take that fence; only
+destructive working cleanup holds it across its bounded HTTP call. Optional reads, extraction
+writes and reflection do not hold Session admission open while waiting on the
+backend. Before cleanup, the fence rechecks execution settlement, the canonical
+watermark and the exact frozen plan. The lease does not grant memory authority:
+every read/write resolves current owner and consent. Extraction retains its 20-second attempt
+budget; finalization retains a 60-second attempt budget. Restart and lease expiry
+recover unfinished work. Failed attempts back off from 5 seconds to 16 minutes;
+the managed recovery worker polls every two seconds with concurrency two.
+
+The journal freezes an uncertain working-write payload before HTTP dispatch,
+then freezes the final snapshot and runtime facts before consolidation. Required
+writes must return exact, nonempty, protocol-compatible receipts. Episode
+receipts, exact working IDs removed, reflection candidates and scene receipts are
+checkpointed separately. A failed archive cannot authorize cleanup. Cleanup only
+removes the captured owner/session working IDs and accepts an already absent ID
+on retry. A failed read never grants an empty successful purge. Optional
+reflection/scene retries preserve completed episode and cleanup stages.
+
+CLI exit targets its idle generation; a follow-up turn invalidates that old
+maintenance request. Explicit close settles all already-admitted extraction and
+rejects writes after the closed generation is consolidated. Repeated close or
+exit requests retain journal progress instead of creating duplicate archives.
+`GET /sessions/{session_id}/memory/status` exposes pending work, the settled turn,
+required/optional completion, failure flags and retry timing to the Session owner;
+it does not expose queued prompts, credentials or snapshot content.
+
+Durable working/episode/scene writes require Memoria's dedicated
+`POST /v1/memories/idempotent` protocol. The authenticated owner, branch and stable
+key determine a receipt ID; the backend atomically arbitrates inserts and rejects
+key reuse with another payload. Old servers reject the dedicated endpoint before
+writing, so Astra retains working state and reports unavailable maintenance until
+the matching backend is deployed. Similarity deduplication is not a substitute for
+an idempotency receipt. The existing direct transports and explicit memory tools
+retain their ordinary API and timeout contracts.
+
+CLI keeps its five-second exit budget; that budget covers the durable handoff,
+not remote completion. A queued acknowledgment is never reported as a confirmed
+archive. Disconnect/revocation blocks future journal operations without erasing
+remote memories. Deleting an Astra Session removes its queued journal inputs and
+cancels later stages under the same Session fence; it does not promise remote
+Memoria erasure. Memoria retention and explicit memory deletion still govern the
+remote records. Successful consolidation is tracked durably per generation,
+rather than relying on a process-local 15-minute debounce timer.
 
 Session-start recall applies
 each profile/episode cap only after typed prompt admission, so invalid or

@@ -920,7 +920,10 @@ pub fn decode_session_memory_prompt(
     Some(parts.join("\n"))
 }
 
-fn decode_session_memory_snapshot(raw: &str, session_id: &str) -> Option<SessionMemorySnapshot> {
+pub(crate) fn decode_session_memory_snapshot(
+    raw: &str,
+    session_id: &str,
+) -> Option<SessionMemorySnapshot> {
     let entry = MemoryEntry::parse(raw.trim())?;
     if entry.ns != NS_SESSION || entry.status != ST_ACTIVE {
         return None;

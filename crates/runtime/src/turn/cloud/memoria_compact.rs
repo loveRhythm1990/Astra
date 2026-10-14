@@ -79,7 +79,7 @@ impl Default for MemoriaCompactParams {
 pub use astra_memoria::{
     MemoriaMemory, MemoriaOperationError, MemoriaPort, MemoriaToolTransport, MemoryScope,
     ReflectCandidate, ReflectSummary, confirmed_memory_id, parse_reflect_candidates,
-    parse_reflect_summary, validate_strict_memories,
+    parse_reflect_summary, validate_attested_strict_recall_payload, validate_strict_memories,
 };
 
 fn cross_session_abstract(prefix: &str, evidence: &str) -> String {
@@ -157,6 +157,79 @@ pub struct HttpMemoriaPort {
 }
 
 impl HttpMemoriaPort {
+    pub(crate) fn from_transport(transport: MemoriaToolTransport) -> Self {
+        let mut client = Self::new(transport.base_url, transport.credential)
+            .with_owner_user_id(transport.owner_user_id);
+        client.owner_scoped_master = transport.owner_scoped_master;
+        client
+    }
+
+    pub(crate) async fn delete_confirmed_or_absent(&self, memory_id: &str) -> Result<(), String> {
+        astra_memoria::validate_memory_id(memory_id)?;
+        let encoded =
+            percent_encoding::utf8_percent_encode(memory_id, percent_encoding::NON_ALPHANUMERIC);
+        let url = format!(
+            "{}/v1/memories/{encoded}",
+            self.base_url.trim_end_matches('/')
+        );
+        let response = self
+            .request(reqwest::Method::DELETE, &url, None)?
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            Err(self.status_error("delete", response.status()))
+        }
+    }
+
+    /// Dedicated endpoint makes old backends fail before any write. The
+    /// deterministic receipt also rejects incompatible/mixed-version routing.
+    pub(crate) async fn store_idempotent(
+        &self,
+        content: &str,
+        memory_type: &str,
+        session_id: &str,
+        trust_tier: &str,
+        key: &str,
+    ) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        let owner = self
+            .owner_user_id
+            .as_deref()
+            .ok_or("idempotent write requires an owner")?;
+        let identity = json!(["memoria.store.v1", owner, "main", key]);
+        let digest =
+            Sha256::digest(serde_json::to_vec(&identity).map_err(|error| error.to_string())?);
+        let expected: String = digest[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let url = format!(
+            "{}/v1/memories/idempotent",
+            self.base_url.trim_end_matches('/')
+        );
+        let response = self
+            .request(reqwest::Method::POST, &url, None)?
+            .json(
+                &json!({"content": content, "memory_type": memory_type, "session_id": session_id,
+                "trust_tier": trust_tier, "idempotency_key": key}),
+            )
+            .send()
+            .await
+            .map_err(|error| format!("idempotent memory store failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(self.status_error("idempotent store", response.status()));
+        }
+        let payload: Value = response.json().await.map_err(|error| error.to_string())?;
+        let id = confirmed_memory_id(&payload)?;
+        if id != expected {
+            return Err("memory backend returned an incompatible idempotency receipt".into());
+        }
+        Ok(id)
+    }
+
     pub fn new(base_url: String, api_key: String) -> Self {
         Self {
             base_url,

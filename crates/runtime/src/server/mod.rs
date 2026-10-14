@@ -63,6 +63,7 @@ pub(crate) mod server_bash_execution;
 pub mod server_loop_host;
 pub mod server_skill_subrun;
 pub(crate) mod session;
+pub(crate) mod session_memory_runtime;
 pub(crate) mod session_turn;
 mod state_builder;
 pub mod sweeper_lease;
@@ -295,6 +296,10 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         bg_cancel.clone(),
     ));
     if let Some(ref pool) = state.shared_pool {
+        bg_handles.push(session_memory_runtime::spawn_session_memory_recovery(
+            state.clone(),
+            bg_cancel.clone(),
+        ));
         bg_handles.push(spawn_data_cleanup(pool.clone(), bg_cancel.clone()));
         bg_handles.push(spawn_edge_dispatch_cleanup(
             state.execution.edge_dispatch_service.clone(),

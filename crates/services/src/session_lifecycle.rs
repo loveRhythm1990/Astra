@@ -174,6 +174,10 @@ const SESSION_DELETE_DERIVED_PARENT_TABLES: &[SessionDeleteStatement] = &[Sessio
 
 const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
+        label: "agent_session_memory_work",
+        sql: "DELETE FROM agent_session_memory_work WHERE session_id = ? AND user_id = ?",
+    },
+    SessionDeleteStatement {
         label: "work_branch_creation_operations_origin",
         sql: "DELETE FROM work_branch_creation_operations WHERE origin_session_id = ? AND owner_id = ?",
     },
@@ -490,6 +494,7 @@ const SESSION_DELETE_TERMINAL_TABLES: &[SessionDeleteStatement] = &[
 ];
 
 const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[(&str, &str)] = &[
+    ("agent_session_memory_work", "user_id"),
     ("agent_sessions", "user_id"),
     ("agent_session_execution_slots", "user_id"),
     ("session_context_heads", "owner_user_id"),

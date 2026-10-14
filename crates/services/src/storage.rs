@@ -3569,6 +3569,26 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
+        "agent_session_memory_work",
+        "CREATE TABLE IF NOT EXISTS agent_session_memory_work (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            state_json JSON NOT NULL,
+            lease_token VARCHAR(36) NULL,
+            lease_expires_at DATETIME(6) NULL,
+            next_attempt_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            attempts BIGINT NOT NULL DEFAULT 0,
+            complete BOOLEAN NOT NULL DEFAULT TRUE,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id),
+            INDEX idx_session_memory_due (complete, next_attempt_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
         "agent_session_lifecycle_fences",
         "CREATE TABLE IF NOT EXISTS agent_session_lifecycle_fences (
             session_id VARCHAR(64) NOT NULL,

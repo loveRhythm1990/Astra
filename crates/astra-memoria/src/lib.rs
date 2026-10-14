@@ -63,6 +63,63 @@ impl MemoryScope {
     }
 }
 
+/// Per-response authority attestation from the authenticated Astra proxy.
+/// Astra identity authorizes the session; Memoria identity owns its records.
+/// Never derive this attestation from a backend response or a client request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryScopeAuthority {
+    pub astra_user_id: String,
+    pub memoria_owner_id: String,
+    pub session_id: String,
+}
+
+pub fn attest_strict_recall_payload(
+    payload: &mut Value,
+    astra_user_id: &str,
+    scope: &MemoryScope,
+) -> Result<(), String> {
+    validate_strict_recall_payload(payload, scope)?;
+    exact_scope_component("astra_user_id", astra_user_id.to_string())?;
+    if payload.is_array() {
+        *payload = serde_json::json!({"memories": payload.take()});
+    }
+    let object = payload
+        .as_object_mut()
+        .ok_or("strict recall requires a response envelope")?;
+    object.insert(
+        "memory_scope".into(),
+        serde_json::to_value(MemoryScopeAuthority {
+            astra_user_id: astra_user_id.into(),
+            memoria_owner_id: scope.user_id.clone(),
+            session_id: scope.session_id.clone(),
+        })
+        .map_err(|error| error.to_string())?,
+    );
+    Ok(())
+}
+
+/// Validate a fresh proxy attestation and all records before admitting any row.
+pub fn validate_attested_strict_recall_payload(
+    payload: &Value,
+    astra_user_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let authority: MemoryScopeAuthority =
+        serde_json::from_value(payload.get("memory_scope").cloned().unwrap_or(Value::Null))
+            .map_err(|_| {
+                "memory_scope_violation: missing or malformed proxy authority".to_string()
+            })?;
+    if authority.astra_user_id != astra_user_id || authority.session_id != session_id {
+        return Err(
+            "memory_scope_violation: proxy authority does not match the requested Astra session"
+                .into(),
+        );
+    }
+    let scope = MemoryScope::new(authority.memoria_owner_id, authority.session_id)
+        .map_err(|error| format!("memory_scope_violation: {error}"))?;
+    validate_strict_recall_payload(payload, &scope)
+}
+
 fn exact_scope_component(field: &str, value: String) -> Result<String, String> {
     if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
         return Err(format!(
@@ -307,6 +364,15 @@ pub trait MemoriaPort: Send + Sync {
     /// cleanup work. Final writes still resolve fresh authority after that work.
     /// Explicit transports default to admitted; user-bound transports resolve
     /// current consent without contacting the external memory service.
+    /// Authenticated remote adapters enqueue maintenance at the Server owner.
+    /// Direct providers return false and execute canonical governance locally.
+    async fn schedule_session_finalization(&self, _session_id: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Cheap admission before model work, snapshot reads and destructive cleanup.
+    /// Final writes resolve fresh authority. User-bound transports check current
+    /// consent without contacting the memory backend.
     async fn admits_operation(&self, _write: bool) -> Result<bool, String> {
         Ok(true)
     }
@@ -443,7 +509,7 @@ pub trait MemoriaPort: Send + Sync {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReflectSummary {
     pub synthesized: bool,
     pub candidates: u64,
@@ -451,7 +517,7 @@ pub struct ReflectSummary {
     pub diagnostics: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReflectCandidate {
     pub signal: String,
     pub importance: f64,
@@ -1116,6 +1182,54 @@ mod tests {
             assert!(error.starts_with("memory_scope_violation:"), "{error}");
             assert!(!error.contains("safe"));
         }
+    }
+
+    #[test]
+    fn proxy_authority_distinguishes_astra_and_memoria_owners_and_is_request_scoped() {
+        use serde_json::json;
+        for owner in ["uc_owner", "connected-personal-owner", "local-astra-user"] {
+            let mut payload =
+                json!([{"memory_id":"m1", "user_id":owner, "session_id":"session-1"}]);
+            let scope = MemoryScope::new(owner, "session-1").unwrap();
+            attest_strict_recall_payload(&mut payload, "astra-user", &scope).unwrap();
+            validate_attested_strict_recall_payload(&payload, "astra-user", "session-1").unwrap();
+            assert!(
+                validate_attested_strict_recall_payload(&payload, "other-user", "session-1")
+                    .is_err()
+            );
+            assert!(
+                validate_attested_strict_recall_payload(&payload, "astra-user", "session-2")
+                    .is_err()
+            );
+            let mut foreign = payload.clone();
+            foreign["memories"][0]["user_id"] = json!("other-owner");
+            assert!(
+                validate_attested_strict_recall_payload(&foreign, "astra-user", "session-1")
+                    .is_err()
+            );
+            let mut forged = payload.clone();
+            forged["memory_scope"]["memoria_owner_id"] = json!("other-owner");
+            assert!(
+                validate_attested_strict_recall_payload(&forged, "astra-user", "session-1")
+                    .is_err()
+            );
+        }
+        assert!(
+            validate_attested_strict_recall_payload(
+                &json!({"memories":[]}),
+                "astra-user",
+                "session-1"
+            )
+            .is_err()
+        );
+        let mut backend = json!({"memory_scope":{"astra_user_id":"forged"}, "memories":[]});
+        attest_strict_recall_payload(
+            &mut backend,
+            "astra-user",
+            &MemoryScope::new("real-owner", "session-1").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(backend["memory_scope"]["astra_user_id"], "astra-user");
     }
 
     #[test]

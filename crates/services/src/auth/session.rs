@@ -987,6 +987,9 @@ impl SessionService for DatabaseSessionService {
             .begin()
             .await
             .map_err(internal_error)?;
+        crate::storage::lock_agent_session_write_fence(&mut tx, &session_id, &user_id)
+            .await
+            .map_err(internal_error)?;
         let locked = query(
             "SELECT IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json \
              FROM agent_sessions WHERE session_id = ? AND user_id = ? FOR UPDATE",
@@ -1059,6 +1062,15 @@ impl SessionService for DatabaseSessionService {
                 StatusCode::NOT_FOUND,
                 format!("Session {session_id} 不存在"),
             ));
+        }
+        if status.as_deref() == Some("closed") {
+            crate::session_memory_lifecycle::request_finalization_tx(
+                &mut tx,
+                &user_id,
+                &session_id,
+            )
+            .await
+            .map_err(internal_error)?;
         }
         tx.commit().await.map_err(internal_error)?;
 
