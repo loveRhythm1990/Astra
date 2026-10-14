@@ -105,8 +105,8 @@ validates every row against the attested Memoria owner. UC and personal Memoria
 namespaces need not equal `/auth/me.user_id`; an absent, malformed or mismatched
 attestation fails closed. No owner or grant cache is shared between operations.
 
-`agent_session_memory_work` is the durable journal for the existing extraction
-and governance algorithms. Normal turn finalization performs a one-second bounded
+Fresh schema contract `2026-10-14-v102` includes `agent_session_memory_work`,
+the durable journal for the existing extraction and governance algorithms. Normal turn finalization performs a one-second bounded
 handoff of authenticated canonical extraction input before terminal completion;
 expensive inference and Memoria work remain background operations. A missed
 handoff is recovered from immutable canonical context using the existing Session

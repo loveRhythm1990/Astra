@@ -66,6 +66,23 @@ service remains explicit. The owner/name unique constraint is enforced by the
 database, and create or rename conflicts now return HTTP 409 rather than 500.
 Other SQL and malformed persisted-data errors retain their 500 behavior.
 
+## Session-memory recovery journal
+
+Fresh schema contract `2026-10-14-v102` adds `agent_session_memory_work`, keyed
+by canonical Astra owner and Session. It checkpoints the existing extraction
+and governance algorithms: frozen request/write inputs, stage receipts, a
+worker lease and bounded retry timing. Canonical Session status, execution
+settlement and context heads remain authoritative; the journal does not grant
+memory access or create another context lifecycle. Session deletion removes
+its queued inputs through the existing deletion catalog.
+
+The startup shape guard requires all journal columns. An existing v101 database
+is rejected under the repository's fresh-schema policy; deployment requires a
+new/current-contract database rather than only changing the image. Bootstrap
+does not silently add the journal to an old completion marker. Database
+replacement and preservation of existing data require an operator-owned rollout;
+this memory change performs no automatic reset or migration.
+
 ## Transcript persistence
 
 Fresh schema contract `2026-10-08-v101` stores transcript items and their
