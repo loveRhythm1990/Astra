@@ -672,7 +672,7 @@ ASTRA_TEST_DB_IT=1 ASTRA_TEST_DATABASE="$ASTRA_DATABASE" \
   cargo test -p astra-services --test session_memory_lifecycle_db_it -- --ignored --test-threads=1
 ASTRA_TEST_DB_IT=1 ASTRA_TEST_DATABASE="$ASTRA_DATABASE" \
   cargo test -p astra-runtime --lib session_memory::durable::tests -- --ignored --test-threads=1
-cargo test -p astra-cli --bin astra cli::session::session_startup::tests::cli_ -- --test-threads=1
+cargo test -p astra-cli --lib cli::session::session_startup::tests::cli_ -- --test-threads=1
 ```
 
 The database tests cover canonical-context handoff recovery, shared fencing and

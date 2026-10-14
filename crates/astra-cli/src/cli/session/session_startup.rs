@@ -1633,11 +1633,15 @@ mod tests {
             ),
             ("astra-user", "uc_owner", "uc_owner", "other-session", false),
         ] {
+            let snapshot = astra_runtime::session_memory::runner::encode_session_memory_entry(
+                "session-1",
+                "# Session Memory\n\n## Current State\n- Verified snapshot",
+            );
             let server = MockServer::start().await;
             Mock::given(method("POST")).and(path("/memory/retrieve"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "memory_scope":{"astra_user_id":astra, "memoria_owner_id":owner,"session_id":"session-1"},
-                    "memories":[{"memory_id":"working-1","user_id":record_owner,"session_id":session,"memory_type":"working","content":"snapshot"}]
+                    "memories":[{"memory_id":"working-1","user_id":record_owner,"session_id":session,"memory_type":"working","content":snapshot}]
                 }))).expect(1).mount(&server).await;
             let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
             let port = CliSessionMemoryMemoriaPort::new(api, None, "astra-user");

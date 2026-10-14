@@ -13284,7 +13284,7 @@ mod tests {
     async fn escape_browser_login_restores_memory_and_external_discovery() {
         use crate::cli::{auth_flow, session::session_runtime};
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        use wiremock::matchers::{body_partial_json, header};
+        use wiremock::matchers::header;
         let _home = crate::test_utils::HomeGuard::temp();
         let _creds = crate::tests::isolate_credentials();
         let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
@@ -13307,14 +13307,11 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        Mock::given(path("/memory/retrieve"))
+        Mock::given(path("/sessions/cancelled-login-session/memory/finalize"))
             .and(header("authorization", "Bearer old-token"))
-            .and(body_partial_json(
-                serde_json::json!({"user_id": "old-owner"}),
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"accepted":true,"session_id":"cancelled-login-session"}),
             ))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"memories": []})),
-            )
             .expect(1)
             .mount(&server)
             .await;
