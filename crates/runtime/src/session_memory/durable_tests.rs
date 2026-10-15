@@ -60,6 +60,12 @@ async fn store_memory(
         assert_eq!(existing, &memory);
     } else {
         backend.writes.insert(id.clone(), memory.clone());
+        if kind == "working"
+            && let Some(inventory) = backend.inventory.as_mut()
+        {
+            inventory.push(memory.clone());
+            inventory.sort_by(|a, b| b["memory_id"].as_str().cmp(&a["memory_id"].as_str()));
+        }
     }
     if (kind == "episodic" && std::mem::take(&mut backend.lose_episode_receipt))
         || (kind == "semantic" && std::mem::take(&mut backend.lose_scene_receipt))
@@ -112,9 +118,22 @@ async fn delete_memory(
     let mut backend = state.lock().unwrap();
     assert_authority(&headers, &backend);
     assert_eq!(query.get("branch").map(String::as_str), Some("main"));
-    assert_eq!(id, "working-final");
     *backend.calls.entry("delete".into()).or_default() += 1;
-    if !std::mem::replace(&mut backend.working_active, false) {
+    let removed = if let Some(inventory) = backend.inventory.as_mut() {
+        if let Some(position) = inventory
+            .iter()
+            .position(|memory| memory["memory_id"] == id)
+        {
+            inventory.remove(position);
+            true
+        } else {
+            false
+        }
+    } else {
+        assert_eq!(id, "working-final");
+        std::mem::replace(&mut backend.working_active, false)
+    };
+    if !removed {
         return StatusCode::NOT_FOUND;
     }
     if std::mem::take(&mut backend.lose_delete_receipt) {
@@ -143,14 +162,17 @@ async fn reflect(
     )
 }
 fn snapshot(owner: &str, session: &str) -> Value {
+    snapshot_at_turn(owner, session, 3)
+}
+fn snapshot_at_turn(owner: &str, session: &str, turn: u32) -> Value {
     let facts = astra_turn_types::session_facts::SessionFacts {
-        turn: 3,
+        turn,
         ..Default::default()
     };
     let detail = serde_json::to_string(&crate::session_memory::runner::SessionMemorySnapshot {
         schema_version: 2,
         session_id: session.into(),
-        updated_turn: 3,
+        updated_turn: turn,
         facts,
         narrative: crate::session_memory::runner::SessionNarrative {
             task_spec: "Complete the final turn".into(),
@@ -652,4 +674,234 @@ async fn inventory_overflow_keeps_plan_unfrozen_and_working_memory_pending() {
     assert_eq!(backend.calls["list"], 9);
     assert!(!backend.calls.contains_key("delete"));
     assert!(backend.writes.is_empty());
+}
+
+async fn stale_cleanup_preserves_receipt_through_close_and_restart(lose_response: bool) {
+    use crate::session_memory::runner::{ExtractionArtifacts, run_extraction};
+    use astra_services::auth::{DatabaseSessionService, SessionService, SessionUpdateRequestData};
+    let f = fixture().await;
+    let stale_receipt = format!("{:032x}", u128::MAX);
+    // The failure case fills the cleanup page with stale rows. The happy
+    // control needs only one old row and avoids racing the one-second cleanup
+    // budget with many database-fenced deletes on a loaded test host.
+    let oldest_stale_turn = if lose_response { 1 } else { 16 };
+    {
+        let mut backend = f.backend.lock().unwrap();
+        backend.inventory = Some(
+            (oldest_stale_turn..=16)
+                .rev()
+                .map(|turn| {
+                    let mut memory = snapshot_at_turn(&backend.owner, &backend.session, turn);
+                    memory["memory_id"] =
+                        json!(format!("{:032x}", u128::MAX - u128::from(16 - turn)));
+                    memory
+                })
+                .collect(),
+        );
+        backend.lose_delete_receipt = lose_response;
+    }
+    let facts = astra_turn_types::session_facts::SessionFacts {
+        turn: 17,
+        ..Default::default()
+    };
+    f.store
+        .publish(
+            &f.user,
+            &f.session,
+            json!({"session_facts": facts}),
+            "generation-17".into(),
+        )
+        .await
+        .unwrap();
+    f.store
+        .request_extraction(&f.user, &f.session)
+        .await
+        .unwrap();
+    let claim = f.store.claim(&f.user, &f.session).await.unwrap().unwrap();
+    let port = Arc::new(DurableMemoriaPort {
+        inner: f.inner.clone(),
+        store: f.store.clone(),
+        claim,
+    });
+    f.store
+        .with_fenced_state(
+            &f.user,
+            &f.session,
+            Some(&port.claim.token),
+            false,
+            |work| {
+                Box::pin(async move {
+                    work.working_memory_id = Some("previous-generation-receipt".into());
+                    Ok(())
+                })
+            },
+        )
+        .await
+        .unwrap();
+    // Before this attempt writes, a typed read must still replace the previous
+    // generation's receipt with the highest-turn observed snapshot.
+    port.retrieve_scoped_typed("session memory", &f.session, 16, &["working"])
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .load_claim_work(&port.claim)
+            .await
+            .unwrap()
+            .working_memory_id
+            .as_deref(),
+        Some(stale_receipt.as_str())
+    );
+    let memoria = port.clone() as Arc<dyn MemoriaPort>;
+    let scope = astra_turn_types::InferenceInvocationScope::Session {
+        session_id: f.session.clone(),
+        turn: 17,
+        round: 0,
+        operation_id: "memory_extraction".into(),
+        logical_attempt: 0,
+    };
+    // Execute the real canonical writer and its best-effort cleanup, using
+    // the supported rule fallback rather than a paid inference provider.
+    let result = run_extraction(
+        &memoria,
+        &scope,
+        &[json!({"role":"user", "content":"Complete the final turn"})],
+        17,
+        "",
+        &facts,
+        &[] as &[crate::memory_hooks::DirectMemoryInferenceClient],
+        Duration::from_secs(1),
+        1024,
+    )
+    .await;
+    let ExtractionArtifacts::Persisted {
+        cleanup_error_reason,
+        ..
+    } = result
+    else {
+        panic!("a confirmed working write remains successful after cleanup failure");
+    };
+    assert_eq!(
+        cleanup_error_reason,
+        lose_response.then_some(
+            astra_services::session_journal::SessionMemoryExtractionErrorReason::PurgeFailed
+        ),
+    );
+    let actual_receipt = {
+        let backend = f.backend.lock().unwrap();
+        let id = backend
+            .writes
+            .values()
+            .find(|memory| memory["memory_type"] == "working")
+            .unwrap()["memory_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            id.as_str() < "fffffffffffffffffffffffffffffff0",
+            "new receipt lies outside the 16-row cleanup page"
+        );
+        assert!(
+            backend
+                .inventory
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|memory| memory["memory_id"] == id)
+        );
+        assert!(
+            !backend
+                .inventory
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|memory| memory["memory_id"] == stale_receipt)
+        );
+        assert_eq!(backend.calls["delete"], 1);
+        id
+    };
+    f.store
+        .finish_extraction(&port.claim, true, 17)
+        .await
+        .unwrap();
+    let work = f.store.status(&f.user, &f.session).await.unwrap();
+    assert_eq!(work["extraction_pending"], false);
+    DatabaseSessionService::new(MatrixOneSettings::from_env())
+        .with_pool(f.pool.clone())
+        .update_session(
+            f.session.clone(),
+            f.user.clone(),
+            SessionUpdateRequestData {
+                title: None,
+                metadata: None,
+                metadata_patch: None,
+                status: Some("closed".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let restarted = SessionMemoryLifecycleStore::new(f.pool.clone());
+    for _ in 0..3 {
+        let claim = restarted.claim(&f.user, &f.session).await.unwrap().unwrap();
+        assert!(claim.work.active_request.is_none());
+        assert!(claim.work.prepared_working.is_none());
+        assert_eq!(
+            claim.work.working_memory_id.as_deref(),
+            Some(actual_receipt.as_str())
+        );
+        let mut recovered = DurableMemoriaPort {
+            inner: f.inner.clone(),
+            store: restarted.clone(),
+            claim,
+        };
+        let plan = recovered.prepare_plan().await.unwrap();
+        assert!(
+            plan.memories
+                .iter()
+                .any(|memory| memory.memory_id == actual_receipt)
+        );
+        recovered.claim.work.plan = Some(serde_json::to_value(&plan).unwrap());
+        // Frozen inventory reads also leave the confirmed receipt unchanged.
+        recovered
+            .retrieve_scoped_typed("session memory", &f.session, 16, &["working"])
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted
+                .load_claim_work(&recovered.claim)
+                .await
+                .unwrap()
+                .working_memory_id
+                .as_deref(),
+            Some(actual_receipt.as_str())
+        );
+        restarted.release(&recovered.claim, true).await.unwrap();
+    }
+    let report = attempt(&f).await;
+    assert!(report.consolidation_complete());
+    assert_eq!(
+        f.store.status(&f.user, &f.session).await.unwrap()["pending"],
+        false
+    );
+    assert!(
+        f.backend
+            .lock()
+            .unwrap()
+            .inventory
+            .as_ref()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn lost_stale_delete_response_preserves_confirmed_receipt_on_close_and_restart() {
+    stale_cleanup_preserves_receipt_through_close_and_restart(true).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn successful_stale_cleanup_preserves_confirmed_receipt_on_close_and_restart() {
+    stale_cleanup_preserves_receipt_through_close_and_restart(false).await;
 }

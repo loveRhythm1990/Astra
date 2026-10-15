@@ -133,9 +133,12 @@ explicit end of pagination permits freezing the plan; overflow, malformed or
 repeated cursors, duplicate rows, and failed pages retain working memory. Journal
 reads decode the native JSON column so inputs and frozen plans larger than 64KB
 survive restart without a truncating character cast. Required
-writes must return exact, nonempty, protocol-compatible receipts. Episode
-receipts, exact working IDs removed, reflection candidates and scene receipts are
-checkpointed separately. A failed archive cannot authorize cleanup. Cleanup only
+writes must return exact, nonempty, protocol-compatible receipts. Once a working
+write is prepared, subsequent reads cannot replace its receipt identity; stale
+snapshot cleanup remains best effort even if a deletion succeeds but its response
+is lost. Reads before a new write may still record a reused existing snapshot.
+Episode receipts, exact working IDs removed, reflection candidates and scene
+receipts are checkpointed separately. A failed archive cannot authorize cleanup. Cleanup only
 removes the captured owner/session working IDs and accepts an already absent ID
 on retry. A failed read never grants an empty successful purge. Optional
 reflection/scene retries preserve completed episode and cleanup stages.

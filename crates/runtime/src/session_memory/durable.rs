@@ -340,7 +340,13 @@ impl MemoriaPort for DurableMemoriaPort {
                 false,
                 move |work| {
                     Box::pin(async move {
-                        work.working_memory_id = snapshot;
+                        // Reads before this generation writes may establish the
+                        // observed snapshot identity. Once its write is prepared,
+                        // the frozen payload/confirmed receipt owns that identity:
+                        // best-effort cleanup can read a page of only stale rows.
+                        if work.prepared_working.is_none() {
+                            work.working_memory_id = snapshot;
+                        }
                         Ok(())
                     })
                 },
