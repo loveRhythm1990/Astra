@@ -497,11 +497,13 @@ pub(crate) async fn request_finalization_tx(
 ) -> Result<(), String> {
     // Closing may occur while an extraction is pending; the recovery worker
     // settles that exact durable generation before constructing a purge plan.
+    // The first bounded handoff may have failed before creating any journal.
+    // Persist close intent atomically even then, so recovery can discover the
+    // session and reconstruct its input from the canonical context head.
+    ensure_work_row(tx, user, session).await?;
     let raw: Option<String> = sqlx::query_scalar("SELECT CAST(state_json AS CHAR) FROM agent_session_memory_work WHERE user_id = ? AND session_id = ? FOR UPDATE")
         .bind(user).bind(session).fetch_optional(&mut **tx).await.map_err(|error| error.to_string())?;
-    let Some(raw) = raw else {
-        return Ok(());
-    };
+    let raw = raw.ok_or("session memory close journal was not created")?;
     let mut work: SessionMemoryWork =
         serde_json::from_str(&raw).map_err(|error| error.to_string())?;
     work.canonical_turn = canonical_turn_tx(tx, user, session).await?;

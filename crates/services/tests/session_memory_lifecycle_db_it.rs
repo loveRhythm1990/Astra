@@ -182,64 +182,9 @@ async fn mutation_fence_serializes_follow_up_and_exit_does_not_close_resumable_s
 #[tokio::test]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn missed_handoff_recovers_from_canonical_context_and_preserves_close_intent() {
-    use astra_services::{
-        AcquireWriterAndReserveTurnOutcome, DatabaseSessionContextCoordinator,
-        SessionContextCoordinator,
-    };
-    use astra_turn_types::{
-        ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
-        CanonicalDeltaModeV1, CanonicalTurnDeltaV1, SessionKeyV1, SessionSurfaceV1,
-    };
+    use astra_services::SessionContextCoordinator;
     let (pool, _settings, user, session) = setup().await;
-    let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
-    let key = SessionKeyV1::owner_session("server", &user, &session, "main");
-    let actor = ActorContextV1::owner_user(
-        &user,
-        "memory-recovery-db-it",
-        ActorKindV1::Server,
-        SessionSurfaceV1::Server,
-        None,
-        AuthorityEpochsV1::default(),
-    );
-    for turn in 1..=4 {
-        let head = coordinator.load_head(&key).await.unwrap();
-        let ready = coordinator
-            .acquire_writer_and_reserve_turn(
-                &key,
-                head.as_ref().map(|head| &head.cursor),
-                &actor,
-                std::time::Duration::from_secs(30),
-                &format!("writer-{turn}"),
-                &format!("reservation-{turn}"),
-                None,
-            )
-            .await
-            .unwrap();
-        let AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } = ready else {
-            panic!("canonical writer must be ready: {ready:?}")
-        };
-        coordinator
-            .commit_turn(
-                &reservation,
-                CanonicalTurnDeltaV1 {
-                    schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
-                    completed_turn: turn,
-                    journal_event_seq: u64::from(turn),
-                    conversation_seq: u64::from(turn),
-                    compaction_generation: 0,
-                    config_version_id: None,
-                    mode: CanonicalDeltaModeV1::Append,
-                    logical_segments: vec![vec![
-                        json!({"role":"user","content":format!("canonical-turn-{turn}")}),
-                        json!({"role":"assistant","content":"durable reply"}),
-                    ]],
-                },
-                &format!("commit-{turn}"),
-            )
-            .await
-            .unwrap();
-        coordinator.release_writer(&lease).await.unwrap();
-    }
+    let coordinator = commit_canonical_turns(pool.clone(), &user, &session, 4).await;
     let store = SessionMemoryLifecycleStore::new(pool.clone());
     store
         .publish(
@@ -285,4 +230,143 @@ async fn missed_handoff_recovers_from_canonical_context_and_preserves_close_inte
     let finalization = store.claim(&user, &session).await.unwrap().unwrap();
     assert!(!finalization.work.extraction_pending());
     assert!(finalization.work.finalize_requested);
+}
+
+async fn commit_canonical_turns(
+    pool: SharedPool,
+    user: &str,
+    session: &str,
+    turns: u32,
+) -> astra_services::DatabaseSessionContextCoordinator {
+    use astra_services::{
+        AcquireWriterAndReserveTurnOutcome, DatabaseSessionContextCoordinator,
+        SessionContextCoordinator,
+    };
+    use astra_turn_types::{
+        ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+        CanonicalDeltaModeV1, CanonicalTurnDeltaV1, SessionKeyV1, SessionSurfaceV1,
+    };
+    let coordinator = DatabaseSessionContextCoordinator::new(pool);
+    let key = SessionKeyV1::owner_session("server", user, session, "main");
+    let actor = ActorContextV1::owner_user(
+        user,
+        "memory-recovery-db-it",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Server,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+    for turn in 1..=turns {
+        let head = coordinator.load_head(&key).await.unwrap();
+        let ready = coordinator
+            .acquire_writer_and_reserve_turn(
+                &key,
+                head.as_ref().map(|head| &head.cursor),
+                &actor,
+                std::time::Duration::from_secs(30),
+                &format!("writer-{turn}"),
+                &format!("reservation-{turn}"),
+                None,
+            )
+            .await
+            .unwrap();
+        let AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } = ready else {
+            panic!("canonical writer must be ready: {ready:?}")
+        };
+        coordinator
+            .commit_turn(
+                &reservation,
+                CanonicalTurnDeltaV1 {
+                    schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+                    completed_turn: turn,
+                    journal_event_seq: u64::from(turn),
+                    conversation_seq: u64::from(turn),
+                    compaction_generation: 0,
+                    config_version_id: None,
+                    mode: CanonicalDeltaModeV1::Append,
+                    logical_segments: vec![vec![
+                        json!({"role":"user","content":format!("canonical-turn-{turn}")}),
+                        json!({"role":"assistant","content":"durable reply"}),
+                    ]],
+                },
+                &format!("commit-{turn}"),
+            )
+            .await
+            .unwrap();
+        coordinator.release_writer(&lease).await.unwrap();
+    }
+    coordinator
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn close_without_any_journal_recovers_committed_context_after_restart() {
+    use astra_services::SessionContextCoordinator;
+    let (pool, settings, user, session) = setup().await;
+    let coordinator = commit_canonical_turns(pool.clone(), &user, &session, 1).await;
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user)
+    .bind(&session)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        rows, 0,
+        "simulate the first handoff failing before publication"
+    );
+    let sessions = DatabaseSessionService::new(settings).with_pool(pool.clone());
+    for _ in 0..2 {
+        sessions
+            .update_session(
+                session.clone(),
+                user.clone(),
+                SessionUpdateRequestData {
+                    title: None,
+                    metadata: None,
+                    metadata_patch: None,
+                    status: Some("closed".into()),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let restarted = SessionMemoryLifecycleStore::new(pool);
+    assert!(
+        restarted
+            .list_due(16)
+            .await
+            .unwrap()
+            .contains(&(user.clone(), session.clone()))
+    );
+    let claim = restarted.claim(&user, &session).await.unwrap().unwrap();
+    assert!(claim.work.finalize_requested);
+    assert!(claim.work.latest_request.is_none());
+    let head = restarted
+        .missing_input_head(&user, &session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.cursor.completed_turn, 1);
+    let materialized = coordinator.materialize(&head).await.unwrap();
+    assert!(
+        materialized
+            .messages
+            .iter()
+            .any(|message| message["content"] == "canonical-turn-1")
+    );
+    restarted.publish_recovery(&claim,
+        json!({"inference_scope":{"turn":1}, "session_facts":{"turn":1}, "messages":materialized.messages}),
+        "recovered-first-generation".into(), 1,
+    ).await.unwrap();
+    restarted.finish_extraction(&claim, true, 1).await.unwrap();
+    let governance = restarted.claim(&user, &session).await.unwrap().unwrap();
+    assert!(governance.work.finalize_requested);
+    assert_eq!(governance.work.completed_turn, Some(1));
+    assert!(governance.work.active_request.is_none());
+    assert_eq!(
+        restarted.status(&user, &session).await.unwrap()["pending"],
+        true
+    );
 }

@@ -164,6 +164,120 @@ impl HttpMemoriaPort {
         self
     }
 
+    /// Unlike top-k recall, a destructive plan requires evidence that every
+    /// page was read. Overflow or an invalid pagination envelope fails closed.
+    pub(crate) async fn retrieve_scoped_inventory(
+        &self,
+        session_id: &str,
+        max_memories: usize,
+        memory_types: &[&str],
+    ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
+        self.list_scoped_typed(session_id, max_memories, memory_types, true)
+            .await
+    }
+
+    async fn list_scoped_typed(
+        &self,
+        session_id: &str,
+        top_k: usize,
+        memory_types: &[&str],
+        complete_inventory: bool,
+    ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
+        let user_id = self.owner_user_id.as_deref().ok_or_else(|| {
+            "typed Memoria retrieve requires an authenticated owner binding".to_string()
+        })?;
+        let scope = astra_memoria::MemoryScope::new(user_id, session_id)?;
+        if top_k == 0 {
+            return if complete_inventory {
+                Err("finalization inventory requires a positive bound".into())
+            } else {
+                Ok(Vec::new())
+            };
+        }
+        let url = format!("{}/v1/memories", self.base_url.trim_end_matches('/'));
+        let requested_types: Vec<Option<&str>> = if memory_types.is_empty() {
+            vec![None]
+        } else {
+            memory_types.iter().copied().map(Some).collect()
+        };
+        let mut memories = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for memory_type in requested_types {
+            let mut cursor: Option<String> = None;
+            let mut seen_cursors = std::collections::HashSet::new();
+            loop {
+                let remaining = top_k - memories.len();
+                if remaining == 0 {
+                    return if complete_inventory {
+                        Err("finalization snapshot exceeds bounded inventory".into())
+                    } else {
+                        Ok(memories)
+                    };
+                }
+                let limit = remaining.min(500).to_string();
+                let mut query = vec![
+                    ("session_id", scope.session_id.as_str()),
+                    ("limit", limit.as_str()),
+                ];
+                if let Some(memory_type) = memory_type {
+                    query.push(("memory_type", memory_type));
+                }
+                if let Some(cursor) = cursor.as_deref() {
+                    query.push(("cursor", cursor));
+                }
+                let resp = self
+                    .request(reqwest::Method::GET, &url, None)?
+                    .query(&query)
+                    .send()
+                    .await
+                    .map_err(|e| format!("Memoria typed list failed: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(self.status_error("typed list", resp.status()).into());
+                }
+                let data: Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| format!("Memoria typed list parse failed: {e}"))?;
+                let page = parse_strict_retrieved_memories(&data, &scope)?;
+                if page.len() > remaining.min(500) {
+                    return Err("Memoria typed list exceeded its requested page limit".into());
+                }
+                let next = match data.get("next_cursor") {
+                    Some(Value::Null) => None,
+                    None if !complete_inventory => None,
+                    Some(Value::String(next))
+                        if next.len() == 32
+                            && next.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            && page.last().is_some_and(|memory| memory.memory_id == *next)
+                            && seen_cursors.insert(next.clone()) =>
+                    {
+                        Some(next.clone())
+                    }
+                    _ => {
+                        return Err(
+                            "Memoria typed list has invalid or missing pagination evidence".into(),
+                        );
+                    }
+                };
+                for memory in page {
+                    if memory_type.is_some_and(|expected| memory.memory_type != expected) {
+                        return Err(
+                            "memory_scope_violation: typed list returned an invalid memory_type"
+                                .into(),
+                        );
+                    }
+                    if !seen.insert(memory.memory_id.clone()) {
+                        return Err("Memoria typed list repeated a memory across pages".into());
+                    }
+                    memories.push(memory);
+                }
+                let Some(next) = next else { break };
+                cursor = Some(next);
+            }
+        }
+        Ok(memories)
+    }
+
     fn scoped_body(&self, mut body: Value) -> Value {
         if self.durable_main_branch {
             body["branch"] = json!("main");
@@ -864,53 +978,8 @@ impl MemoriaPort for HttpMemoriaPort {
         top_k: usize,
         memory_types: &[&str],
     ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
-        let user_id = self.owner_user_id.as_deref().ok_or_else(|| {
-            "typed Memoria retrieve requires an authenticated owner binding".to_string()
-        })?;
-        let scope = astra_memoria::MemoryScope::new(user_id, session_id)?;
-        let url = format!("{}/v1/memories", self.base_url.trim_end_matches('/'));
-        let limit = top_k.clamp(1, 500).to_string();
-        let requested_types: Vec<Option<&str>> = if memory_types.is_empty() {
-            vec![None]
-        } else {
-            memory_types.iter().copied().map(Some).collect()
-        };
-        let mut memories = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for memory_type in requested_types {
-            let mut query = vec![
-                ("session_id", scope.session_id.as_str()),
-                ("limit", limit.as_str()),
-            ];
-            if let Some(memory_type) = memory_type {
-                query.push(("memory_type", memory_type));
-            }
-            let resp = self
-                .request(reqwest::Method::GET, &url, None)?
-                .query(&query)
-                .send()
-                .await
-                .map_err(|e| format!("Memoria typed list failed: {e}"))?;
-            if !resp.status().is_success() {
-                return Err(self.status_error("typed list", resp.status()).into());
-            }
-            let data: Value = resp
-                .json()
-                .await
-                .map_err(|e| format!("Memoria typed list parse failed: {e}"))?;
-            for memory in parse_strict_retrieved_memories(&data, &scope)? {
-                if memory_type.is_some_and(|expected| memory.memory_type != expected) {
-                    return Err(
-                        "memory_scope_violation: typed list returned an invalid memory_type".into(),
-                    );
-                }
-                if seen.insert(memory.memory_id.clone()) {
-                    memories.push(memory);
-                }
-            }
-        }
-        memories.truncate(top_k);
-        Ok(memories)
+        self.list_scoped_typed(session_id, top_k, memory_types, false)
+            .await
     }
 
     async fn store(
@@ -3263,3 +3332,7 @@ mod tests {
         assert_eq!(parsed[0].summary, "- real body");
     }
 }
+
+#[cfg(test)]
+#[path = "memoria_inventory_tests.rs"]
+mod inventory_tests;

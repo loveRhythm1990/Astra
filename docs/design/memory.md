@@ -126,7 +126,11 @@ recover unfinished work. Failed attempts back off from 5 seconds to 16 minutes;
 the managed recovery worker polls every two seconds with concurrency two.
 
 The journal freezes an uncertain working-write payload before HTTP dispatch,
-then freezes the final snapshot and runtime facts before consolidation. Required
+then freezes the final snapshot and runtime facts before consolidation. The
+working inventory follows owner/session-scoped cursor pages (at most 500 rows per
+request), with a 4096-memory bound and a ten-second total read budget. Only an
+explicit end of pagination permits freezing the plan; overflow, malformed or
+repeated cursors, duplicate rows, and failed pages retain working memory. Required
 writes must return exact, nonempty, protocol-compatible receipts. Episode
 receipts, exact working IDs removed, reflection candidates and scene receipts are
 checkpointed separately. A failed archive cannot authorize cleanup. Cleanup only
@@ -136,7 +140,9 @@ reflection/scene retries preserve completed episode and cleanup stages.
 
 CLI exit targets its idle generation; a follow-up turn invalidates that old
 maintenance request. Explicit close settles all already-admitted extraction and
-rejects writes after the closed generation is consolidated. Repeated close or
+rejects writes after the closed generation is consolidated. The close transaction
+creates the journal even when the first turn's bounded handoff never published a
+row, allowing restart recovery to discover canonical input. Repeated close or
 exit requests retain journal progress instead of creating duplicate archives.
 `GET /sessions/{session_id}/memory/status` exposes pending work, the settled turn,
 required/optional completion, failure flags and retry timing to the Session owner;

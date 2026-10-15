@@ -78,19 +78,11 @@ impl DurableMemoriaPort {
         // Optional backend reads never hold the Session admission fence.
         let memories = tokio::time::timeout(
             Duration::from_secs(10),
-            client.retrieve_scoped_typed(
-                "session memory",
-                &self.claim.session_id,
-                4096,
-                &["working"],
-            ),
+            client.retrieve_scoped_inventory(&self.claim.session_id, 4096, &["working"]),
         )
         .await
         .map_err(|_| "finalization snapshot deadline exceeded")?
         .map_err(|error| error.to_string())?;
-        if memories.len() >= 4096 {
-            return Err("finalization snapshot exceeds bounded inventory".into());
-        }
         self.store.with_fenced_state(&self.claim.user_id,&self.claim.session_id,Some(&self.claim.token),true,move |work| Box::pin(async move {
             ensure_settled(work)?;
             if work.completed_fingerprint!=generation {return Err("finalization snapshot generation changed during retrieval".into());}

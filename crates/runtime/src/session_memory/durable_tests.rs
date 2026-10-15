@@ -16,6 +16,7 @@ struct Backend {
     owner: String,
     session: String,
     snapshot: Value,
+    inventory: Option<Vec<Value>>,
     working_active: bool,
     writes: BTreeMap<String, Value>,
     calls: BTreeMap<String, usize>,
@@ -76,6 +77,28 @@ async fn list_memory(
     assert_authority(&headers, &backend);
     assert_eq!(query.get("branch").map(String::as_str), Some("main"));
     *backend.calls.entry("list".into()).or_default() += 1;
+    if let Some(inventory) = backend.inventory.as_ref() {
+        assert_eq!(query["session_id"], backend.session);
+        assert_eq!(query["memory_type"], "working");
+        let offset = query
+            .get("cursor")
+            .map(|cursor| {
+                inventory
+                    .iter()
+                    .position(|row| row["memory_id"] == *cursor)
+                    .unwrap()
+                    + 1
+            })
+            .unwrap_or(0);
+        let limit: usize = query["limit"].parse().unwrap();
+        let items: Vec<_> = inventory.iter().skip(offset).take(limit).cloned().collect();
+        let next = if offset + items.len() < inventory.len() {
+            items.last().unwrap()["memory_id"].clone()
+        } else {
+            Value::Null
+        };
+        return Json(json!({"items":items,"next_cursor":next}));
+    }
     Json(
         json!({"items":if backend.working_active {vec![backend.snapshot.clone()]} else {vec![]},"next_cursor":null}),
     )
@@ -526,4 +549,107 @@ async fn stale_canonical_watermark_and_old_backend_never_authorize_working_clean
     assert!(report.working_retained_due_to_episode_failure);
     assert!(f.backend.lock().unwrap().working_active);
     assert!(f.backend.lock().unwrap().writes.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn finalization_freezes_all_pages_with_final_receipt_on_either_page() {
+    for receipt_index in [0, 500] {
+        let f = fixture().await;
+        let receipt = {
+            let mut backend = f.backend.lock().unwrap();
+            let inventory: Vec<_> = (0..501)
+                .rev()
+                .map(|index| {
+                    let mut memory = backend.snapshot.clone();
+                    memory["memory_id"] = json!(format!("{index:032x}"));
+                    memory
+                })
+                .collect();
+            let receipt = inventory[receipt_index]["memory_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            backend.inventory = Some(inventory);
+            receipt
+        };
+        f.store
+            .with_fenced_state(&f.user, &f.session, None, true, move |work| {
+                Box::pin(async move {
+                    work.working_memory_id = Some(receipt);
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        f.store
+            .request_finalization(&f.user, &f.session)
+            .await
+            .unwrap();
+        let claim = f.store.claim(&f.user, &f.session).await.unwrap().unwrap();
+        let port = DurableMemoriaPort {
+            inner: f.inner.clone(),
+            store: f.store.clone(),
+            claim,
+        };
+        let plan = port.prepare_plan().await.unwrap();
+        assert_eq!(plan.memories.len(), 501);
+        let persisted = f.store.load_claim_work(&port.claim).await.unwrap();
+        let frozen: FinalizationPlan = serde_json::from_value(persisted.plan.unwrap()).unwrap();
+        assert_eq!(frozen.memories.len(), 501);
+        assert!(
+            frozen
+                .memories
+                .iter()
+                .any(|memory| Some(&memory.memory_id) == persisted.working_memory_id.as_ref())
+        );
+        assert!(!persisted.consolidation_complete);
+        let backend = f.backend.lock().unwrap();
+        assert_eq!(backend.calls["list"], 2);
+        assert!(!backend.calls.contains_key("delete"));
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn inventory_overflow_keeps_plan_unfrozen_and_working_memory_pending() {
+    let f = fixture().await;
+    {
+        let mut backend = f.backend.lock().unwrap();
+        backend.inventory = Some(
+            (0..4097)
+                .rev()
+                .map(|index| {
+                    let mut memory = backend.snapshot.clone();
+                    memory["memory_id"] = json!(format!("{index:032x}"));
+                    memory
+                })
+                .collect(),
+        );
+    }
+    f.store
+        .request_finalization(&f.user, &f.session)
+        .await
+        .unwrap();
+    let claim = f.store.claim(&f.user, &f.session).await.unwrap().unwrap();
+    let port = DurableMemoriaPort {
+        inner: f.inner.clone(),
+        store: f.store.clone(),
+        claim,
+    };
+    let error = port
+        .prepare_plan()
+        .await
+        .err()
+        .expect("overflow must retain working memory");
+    assert!(error.contains("exceeds bounded inventory"));
+    let work = f.store.load_claim_work(&port.claim).await.unwrap();
+    assert!(work.plan.is_none());
+    assert!(!work.consolidation_complete);
+    assert!(work.pending());
+    let backend = f.backend.lock().unwrap();
+    assert!(backend.working_active);
+    assert_eq!(backend.calls["list"], 9);
+    assert!(!backend.calls.contains_key("delete"));
+    assert!(backend.writes.is_empty());
 }
