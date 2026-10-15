@@ -130,7 +130,9 @@ then freezes the final snapshot and runtime facts before consolidation. The
 working inventory follows owner/session-scoped cursor pages (at most 500 rows per
 request), with a 4096-memory bound and a ten-second total read budget. Only an
 explicit end of pagination permits freezing the plan; overflow, malformed or
-repeated cursors, duplicate rows, and failed pages retain working memory. Required
+repeated cursors, duplicate rows, and failed pages retain working memory. Journal
+reads decode the native JSON column so inputs and frozen plans larger than 64KB
+survive restart without a truncating character cast. Required
 writes must return exact, nonempty, protocol-compatible receipts. Episode
 receipts, exact working IDs removed, reflection candidates and scene receipts are
 checkpointed separately. A failed archive cannot authorize cleanup. Cleanup only

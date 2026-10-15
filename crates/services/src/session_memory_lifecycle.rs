@@ -8,7 +8,7 @@ use astra_core::SharedPool;
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{Connection, MySql, Row, Transaction};
+use sqlx::{Connection, MySql, Row, Transaction, mysql::MySqlRow, types::Json};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -170,16 +170,12 @@ impl SessionMemoryLifecycleStore {
         user: &str,
         session: &str,
     ) -> Result<Option<astra_turn_types::SessionContextHeadV1>, String> {
-        let row = sqlx::query("SELECT CAST(w.state_json AS CHAR) AS state_json, h.head_json FROM agent_session_memory_work w JOIN session_context_heads h ON h.owner_user_id = w.user_id AND h.session_id = w.session_id WHERE w.user_id = ? AND w.session_id = ? AND h.head_json IS NOT NULL ORDER BY h.completed_turn DESC, h.updated_at DESC LIMIT 1")
+        let row = sqlx::query("SELECT w.state_json, h.head_json FROM agent_session_memory_work w JOIN session_context_heads h ON h.owner_user_id = w.user_id AND h.session_id = w.session_id WHERE w.user_id = ? AND w.session_id = ? AND h.head_json IS NOT NULL ORDER BY h.completed_turn DESC, h.updated_at DESC LIMIT 1")
             .bind(user).bind(session).fetch_optional(self.pool.get()).await.map_err(|error| error.to_string())?;
         let Some(row) = row else {
             return Ok(None);
         };
-        let work: SessionMemoryWork = serde_json::from_str(
-            &row.try_get::<String, _>("state_json")
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
+        let work = decode_work(&row)?;
         let head: astra_turn_types::SessionContextHeadV1 = serde_json::from_str(
             &row.try_get::<String, _>("head_json")
                 .map_err(|error| error.to_string())?,
@@ -253,16 +249,12 @@ impl SessionMemoryLifecycleStore {
     }
 
     pub async fn status(&self, user: &str, session: &str) -> Result<Value, String> {
-        let row = sqlx::query("SELECT CAST(state_json AS CHAR) AS state_json, attempts, CAST(next_attempt_at AS CHAR) AS next_attempt_at FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?")
+        let row = sqlx::query("SELECT state_json, attempts, CAST(next_attempt_at AS CHAR) AS next_attempt_at FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?")
             .bind(user).bind(session).fetch_optional(self.pool.get()).await.map_err(|error| error.to_string())?;
         let Some(row) = row else {
             return Ok(serde_json::json!({"requested": false, "session_id":session}));
         };
-        let work: SessionMemoryWork = serde_json::from_str(
-            &row.try_get::<String, _>("state_json")
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
+        let work = decode_work(&row)?;
         Ok(
             serde_json::json!({"session_id":session, "requested":work.finalize_requested,
             "pending":work.pending(), "extraction_pending":work.extraction_pending(),
@@ -301,7 +293,7 @@ impl SessionMemoryLifecycleStore {
             .await
             .map_err(|error| error.to_string())?;
         lock_session(&mut tx, user, session).await?;
-        let Some(row) = sqlx::query("SELECT CAST(state_json AS CHAR) AS state_json, (lease_token IS NULL OR lease_expires_at <= NOW(6)) AS available FROM agent_session_memory_work WHERE user_id = ? AND session_id = ? AND complete = 0 AND next_attempt_at <= NOW(6) FOR UPDATE")
+        let Some(row) = sqlx::query("SELECT state_json, (lease_token IS NULL OR lease_expires_at <= NOW(6)) AS available FROM agent_session_memory_work WHERE user_id = ? AND session_id = ? AND complete = 0 AND next_attempt_at <= NOW(6) FOR UPDATE")
             .bind(user).bind(session).fetch_optional(&mut *tx).await.map_err(|error| error.to_string())? else { return Ok(None); };
         if row
             .try_get::<i64, _>("available")
@@ -310,11 +302,7 @@ impl SessionMemoryLifecycleStore {
         {
             return Ok(None);
         }
-        let mut work: SessionMemoryWork = serde_json::from_str(
-            &row.try_get::<String, _>("state_json")
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
+        let mut work = decode_work(&row)?;
         if work.extraction_pending() && work.active_request.is_none() {
             work.active_request = work.latest_request.clone();
             work.active_fingerprint = work.latest_fingerprint.clone();
@@ -360,7 +348,7 @@ impl SessionMemoryLifecycleStore {
             ensure_idle(&mut tx, user, session).await?;
         }
         ensure_work_row(&mut tx, user, session).await?;
-        let row = sqlx::query("SELECT CAST(state_json AS CHAR) AS state_json, lease_token, (lease_expires_at > NOW(6)) AS lease_live FROM agent_session_memory_work WHERE user_id = ? AND session_id = ? FOR UPDATE")
+        let row = sqlx::query("SELECT state_json, lease_token, (lease_expires_at > NOW(6)) AS lease_live FROM agent_session_memory_work WHERE user_id = ? AND session_id = ? FOR UPDATE")
             .bind(user).bind(session).fetch_one(&mut *tx).await.map_err(|error| error.to_string())?;
         if let Some(token) = token
             && (row
@@ -375,11 +363,7 @@ impl SessionMemoryLifecycleStore {
         {
             return Err("session memory worker lease was superseded".into());
         }
-        let mut work: SessionMemoryWork = serde_json::from_str(
-            &row.try_get::<String, _>("state_json")
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
+        let mut work = decode_work(&row)?;
         work.session_closed = status == "closed";
         if require_idle {
             work.canonical_turn = canonical_turn_tx(&mut tx, user, session).await?;
@@ -448,6 +432,14 @@ impl SessionMemoryLifecycleStore {
     }
 }
 
+// Decode the native JSON column. MatrixOne's unbounded CHAR cast defaults to
+// 65535 bytes and silently truncates realistic extraction inputs/frozen plans.
+fn decode_work(row: &MySqlRow) -> Result<SessionMemoryWork, String> {
+    row.try_get::<Json<SessionMemoryWork>, _>("state_json")
+        .map(|Json(work)| work)
+        .map_err(|error| error.to_string())
+}
+
 async fn lock_session(
     tx: &mut Transaction<'_, MySql>,
     user: &str,
@@ -501,11 +493,8 @@ pub(crate) async fn request_finalization_tx(
     // Persist close intent atomically even then, so recovery can discover the
     // session and reconstruct its input from the canonical context head.
     ensure_work_row(tx, user, session).await?;
-    let raw: Option<String> = sqlx::query_scalar("SELECT CAST(state_json AS CHAR) FROM agent_session_memory_work WHERE user_id = ? AND session_id = ? FOR UPDATE")
-        .bind(user).bind(session).fetch_optional(&mut **tx).await.map_err(|error| error.to_string())?;
-    let raw = raw.ok_or("session memory close journal was not created")?;
-    let mut work: SessionMemoryWork =
-        serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+    let Json(mut work) = sqlx::query_scalar::<_, Json<SessionMemoryWork>>("SELECT state_json FROM agent_session_memory_work WHERE user_id = ? AND session_id = ? FOR UPDATE")
+        .bind(user).bind(session).fetch_one(&mut **tx).await.map_err(|error| error.to_string())?;
     work.canonical_turn = canonical_turn_tx(tx, user, session).await?;
     if work.canonical_turn > work.completed_turn.unwrap_or(0) {
         work.reset_plan();

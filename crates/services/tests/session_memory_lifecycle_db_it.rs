@@ -370,3 +370,70 @@ async fn close_without_any_journal_recovers_committed_context_after_restart() {
         true
     );
 }
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn large_json_journal_survives_close_status_claim_and_recovery_reads() {
+    let (pool, settings, user, session) = setup().await;
+    commit_canonical_turns(pool.clone(), &user, &session, 2).await;
+    let store = SessionMemoryLifecycleStore::new(pool.clone());
+    let content = "large journal input 界".repeat(8192);
+    assert!(content.len() > 65535);
+    let expected_bytes = content.len();
+    store
+        .publish(
+            &user,
+            &session,
+            json!({"session_facts":{"turn":1},"messages":[{"role":"user","content":content}]}),
+            "large-generation".into(),
+        )
+        .await
+        .unwrap();
+    let sessions = DatabaseSessionService::new(settings).with_pool(pool.clone());
+    sessions
+        .update_session(
+            session.clone(),
+            user.clone(),
+            SessionUpdateRequestData {
+                title: None,
+                metadata: None,
+                metadata_patch: None,
+                status: Some("closed".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.status(&user, &session).await.unwrap()["pending"],
+        true
+    );
+    let restarted = SessionMemoryLifecycleStore::new(pool);
+    let claim = restarted.claim(&user, &session).await.unwrap().unwrap();
+    let work = restarted.load_claim_work(&claim).await.unwrap();
+    assert_eq!(
+        work.latest_request.as_ref().unwrap()["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .len(),
+        expected_bytes
+    );
+    assert_eq!(
+        claim.work.active_request.as_ref().unwrap()["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .len(),
+        expected_bytes
+    );
+    assert!(work.finalize_requested);
+    assert_eq!(
+        restarted
+            .missing_input_head(&user, &session)
+            .await
+            .unwrap()
+            .unwrap()
+            .cursor
+            .completed_turn,
+        2
+    );
+    restarted.release(&claim, true).await.unwrap();
+}
