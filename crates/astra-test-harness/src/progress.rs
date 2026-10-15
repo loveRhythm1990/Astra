@@ -33,7 +33,7 @@ fn criteria(values: &[CriterionResult], outcome: &RunOutcome) -> io::Result<Vec<
                 | Criterion::ExecutionChildResultsAdopted { .. } =>
                     crate::criteria::execution_contract_proof(&c.criterion, outcome)
                         .map(|(_, diagnostic)| diagnostic)
-                        .unwrap_or_else(|_| json!({"kind":"unavailable"})),
+                        .unwrap_or_else(|failure| failure.diagnostic()),
                 Criterion::DurationBetween { min_ms, max_ms } =>
                     json!({"kind":"count", "min":min_ms, "max":max_ms, "actual":outcome.duration_ms}),
                 Criterion::ToolsCountBetween { min, max } =>
@@ -420,6 +420,215 @@ mod tests {
                 .unwrap()
                 .contains("private-sentinel")
         );
+    }
+
+    #[test]
+    fn child_proof_reasons_preserve_verdicts_and_exclude_private_evidence() {
+        for (fault, status, reason) in [
+            ("none", "proven", None),
+            ("count", "contradicted", Some("child_count_mismatch")),
+            ("running", "contradicted", Some("child_not_completed")),
+            ("model", "contradicted", Some("model_mismatch")),
+            ("result", "contradicted", Some("expected_result_mismatch")),
+            ("digest", "contradicted", Some("result_digest_mismatch")),
+            ("late", "contradicted", Some("finalization_before_adoption")),
+            ("tree", "unavailable", Some("run_tree_unavailable")),
+            (
+                "missing-result",
+                "unavailable",
+                Some("child_result_unavailable"),
+            ),
+            (
+                "missing-adoption",
+                "unavailable",
+                Some("adoption_evidence_unavailable"),
+            ),
+            (
+                "missing-finalization",
+                "unavailable",
+                Some("finalization_unavailable"),
+            ),
+            (
+                "physical",
+                "unavailable",
+                Some("physical_execution_unavailable"),
+            ),
+            (
+                "window-identity",
+                "unavailable",
+                Some("result_window_identity_conflict"),
+            ),
+            (
+                "window-digest",
+                "unavailable",
+                Some("result_window_digest_conflict"),
+            ),
+            (
+                "window-invalid",
+                "unavailable",
+                Some("result_window_invalid"),
+            ),
+            (
+                "window-shape",
+                "unavailable",
+                Some("result_window_unavailable"),
+            ),
+            ("fanout", "proven", None),
+            ("wrong-group", "contradicted", Some("fanout_group_mismatch")),
+            ("wrong-slot", "contradicted", Some("slot_missing")),
+            (
+                "failed-start",
+                "contradicted",
+                Some("fanout_start_unsuccessful"),
+            ),
+            (
+                "repeated-start",
+                "contradicted",
+                Some("fanout_start_repeated"),
+            ),
+        ] {
+            let mut capture =
+                serde_json::to_value(crate::execution_capture::tests::tool_capture()).unwrap();
+            let mut criterion = json!({"type":"execution_child_results_adopted",
+                "children":[{"model":"test-model", "expected_result":{"text":"observed-value"}}]});
+            let fanout = matches!(
+                fault,
+                "fanout" | "wrong-group" | "wrong-slot" | "failed-start" | "repeated-start"
+            );
+            if fanout {
+                criterion["fanout_group"] = json!({"kind":"id", "value":"group"});
+                criterion["children"][0]["slot_index"] = 0.into();
+                capture["transcript"]["items"][0]["tool_calls"][0]["name"] = "agent_fanout".into();
+                capture["transcript"]["items"][0]["tool_calls"][0]["arguments"] =
+                    json!({"action":"start", "group_id":"group", "description":"private-sentinel"})
+                        .to_string()
+                        .into();
+                capture["transcript"]["items"][1]["tool_result"]["name"] = "agent_fanout".into();
+                capture["transcript"]["items"][1]["content"] =
+                    json!({"status":"started", "group_id":"group", "title":"group",
+                        "fanout":{"group_id":"group", "title":"group", "parent_run_id":"root"},
+                        "work_unit_observation":{"id":"group", "kind":"agent_fanout"}, "agents":[{
+                        "slot_index":0, "run_id":"child", "agent_id":"member"
+                    }]})
+                    .to_string()
+                    .into();
+            }
+            let facts = "/reflection/graph_slice/nodes/0/metadata/execution_spine/facts";
+            match fault {
+                "count" => criterion["children"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"model":"test-model"})),
+                "running" => capture["run_tree"]["runs"][1]["status"] = "running".into(),
+                "model" => criterion["children"][0]["model"] = "private-sentinel".into(),
+                "result" => {
+                    criterion["children"][0]["expected_result"]["text"] = "private-sentinel".into()
+                }
+                "digest" => {
+                    capture.pointer_mut(facts).unwrap()[1]["children"][0]["result_sha256"] =
+                        "private-sentinel".into()
+                }
+                "late" => {
+                    capture.pointer_mut(facts).unwrap()[2]["created_at"] =
+                        "2026-10-07T00:00:01.000000".into()
+                }
+                "tree" => capture["run_tree"]["truncated"] = true.into(),
+                "missing-result" => {
+                    capture["transcript"]["items"].as_array_mut().unwrap().pop();
+                }
+                "missing-adoption" => {
+                    capture
+                        .pointer_mut(facts)
+                        .unwrap()
+                        .as_array_mut()
+                        .unwrap()
+                        .remove(1);
+                }
+                "missing-finalization" => {
+                    capture
+                        .pointer_mut(facts)
+                        .unwrap()
+                        .as_array_mut()
+                        .unwrap()
+                        .pop();
+                }
+                "wrong-group" => {
+                    let mut args: Value = serde_json::from_str(
+                        capture["transcript"]["items"][0]["tool_calls"][0]["arguments"]
+                            .as_str()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    args["group_id"] = "private-sentinel".into();
+                    capture["transcript"]["items"][0]["tool_calls"][0]["arguments"] =
+                        args.to_string().into();
+                }
+                "physical" => {
+                    capture["reflection"]["model_requests"]["terminal"]["groups"] = json!([])
+                }
+                "window-identity" | "window-digest" | "window-invalid" | "window-shape" => {
+                    let entry = &mut capture.pointer_mut(facts).unwrap()[1]["children"][0];
+                    entry["result_truncated"] = true.into();
+                    entry["result_range"] = match fault {
+                        "window-identity" => json!([0, 14, 999]),
+                        "window-invalid" => json!([0, 999, 14]),
+                        "window-shape" => json!("private-sentinel"),
+                        _ => json!([0, 14, 14]),
+                    };
+                    if fault == "window-digest" {
+                        entry["result_sha256"] = "private-sentinel".into();
+                    }
+                }
+                "wrong-slot" => criterion["children"][0]["slot_index"] = 1.into(),
+                "failed-start" => {
+                    capture["transcript"]["items"][1]["tool_result"]["status"] = "failed".into()
+                }
+                "repeated-start" => {
+                    let items = capture["transcript"]["items"].as_array_mut().unwrap();
+                    let mut request = items[0].clone();
+                    let mut response = items[1].clone();
+                    request["item_seq"] = 4.into();
+                    request["source_event_id"] = "source-4".into();
+                    request["tool_calls"][0]["tool_use_id"] = "repeat".into();
+                    response["item_seq"] = 5.into();
+                    response["source_event_id"] = "source-5".into();
+                    response["tool_result"]["tool_use_id"] = "repeat".into();
+                    items.extend([request, response]);
+                    capture["run_tree"]["runs"][0]["total_tool_calls"] = 2.into();
+                }
+                _ => {}
+            }
+            let mut outcome = RunOutcome::new("model");
+            outcome.run_id = Some("root".into());
+            outcome.text = "private-sentinel".into();
+            outcome.stderr = "private-sentinel".into();
+            let mut stream = crate::runner::StreamCapture::default();
+            stream.identity_verified = true;
+            stream.execution = Some(serde_json::from_value(capture).unwrap());
+            outcome.stream_capture = Some(stream);
+            let criterion: Criterion = serde_json::from_value(criterion).unwrap();
+            let results = crate::criteria::evaluate_deterministic(&[criterion], &outcome);
+            assert_eq!(results[0].passed, status == "proven", "{fault}");
+            assert_eq!(
+                crate::criteria::execution_verification_unavailable(&results[0], &outcome),
+                status == "unavailable",
+                "{fault}"
+            );
+            let projected = criteria(&results, &outcome).unwrap();
+            assert_eq!(
+                projected[0]["diagnostic"],
+                json!({
+                    "kind":"child_adoption", "status":status, "reason":reason
+                }),
+                "{fault}"
+            );
+            assert!(
+                !serde_json::to_string(&projected)
+                    .unwrap()
+                    .contains("private-sentinel"),
+                "{fault}"
+            );
+        }
     }
 
     #[tokio::test]

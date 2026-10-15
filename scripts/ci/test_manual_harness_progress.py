@@ -120,6 +120,40 @@ class ManualHarnessProgressTests(unittest.TestCase):
             self.assertEqual(summary["observation_error"], "invalid_progress")
             self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
 
+    def test_child_proof_reason_survives_real_summary_entrypoint(self):
+        for status, reason in [("proven", None),
+                               ("contradicted", "result_digest_mismatch"),
+                               ("unavailable", "adoption_evidence_unavailable")]:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                passed = status == "proven"
+                data = events(("passed" if passed else "failed",))
+                result = next(e["row"] for e in data if e["type"] == "case_completed")
+                diagnostic = {"kind":"child_adoption", "status":status, "reason":reason}
+                result["steps"] = []
+                result["criteria"] = [{"type":"execution_child_results_adopted",
+                    "severity":"hard", "score":None, "passed":passed,
+                    "evaluation":"reported", "diagnostic":diagnostic}]
+                write_events(root, data)
+                (root / "report.json").write_text("private-sentinel")
+                (root / "execution.json").write_text(json.dumps({"exit_code":0 if passed else 1,
+                                                                "termination":"finished"}))
+                code, summary = self.publish(root, "success" if passed else "failure", cli=True)
+                self.assertEqual(code, 0 if passed else 1)
+                self.assertIsNone(summary["observation_error"])
+                self.assertEqual(summary["runs"][0]["criteria"][0]["diagnostic"], diagnostic)
+                if not passed:
+                    self.assertIn(f"{status}: {reason}", (root / "job-summary").read_text())
+                self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
+
+    def test_child_proof_diagnostic_rejects_untrusted_reasons_and_fields(self):
+        valid = {"kind":"child_adoption", "status":"contradicted", "reason":"model_mismatch"}
+        for changes in [{"reason":"private-sentinel"}, {"detail":"private-sentinel"},
+                        {"status":"proven"}, {"status":"unavailable"},
+                        {"status":{}}, {"reason":[]}]:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                h.safe_diagnostic(dict(valid, **changes), 0)
+
     def publish(self, root, outcome="success", *, cli=False):
         with patch.dict(os.environ, {"ASTRA_BUILD_SOURCE_GIT_SHA":SHA, "GITHUB_STEP_SUMMARY":str(root / "job-summary"),
                                     "HARNESS_OUTCOME":outcome}):

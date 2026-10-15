@@ -15,6 +15,27 @@ SCHEMA = "astra.harness_progress.v2"
 MAX_RECORD = 262_144
 MAX_FILE = 32 * 1024 * 1024
 STATUSES = ("passed", "failed", "cancelled", "unavailable")
+# Closed diagnostic vocabulary shared with the canonical Rust verifier.
+CHILD_PROOF_CONTRADICTIONS = frozenset("""
+child_count_mismatch child_not_completed execution_identity_mismatch model_mismatch
+fanout_start_missing fanout_start_repeated fanout_start_unsuccessful fanout_group_mismatch
+fanout_rejection_executed fanout_selection_invalid fanout_title_invalid
+fanout_child_count_mismatch fanout_label_invalid fanout_identity_mismatch
+fanout_children_mismatch spawn_identity_mismatch slot_missing model_ambiguous
+child_selection_repeated offering_mismatch thinking_mismatch mutation_mismatch
+question_unanswered logical_rounds_mismatch child_result_conflict
+expected_result_mismatch result_digest_mismatch finalization_before_adoption
+""".split())
+CHILD_PROOF_UNAVAILABLE = frozenset("""
+run_tree_unavailable fanout_receipt_unavailable model_identity_unavailable
+fanout_rejection_execution_unknown fanout_selection_unavailable
+offering_identity_unavailable thinking_unavailable mutation_unavailable
+question_evidence_unavailable logical_rounds_unavailable child_result_unavailable
+adoption_evidence_unavailable agent_identity_unavailable finalization_unavailable
+physical_execution_unavailable result_window_unavailable result_window_identity_conflict
+result_window_digest_conflict result_window_invalid
+""".split())
+
 METRICS = ("duration_ms", "ttft_ms", "turn_rounds", "tool_calls_count", "prompt_tokens",
            "cached_input_tokens", "cache_creation_tokens", "completion_tokens")
 OUTCOME_STATUSES = {"completed", "failed", "rejected", "blocked", "started", "unknown",
@@ -60,11 +81,24 @@ def safe_diagnostic(value, depth):
     fields = {"count": {"min", "max", "actual"}, "exit": {"expected", "actual"},
               "tool_count": {"min", "max", "actual", "considered", "expected_ok", "outcome_matches", "error_matches", "predicate_matches", "observed_outcomes", "outcomes_omitted"},
               "sequence": {"matched", "expected"}, "proof": {"proven"},
-              "judge": {"threshold", "assessment"}, "unavailable": set(), "composite": {"checks"}}
+              "judge": {"threshold", "assessment"}, "unavailable": set(), "composite": {"checks"},
+              "child_adoption": {"status", "reason"}}
     if kind not in fields or set(value) != {"kind"} | fields[kind]:
         raise ValueError("unexpected diagnostic payload")
     if kind == "composite":
         safe_criteria(value["checks"], owner_passed=False, depth=depth+1)
+    elif kind == "child_adoption":
+        status, reason = value["status"], value["reason"]
+        if not isinstance(status, str):
+            raise ValueError("invalid child proof status")
+        allowed = {"contradicted": CHILD_PROOF_CONTRADICTIONS,
+                   "unavailable": CHILD_PROOF_UNAVAILABLE}
+        if status == "proven":
+            if reason is not None:
+                raise ValueError("proven child proof has a failure reason")
+        elif (not isinstance(reason, str) or status not in allowed
+              or reason not in allowed[status]):
+            raise ValueError("invalid child proof diagnostic")
     elif kind == "judge":
         if value["assessment"] not in ("graded", "accepted", "rejected", "unavailable", "unreported"):
             raise ValueError("invalid judge assessment")
@@ -187,6 +221,8 @@ def check_lines(items, prefix):
             reason = f"matched {diagnostic['matched']} of {diagnostic['expected']} ordered tool receipts"
         elif kind == "unavailable":
             reason = "Canonical execution evidence unavailable or incomplete; cannot verify this contract"
+        elif kind == "child_adoption":
+            reason = f"Child adoption verification {diagnostic['status']}: {diagnostic['reason']}"
         elif kind == "proof":
             reason = f"Canonical child identity/result adoption proven={diagnostic['proven']}"
         elif kind == "composite":

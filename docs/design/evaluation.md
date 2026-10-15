@@ -60,6 +60,12 @@ claims. Missing, oversized, or contradictory evidence cannot authorize a pass.
 Explicit text and JSON expectations remain available for actual output-format
 contracts; they must not be imposed accidentally on general collaboration tests.
 
+Public child-adoption diagnostics use closed reason codes from the canonical
+custody verifier, distinguishing a failed condition from unavailable evidence.
+Neither category authorizes semantic judging without verified child evidence.
+Public progress and CI summaries omit raw results, identities, arguments and
+provider error text; diagnostic changes preserve grading and failure classification.
+
 ## Replay modes
 
 | Mode | Meaning |

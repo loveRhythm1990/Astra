@@ -236,6 +236,15 @@ and free-form judge diagnostics remain private; public artifacts do not include
 them. Checks without a safe numeric projection explicitly say that their detailed
 payload is withheld. Full private diagnostics remain in the local suite report.
 
+Once execution identity is verified, child-adoption checks publish a closed `child_adoption` diagnostic with status
+`proven`, `contradicted`, or `unavailable`, and a fixed failure reason such as
+`child_not_completed`, `fanout_start_repeated`, `model_mismatch`,
+`result_digest_mismatch`, or `finalization_before_adoption`. Missing evidence has
+separate unavailable reason codes. The grader and public projection use the same
+canonical verifier; these diagnostics do not change verdicts or judge admission.
+No child content, identities, arguments, expected values, or provider error text
+are included. The safe-summary consumer rejects unknown codes and extra fields.
+
 ### Small automatic live regression
 
 **Harness regression (live)** runs on relevant `main` pushes, same-repository

@@ -1008,12 +1008,39 @@ pub(crate) fn execution_verification_unavailable(
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{detail}")]
+pub(crate) struct ExecutionProofUnavailable {
+    detail: &'static str,
+    child_reason: Option<crate::execution_capture::ChildProofReason>,
+}
+
+impl From<&'static str> for ExecutionProofUnavailable {
+    fn from(detail: &'static str) -> Self {
+        Self {
+            detail,
+            child_reason: None,
+        }
+    }
+}
+
+impl ExecutionProofUnavailable {
+    pub(crate) fn diagnostic(&self) -> serde_json::Value {
+        match self.child_reason {
+            Some(reason) => serde_json::json!({
+                "kind":"child_adoption", "status":"unavailable", "reason":reason
+            }),
+            None => serde_json::json!({"kind":"unavailable"}),
+        }
+    }
+}
+
 /// The verdict and its public numeric evidence come from the same proof. Never
 /// include tool arguments, result strings, predicate values or provider errors.
 pub(crate) fn execution_contract_proof(
     c: &Criterion,
     outcome: &RunOutcome,
-) -> Result<(bool, serde_json::Value), &'static str> {
+) -> Result<(bool, serde_json::Value), ExecutionProofUnavailable> {
     let stream = outcome
         .stream_capture
         .as_ref()
@@ -1023,7 +1050,7 @@ pub(crate) fn execution_contract_proof(
     // identity, owner, canonical completeness, and lifecycle checks are
     // enforced independently.
     if !stream.identity_verified {
-        return Err("execution identity or coverage unverified");
+        return Err("execution identity or coverage unverified".into());
     }
     let capture = stream
         .execution
@@ -1035,9 +1062,26 @@ pub(crate) fn execution_contract_proof(
         fanout_group,
     } = c
     {
-        return capture
-            .proves_children(root, children, fanout_group.as_ref())
-            .map(|passed| (passed, serde_json::json!({"kind":"proof", "proven":passed})));
+        return match capture.verify_children(root, children, fanout_group.as_ref()) {
+            Ok(_) => Ok((
+                true,
+                serde_json::json!({
+                    "kind":"child_adoption", "status":"proven", "reason":null
+                }),
+            )),
+            Err(failure) => match failure.unavailable_detail {
+                Some(detail) => Err(ExecutionProofUnavailable {
+                    detail,
+                    child_reason: Some(failure.reason),
+                }),
+                None => Ok((
+                    false,
+                    serde_json::json!({
+                        "kind":"child_adoption", "status":"contradicted", "reason":failure.reason
+                    }),
+                )),
+            },
+        };
     }
     if let Criterion::ExecutionChildCount { min, max } = c {
         let count = capture
@@ -1061,7 +1105,8 @@ pub(crate) fn execution_contract_proof(
         } => {
             if *min == 0 && (!predicates.is_empty() || error_contains.is_some()) {
                 return Err(
-                    "negative document predicates require raw capture, not display projections",
+                    "negative document predicates require raw capture, not display projections"
+                        .into(),
                 );
             }
             for call in calls
@@ -1069,7 +1114,7 @@ pub(crate) fn execution_contract_proof(
                 .filter(|call| call.name == name && (!root_only || call.run_id == root))
             {
                 if ok.is_some() && call.ok.is_none() {
-                    return Err("requested tool outcome not captured");
+                    return Err("requested tool outcome not captured".into());
                 }
                 if ok.is_some_and(|expected| call.ok != Some(expected)) {
                     continue;
@@ -1081,7 +1126,7 @@ pub(crate) fn execution_contract_proof(
                         _ => None,
                     };
                     if document.is_none() {
-                        return Err("required tool document unavailable or not JSON");
+                        return Err("required tool document unavailable or not JSON".into());
                     }
                 }
             }
