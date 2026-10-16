@@ -468,15 +468,34 @@ async fn execution_is_idle(
     user: &str,
     session: &str,
 ) -> Result<bool, String> {
-    let slots: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
+    let slot = sqlx::query(
+        "SELECT 1 FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
     )
     .bind(user)
     .bind(session)
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(|error| error.to_string())?;
-    Ok(slots == 0)
+    if slot.is_some() {
+        return Ok(false);
+    }
+    // Terminal Run persistence releases the execution slot before canonical
+    // context commit. The coordinator's existing writer/reservation authority
+    // still permits that commit, so neither close nor destructive maintenance
+    // may treat the old watermark as settled. Use database time and current
+    // reads under the shared Session fence, just like the context coordinator.
+    let context_writer = sqlx::query(
+        "SELECT 1 FROM session_context_heads WHERE owner_user_id = ? AND session_id = ?
+         AND (active_writer_expires_at_ms > CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED)
+              OR active_reservation_expires_at_ms > CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED))
+         LIMIT 1 FOR UPDATE",
+    )
+    .bind(user)
+    .bind(session)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(context_writer.is_none())
 }
 
 async fn ensure_work_row(
