@@ -678,8 +678,13 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         assert_eq!(resumed["disposition"], "applied");
         assert_eq!(resumed["run_id"], run_id);
         assert_eq!(resumed["status"], "running");
-        tokio::time::timeout(Duration::from_secs(10), entered.notified()).await
-            .expect("public resume must reach the actual provider");
+        if tokio::time::timeout(Duration::from_secs(10), entered.notified()).await.is_err() {
+            let stalled = store.load_run(&ctx.user_id, &run_id).await.unwrap().unwrap();
+            let event_types: Vec<_> = stalled.events.iter()
+                .filter_map(|event| event["event_type"].as_str()).collect();
+            panic!("public resume must reach the actual provider: durable_status={}, error_code={:?}, events={event_types:?}",
+                stalled.status, stalled.error_code);
+        }
         let active = store.load_run(&ctx.user_id, &run_id).await.unwrap().unwrap();
         assert_eq!(active.run_generation, recovered.run_generation + 1);
         assert_eq!(active.original_admission_data().unwrap(), &original_admission);
