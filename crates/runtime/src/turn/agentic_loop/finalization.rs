@@ -1067,10 +1067,6 @@ async fn maybe_run_memory_extraction(state: &mut AgenticLoopState, defer_dispatc
 mod trace_ingestion_tests;
 
 #[cfg(test)]
-#[path = "../../../../services/tests/common/isolated_database.rs"]
-mod isolated_database;
-
-#[cfg(test)]
 mod tests {
     use crate::server::runtime_tool_executor::RuntimeToolExecutor;
     use crate::server::tool_transport::{ExecutorBinding, WorkspaceBinding};
@@ -2577,7 +2573,7 @@ mod tests {
     #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
     async fn post_loop_owner_preserves_durable_handoff_before_dispatch() {
         let settings = astra_core::MatrixOneSettings::from_env();
-        super::isolated_database::require_isolated_database(&settings.database);
+        crate::isolated_database::require_isolated_database(&settings.database);
         astra_services::storage::ensure_core_schema(&settings, "mysql")
             .await
             .unwrap();

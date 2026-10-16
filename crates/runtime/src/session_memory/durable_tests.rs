@@ -1,5 +1,6 @@
 //! Real MatrixOne journal plus a strict loopback backend at public HTTP paths.
 use super::*;
+use crate::isolated_database;
 use astra_core::{MatrixOneSettings, SharedPool};
 use axum::{
     Json, Router,
@@ -8,8 +9,6 @@ use axum::{
     routing::{delete, get, post},
 };
 use std::{collections::BTreeMap, sync::Mutex};
-#[path = "../../../services/tests/common/isolated_database.rs"]
-mod isolated_database;
 
 #[derive(Default)]
 struct Backend {

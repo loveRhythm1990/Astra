@@ -72,6 +72,10 @@ pub mod session_memory;
 pub mod tool_registry;
 pub mod turn;
 
+#[cfg(test)]
+#[path = "../../services/tests/common/isolated_database.rs"]
+pub(crate) mod isolated_database;
+
 #[doc(hidden)]
 pub mod context_observability_bench {
     use serde_json::Value;
