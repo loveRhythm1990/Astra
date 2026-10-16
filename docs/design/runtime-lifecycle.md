@@ -535,6 +535,10 @@ both the ordinary MCP client and stateless Agent Binding HTTP calls. Cancellatio
 sends `notifications/cancelled` with the exact JSON-RPC request id. Agent Binding
 exchanges use distinct request ids while retaining their business `call_id`
 across provider-interaction rounds. Cancellation closes admission to later rounds.
+Transport preflight distinguishes cancellation before dispatch from an attempted
+RPC. If no exchange was dispatched, cancellation releases the unused workspace
+authority without quarantine. A previously dispatched interaction round retains
+its settlement obligation even if the next exchange is cancelled before dispatch.
 The notification does not settle the invocation: the original response remains
 owned and polled, including when the notification fails or its HTTP response is
 delayed. The ordinary client currently negotiates MCP 2025-11-25, whose

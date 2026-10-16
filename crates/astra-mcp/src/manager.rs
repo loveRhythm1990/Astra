@@ -77,7 +77,8 @@ impl PreparedMcpToolCall {
         arguments: Value,
         protocol_metadata: Option<serde_json::Map<String, Value>>,
     ) -> Result<CallToolResult, rmcp::ServiceError> {
-        self.call_with_cancel(arguments, protocol_metadata, None)
+        self.connection
+            .call_tool_with_metadata(&self.original_tool_name, arguments, protocol_metadata)
             .await
     }
 
@@ -86,7 +87,7 @@ impl PreparedMcpToolCall {
         arguments: Value,
         protocol_metadata: Option<serde_json::Map<String, Value>>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
-    ) -> Result<CallToolResult, rmcp::ServiceError> {
+    ) -> Result<CallToolResult, crate::McpToolCallError> {
         self.connection
             .call_tool_with_metadata_and_cancel(
                 &self.original_tool_name,

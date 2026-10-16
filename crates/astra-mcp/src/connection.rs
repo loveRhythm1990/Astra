@@ -250,6 +250,7 @@ impl McpConnection {
     ) -> Result<CallToolResult, ServiceError> {
         self.call_tool_with_metadata_and_cancel(name, arguments, protocol_metadata, None)
             .await
+            .map_err(crate::McpToolCallError::into_service_error)
     }
 
     pub async fn call_tool_with_metadata_and_cancel(
@@ -258,7 +259,7 @@ impl McpConnection {
         arguments: serde_json::Value,
         protocol_metadata: Option<serde_json::Map<String, serde_json::Value>>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
-    ) -> Result<CallToolResult, ServiceError> {
+    ) -> Result<CallToolResult, crate::McpToolCallError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
         let start = Instant::now();
 
@@ -294,7 +295,8 @@ impl McpConnection {
                 );
                 Err(ServiceError::Timeout {
                     timeout: std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS),
-                })
+                }
+                .into())
             }
         };
 
@@ -917,11 +919,9 @@ async fn call_tool_with_cancel(
     peer: &Peer<RoleClient>,
     params: CallToolRequestParams,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
-) -> Result<CallToolResult, ServiceError> {
+) -> Result<CallToolResult, crate::McpToolCallError> {
     if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-        return Err(ServiceError::Cancelled {
-            reason: Some("run cancelled before dispatch".into()),
-        });
+        return Err(crate::McpToolCallError::CancelledBeforeDispatch);
     }
     let request = peer
         .send_cancellable_request(
@@ -969,7 +969,7 @@ async fn call_tool_with_cancel(
     }?;
     match result {
         ServerResult::CallToolResult(result) => Ok(result),
-        _ => Err(ServiceError::UnexpectedResponse),
+        _ => Err(ServiceError::UnexpectedResponse.into()),
     }
 }
 
@@ -1072,7 +1072,10 @@ mod tests {
             Some(&token),
         )
         .await;
-        assert!(matches!(pre_cancelled, Err(ServiceError::Cancelled { .. })));
+        assert!(matches!(
+            pre_cancelled,
+            Err(crate::McpToolCallError::CancelledBeforeDispatch)
+        ));
         client.cancel().await.unwrap();
         assert_eq!(
             server.await.unwrap(),

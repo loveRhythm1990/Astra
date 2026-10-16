@@ -339,9 +339,14 @@ pub(crate) struct AgentBindingMcpRpcError {
     outcome_unknown: bool,
     timed_out: bool,
     provider_acknowledged: bool,
+    cancelled_before_dispatch: bool,
 }
 
 impl AgentBindingMcpRpcError {
+    pub(crate) fn is_cancelled_before_dispatch(&self) -> bool {
+        self.cancelled_before_dispatch
+    }
+
     pub(crate) fn side_effects_maybe(&self) -> bool {
         self.outcome_unknown
     }
@@ -394,6 +399,7 @@ fn agent_binding_mcp_rpc_error(detail: impl Into<String>) -> AgentBindingMcpRpcE
         outcome_unknown: false,
         timed_out: false,
         provider_acknowledged: false,
+        cancelled_before_dispatch: false,
     }
 }
 
@@ -403,6 +409,7 @@ fn agent_binding_mcp_provider_error(detail: impl Into<String>) -> AgentBindingMc
         outcome_unknown: false,
         timed_out: false,
         provider_acknowledged: true,
+        cancelled_before_dispatch: false,
     }
 }
 
@@ -412,6 +419,7 @@ fn agent_binding_mcp_timeout_error(detail: impl Into<String>) -> AgentBindingMcp
         outcome_unknown: true,
         timed_out: true,
         provider_acknowledged: false,
+        cancelled_before_dispatch: false,
     }
 }
 
@@ -1383,9 +1391,9 @@ impl AgentBindingMcpRuntime {
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<McpToolCallResult, AgentBindingMcpRpcError> {
         if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-            return Err(agent_binding_mcp_rpc_error(
-                "MCP tool cancelled before dispatch",
-            ));
+            let mut error = agent_binding_mcp_rpc_error("MCP tool cancelled before dispatch");
+            error.cancelled_before_dispatch = true;
+            return Err(error);
         }
         if tool_call_id.trim().is_empty() {
             return Err(agent_binding_mcp_rpc_error(

@@ -851,6 +851,8 @@ pub struct RuntimeToolExecutor {
     /// shared HTTP transport pool. Unlike `mcp_manager`, this never holds a
     /// long-lived authorization-scoped MCP session.
     agent_binding_mcp: Option<Arc<super::runtime_mcp::AgentBindingMcpRuntime>>,
+    #[cfg(test)]
+    mcp_before_transport: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Request-scoped MCP tool schemas. Joined with the server-side allowlist
     /// only when the matching MCP runtime binding is ready, so deferred
     /// activation reaches MCP tools without treating arbitrary schemas as
@@ -1030,6 +1032,8 @@ impl RuntimeToolExecutor {
             current_discovery_deferred_tool_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
             mcp_manager: None,
             agent_binding_mcp: None,
+            #[cfg(test)]
+            mcp_before_transport: None,
             agent_tool_context: std::sync::RwLock::new(None),
             work_surface_events: WorkSurfaceEventEmitter::new(session_id.clone()),
             tool_route_observer: Arc::new(std::sync::RwLock::new(None)),
@@ -1690,12 +1694,7 @@ impl RuntimeToolExecutor {
         loop {
             let prior_dispatch = !seen_interaction_ids.is_empty();
             if cancel_token.is_some_and(CancellationToken::is_cancelled) {
-                let result = astra_tools::cancelled_tool_result(name, prior_dispatch);
-                return if prior_dispatch {
-                    mark_mcp_call_dispatched(result)
-                } else {
-                    result
-                };
+                return mcp_cancelled_tool_result(name, prior_dispatch);
             }
             if let Some(result) =
                 astra_tools::dispatch_deadline_result(admission_deadline, prior_dispatch)
@@ -1706,13 +1705,17 @@ impl RuntimeToolExecutor {
                     result
                 };
             }
+            #[cfg(test)]
+            if let Some(before_transport) = &self.mcp_before_transport {
+                before_transport();
+            }
             let result = if let Some(agent_binding_mcp) = &self.agent_binding_mcp {
                 let Some(tool_call_id) = tool_call_id else {
                     return astra_tools::ToolResult::error(format!(
                         "Agent Binding MCP tool '{name}' is missing its trusted tool call identity."
                     ));
                 };
-                agent_binding_mcp
+                let result = agent_binding_mcp
                     .call_tool_by_mcp_name(
                         name,
                         args,
@@ -1721,17 +1724,23 @@ impl RuntimeToolExecutor {
                         interaction_response.as_ref(),
                         cancel_token,
                     )
-                    .await
-                    .map_err(|error| {
-                        mcp_call_error_result(
-                            super::runtime_mcp::redact_mcp_error_text(&format!(
-                                "Agent Binding MCP tool '{name}' failed on server '{}': {error}",
-                                agent_binding_mcp.server_name()
-                            )),
-                            error.side_effects_maybe(),
-                            error.is_timeout(),
-                        )
-                    })
+                    .await;
+                if result
+                    .as_ref()
+                    .is_err_and(|error| error.is_cancelled_before_dispatch())
+                {
+                    return mcp_cancelled_tool_result(name, prior_dispatch);
+                }
+                result.map_err(|error| {
+                    mcp_call_error_result(
+                        super::runtime_mcp::redact_mcp_error_text(&format!(
+                            "Agent Binding MCP tool '{name}' failed on server '{}': {error}",
+                            agent_binding_mcp.server_name()
+                        )),
+                        error.side_effects_maybe(),
+                        error.is_timeout(),
+                    )
+                })
             } else {
                 let protocol_metadata = interaction_response.as_ref().map(|response| {
                     Map::from_iter([(
@@ -1740,11 +1749,18 @@ impl RuntimeToolExecutor {
                             .expect("provider interaction response must serialize"),
                     )])
                 });
-                prepared
+                let result = prepared
                     .as_ref()
                     .expect("non-Agent-Binding MCP call was prepared before admission")
                     .call_with_cancel(args.clone(), protocol_metadata, cancel_token)
-                    .await
+                    .await;
+                if matches!(
+                    result,
+                    Err(astra_mcp::McpToolCallError::CancelledBeforeDispatch)
+                ) {
+                    return mcp_cancelled_tool_result(name, prior_dispatch);
+                }
+                result
                     .map(|result| {
                         astra_mcp::extract_tool_call_result_with_limit(
                             &result,
@@ -1752,7 +1768,7 @@ impl RuntimeToolExecutor {
                         )
                     })
                     .map_err(|error| {
-                        let error = astra_mcp::McpError::Service(error);
+                        let error = astra_mcp::McpError::Service(error.into_service_error());
                         mcp_call_error_result(
                             super::runtime_mcp::redact_mcp_error_text(&format!(
                                 "MCP tool '{name}' failed: {error}"
@@ -5564,6 +5580,15 @@ fn mark_mcp_call_dispatched(mut result: astra_tools::ToolResult) -> astra_tools:
         .get_or_insert_with(Map::new)
         .insert("mcp_call_dispatched".to_string(), Value::Bool(true));
     result
+}
+
+fn mcp_cancelled_tool_result(name: &str, prior_dispatch: bool) -> astra_tools::ToolResult {
+    let result = astra_tools::cancelled_tool_result(name, prior_dispatch);
+    if prior_dispatch {
+        mark_mcp_call_dispatched(result)
+    } else {
+        result
+    }
 }
 
 fn finalize_mcp_workspace_effect(
@@ -13990,6 +14015,191 @@ pub(crate) mod tests {
         );
         assert_eq!(provider_calls, 17);
         assert_eq!(gate_calls, 16);
+    }
+
+    #[tokio::test]
+    async fn mcp_transport_preflight_cancellation_preserves_workspace_dispatch_state() {
+        for ordinary_mcp in [false, true] {
+            for prior_dispatch in [false, true] {
+                let (mut exec, dir) = test_executor();
+                let calls_path = dir.path().join("provider-calls");
+                let interaction_result = json!({
+                    "content": [{"type": "text", "text": "choose"}],
+                    "_meta": {"astra/providerInteraction": {
+                        "request_id": "preflight-interaction",
+                        "payload": {"type": "provider.opaque.select"},
+                        "timeout_ms": 60_000
+                    }}
+                });
+                let mut server = None;
+                let mut manager = None;
+                if ordinary_mcp {
+                    let mut client = astra_mcp::McpClientManager::new();
+                    let config = astra_mcp::McpServerConfig {
+                        name: "controlled".into(),
+                        transport: astra_mcp::Transport::Stdio {
+                            command: vec!["python3".into()],
+                            args: vec![
+                                "-u".into(), "-c".into(),
+                                r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    method = request['method']
+    if method == 'initialize':
+        result = {'protocolVersion': request['params']['protocolVersion'], 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'controlled', 'version': '1'}}
+    elif method == 'tools/list':
+        result = {'tools': [{'name': 'write', 'inputSchema': {'type': 'object'}, 'annotations': {'readOnlyHint': False, 'destructiveHint': True}}]}
+    elif method == 'tools/call':
+        with open(sys.argv[1], 'a') as calls:
+            calls.write('call\n')
+        result = json.loads(sys.argv[2])
+    else:
+        raise AssertionError(method)
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+"#.into(),
+                                calls_path.to_str().unwrap().into(),
+                                interaction_result.to_string(),
+                            ],
+                            env: HashMap::new(),
+                        },
+                        description: String::new(),
+                        enabled: true,
+                        retry: astra_mcp::RetryConfig::default(),
+                    };
+                    tokio::time::timeout(Duration::from_secs(5), client.connect(config))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        client
+                            .prepare_tool_call_by_mcp_name("mcp__controlled__write")
+                            .unwrap()
+                            .policy()
+                            .effect,
+                        astra_turn_types::ResolvedToolEffect::Mutating,
+                    );
+                    let client = Arc::new(tokio::sync::RwLock::new(client));
+                    exec.set_mcp_manager(client.clone());
+                    manager = Some(client);
+                } else {
+                    let app = axum::Router::new().route(
+                        "/mcp",
+                        axum::routing::post({
+                            let calls_path = calls_path.clone();
+                            move |axum::Json(body): axum::Json<Value>| {
+                                let calls_path = calls_path.clone();
+                                let interaction_result = interaction_result.clone();
+                                async move {
+                                    use std::io::Write as _;
+
+                                    assert_eq!(body["method"], "tools/call");
+                                    let mut calls = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(calls_path)
+                                        .unwrap();
+                                    writeln!(calls, "call").unwrap();
+                                    axum::Json(json!({
+                                        "jsonrpc": "2.0", "id": body["id"],
+                                        "result": interaction_result
+                                    }))
+                                }
+                            }
+                        }),
+                    );
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+                    server = Some(tokio::spawn(async move {
+                        axum::serve(listener, app).await.unwrap()
+                    }));
+                    exec.set_agent_binding_mcp(Arc::new(
+                        crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests_at_endpoint(
+                            "controlled",
+                            &["mcp__controlled__write"],
+                            &endpoint,
+                        )
+                        .with_test_workspace_effect(astra_turn_types::ResolvedToolEffect::Mutating),
+                    ));
+                }
+                exec.set_request_scoped_mcp_schemas(vec![json!({
+                    "type": "function", "function": {
+                        "name": "mcp__controlled__write", "parameters": {"type": "object"}
+                    }
+                })]);
+                let gate_calls = Arc::new(AtomicUsize::new(0));
+                exec.set_provider_interaction_gate(Arc::new(FixedProviderInteractionGate {
+                    calls: gate_calls.clone(),
+                    decision: astra_tools::ProviderInteractionDecision::Submitted(json!({})),
+                    wait: None,
+                }));
+                let token = CancellationToken::new();
+                let rounds = Arc::new(AtomicUsize::new(0));
+                exec.mcp_before_transport = Some(Arc::new({
+                    let token = token.clone();
+                    move || {
+                        // Deterministically signal cancellation after the executor's
+                        // check but before the real transport's preflight check.
+                        if rounds.fetch_add(1, Ordering::SeqCst) == usize::from(prior_dispatch) {
+                            token.cancel();
+                        }
+                    }
+                }));
+                let mut request = exec.tool_execution_request("mcp__controlled__write", &json!({}));
+                request.tool_call_id = "call-transport-preflight".into();
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    <RuntimeToolExecutor as ServerLocalToolTransport<
+                        crate::server::tool_local_transport::RuntimeToolExecutionResult,
+                    >>::execute_server_local_tool(&exec, &request, Some(&token)),
+                )
+                .await
+                .unwrap()
+                .result;
+                if let Some(server) = server {
+                    server.abort();
+                }
+                if let Some(manager) = manager {
+                    assert!(manager.write().await.disconnect("controlled"));
+                }
+                let calls = match std::fs::read_to_string(&calls_path) {
+                    Ok(calls) => calls.lines().count(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                    Err(error) => panic!("cannot read provider dispatches: {error}"),
+                };
+                assert_eq!(calls, usize::from(prior_dispatch));
+                assert_eq!(
+                    gate_calls.load(Ordering::SeqCst),
+                    usize::from(prior_dispatch)
+                );
+                assert!(result.is_error, "{result:?}");
+                let fields = result.metadata.as_ref().unwrap();
+                let writer =
+                    astra_tools::workspace_observation::begin_workspace_writer_with_options(
+                        dir.path(),
+                        None,
+                        Duration::from_millis(100),
+                    )
+                    .await;
+                if prior_dispatch {
+                    assert_eq!(fields["mcp_call_dispatched"], true);
+                    assert_eq!(
+                        fields["error_kind"],
+                        astra_tools::TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED
+                    );
+                    assert!(matches!(writer, Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled)));
+                } else {
+                    assert_eq!(fields["cancelled"], true);
+                    assert_ne!(fields.get("mcp_call_dispatched"), Some(&Value::Bool(true)));
+                    assert!(!fields.contains_key("workspace_effect_settled"));
+                    assert!(
+                        writer.is_ok(),
+                        "an undispatched cancellation must allow the next writer"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
