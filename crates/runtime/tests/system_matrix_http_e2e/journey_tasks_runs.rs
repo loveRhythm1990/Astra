@@ -777,9 +777,20 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         let slots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?")
             .bind(&ctx.user_id).bind(&ctx.session_id).fetch_one(&ctx.pool).await.unwrap();
         assert_eq!(slots, 0);
-        let completed_turn: i64 = sqlx::query_scalar(
-            "SELECT completed_turn FROM session_context_heads WHERE owner_user_id = ? AND session_id = ?"
-        ).bind(&ctx.user_id).bind(&ctx.session_id).fetch_one(&ctx.pool).await.unwrap();
+        // The atomic terminal transaction now records settlement_finished
+        // before the canonical context commit. Wait for the actual context
+        // watermark rather than treating the terminal event as that barrier.
+        let completed_turn = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let completed_turn: i64 = sqlx::query_scalar(
+                    "SELECT completed_turn FROM session_context_heads WHERE owner_user_id = ? AND session_id = ?"
+                ).bind(&ctx.user_id).bind(&ctx.session_id).fetch_one(&ctx.pool).await.unwrap();
+                if completed_turn >= turn as i64 {
+                    break completed_turn;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("canonical context must commit after terminal settlement");
         assert_eq!(completed_turn, turn as i64, "same reserved conversation turn commits once");
 
         // The normal terminal checkpoint exposes the restored loop budget;
