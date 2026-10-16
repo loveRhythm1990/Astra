@@ -1690,7 +1690,12 @@ impl RuntimeToolExecutor {
         loop {
             let prior_dispatch = !seen_interaction_ids.is_empty();
             if cancel_token.is_some_and(CancellationToken::is_cancelled) {
-                return astra_tools::cancelled_tool_result(name, prior_dispatch);
+                let result = astra_tools::cancelled_tool_result(name, prior_dispatch);
+                return if prior_dispatch {
+                    mark_mcp_call_dispatched(result)
+                } else {
+                    result
+                };
             }
             if let Some(result) =
                 astra_tools::dispatch_deadline_result(admission_deadline, prior_dispatch)
@@ -13985,6 +13990,110 @@ pub(crate) mod tests {
         );
         assert_eq!(provider_calls, 17);
         assert_eq!(gate_calls, 16);
+    }
+
+    #[tokio::test]
+    async fn mcp_interaction_resume_cancellation_quarantines_unsettled_mutation() {
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/mcp",
+            axum::routing::post({
+                let provider_calls = provider_calls.clone();
+                move |axum::Json(body): axum::Json<Value>| {
+                    provider_calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        assert_eq!(body["method"], "tools/call");
+                        axum::Json(json!({
+                            "jsonrpc": "2.0", "id": body["id"],
+                            "result": {
+                                "content": [{"type": "text", "text": "choose"}],
+                                "_meta": {
+                                    "astra/providerInteraction": {
+                                        "request_id": "mutating-interaction",
+                                        "payload": {"type": "provider.opaque.select"},
+                                        "timeout_ms": 60_000
+                                    }
+                                }
+                            }
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut exec, dir) = test_executor();
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function", "function": {
+                "name": "mcp__controlled__write", "parameters": {"type": "object"}
+            }
+        })]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests_at_endpoint(
+                "controlled",
+                &["mcp__controlled__write"],
+                &endpoint,
+            )
+            .with_test_workspace_effect(astra_turn_types::ResolvedToolEffect::Mutating),
+        ));
+        let wait = ProjectionWriteBarrier {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            completed: Arc::new(tokio::sync::Notify::new()),
+        };
+        let gate_calls = Arc::new(AtomicUsize::new(0));
+        exec.set_provider_interaction_gate(Arc::new(FixedProviderInteractionGate {
+            calls: gate_calls.clone(),
+            decision: astra_tools::ProviderInteractionDecision::Submitted(json!({
+                "selected": "primary"
+            })),
+            wait: Some(wait.clone()),
+        }));
+        let mut request = exec.tool_execution_request("mcp__controlled__write", &json!({}));
+        request.tool_call_id = "call-cancel-at-interaction-resume".into();
+        let token = CancellationToken::new();
+        let execution = <RuntimeToolExecutor as ServerLocalToolTransport<
+            crate::server::tool_local_transport::RuntimeToolExecutionResult,
+        >>::execute_server_local_tool(&exec, &request, Some(&token));
+        tokio::pin!(execution);
+        tokio::select! {
+            result = &mut execution => panic!("must reach interaction gate: {:?}", result.result),
+            () = wait.entered.notified() => {}
+            () = tokio::time::sleep(Duration::from_secs(5)) => panic!("interaction gate was not reached"),
+        }
+        // Model cancellation while the durable submission is being projected:
+        // the gate still returns Submitted, but no continuation may dispatch.
+        token.cancel();
+        wait.release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut execution)
+            .await
+            .unwrap()
+            .result;
+        server.abort();
+
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
+        assert!(result.is_error, "{result:?}");
+        let fields = result.metadata.as_ref().unwrap();
+        assert_eq!(fields.get("mcp_call_dispatched"), Some(&Value::Bool(true)));
+        assert_eq!(
+            fields["error_kind"],
+            astra_tools::TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED
+        );
+        assert_eq!(fields["workspace_effect_settled"], false);
+        assert!(
+            matches!(
+                astra_tools::workspace_observation::begin_workspace_writer_with_options(
+                    dir.path(),
+                    None,
+                    Duration::from_millis(100),
+                )
+                .await,
+                Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled)
+            ),
+            "an intermediate interaction response must not admit a later workspace writer"
+        );
     }
 
     #[tokio::test]
