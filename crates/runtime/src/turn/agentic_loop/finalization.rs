@@ -676,14 +676,10 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
 
     finalize_turn_trace(state).await;
 
-    // Background session-memory extraction. Fire-and-forget; service
-    // handles LLM vs. rule-based decision, event emission, UX broker, and
-    // debounce. Server runs own a later post-loop settlement boundary that
-    // is already detached from terminal delivery and must remain the sole
-    // extraction admission point for that surface.
-    if !host.owns_post_loop_memory_settlement() {
-        maybe_run_memory_extraction(state).await;
-    }
+    // Publish the bounded durable handoff before terminal completion. Server
+    // runs admit extraction only at their detached post-loop boundary; other
+    // surfaces let the same service dispatch background extraction here.
+    maybe_run_memory_extraction(state, host.owns_post_loop_memory_settlement()).await;
 
     // Desired-state convergence authority is deliberately live-only. A
     // terminal turn (successful, interrupted, or cancelled) must not leave a
@@ -1000,10 +996,10 @@ fn update_session_facts_from_turn(state: &mut super::host::AgenticLoopState) {
 
 /// Bridge between turn finalization and
 /// [`crate::session_memory::MemoryExtractionService`]. Returns
-/// immediately — the service owns the per-session debounce state,
-/// decides whether to spawn, emits the gate/skip/extracted/errored
-/// journal event inline, and runs the background worker.
-async fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
+/// after a bounded durable input handoff. The service owns per-session
+/// debounce and background extraction; Server defers dispatch to its sole
+/// post-loop settlement owner without skipping the durable publication.
+async fn maybe_run_memory_extraction(state: &mut AgenticLoopState, defer_dispatch: bool) {
     let Some(svc) = state.memory_extraction_service.clone() else {
         return;
     };
@@ -1057,6 +1053,9 @@ async fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
             return;
         }
     }
+    if defer_dispatch {
+        return;
+    }
     match svc.maybe_spawn(req) {
         crate::session_memory::SpawnDecision::Spawned => {}
         crate::session_memory::SpawnDecision::Queued => {}
@@ -1066,6 +1065,10 @@ async fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
 
 #[cfg(test)]
 mod trace_ingestion_tests;
+
+#[cfg(test)]
+#[path = "../../../../services/tests/common/isolated_database.rs"]
+mod isolated_database;
 
 #[cfg(test)]
 mod tests {
@@ -2474,7 +2477,10 @@ mod tests {
                 Arc::new(crate::session_memory::ConstMemoryInferenceResolver(None)),
                 Arc::clone(&memoria) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>,
                 ingestion,
-                "test-user",
+                state
+                    .context_manifest_user_id
+                    .as_deref()
+                    .unwrap_or("test-user"),
                 Arc::new(crate::session_memory::BackgroundActivityBroker::new()),
             )
             .with_local_current_snapshot(),
@@ -2565,6 +2571,76 @@ mod tests {
             memoria.stored.lock().unwrap().is_empty(),
             "the post-loop settlement owner must admit extraction at its own boundary"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+    async fn post_loop_owner_preserves_durable_handoff_before_dispatch() {
+        let settings = astra_core::MatrixOneSettings::from_env();
+        super::isolated_database::require_isolated_database(&settings.database);
+        astra_services::storage::ensure_core_schema(&settings, "mysql")
+            .await
+            .unwrap();
+        let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let user = format!("handoff-owner-{nonce}");
+        let session = format!("handoff-session-{nonce}");
+        sqlx::query(
+            "INSERT INTO agent_sessions (user_id, session_id, status) VALUES (?, ?, 'active')",
+        )
+        .bind(&user)
+        .bind(&session)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        let mut state = make_state();
+        state.current_session_id = Some(session.clone());
+        state.context_manifest_user_id = Some(user.clone());
+        state.session_turn = 1;
+        state.session_facts.turn = 1;
+        state
+            .messages
+            .push(serde_json::json!({"role":"user","content":"durable handoff"}));
+        let (_rx, memoria) = attach_memory_extraction_service(&mut state);
+        let svc = std::sync::Arc::try_unwrap(state.memory_extraction_service.take().unwrap())
+            .unwrap_or_else(|_| panic!("fixture owns its service"));
+        state.memory_extraction_service =
+            Some(std::sync::Arc::new(svc.with_durable_store(pool.clone())));
+        let mut host = MockHost::new(Vec::new()).with_post_loop_memory_settlement_owner();
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        let sqlx::types::Json(work): sqlx::types::Json<
+            astra_services::session_memory_lifecycle::SessionMemoryWork,
+        > = sqlx::query_scalar(
+            "SELECT state_json FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user)
+        .bind(&session)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        let request = work
+            .latest_request
+            .expect("terminal finalization must persist its input");
+        assert_eq!(request["session_facts"]["turn"], 1);
+        assert_eq!(request["messages"], serde_json::json!(state.messages));
+        assert!(work.latest_fingerprint.is_some());
+        assert!(
+            !work.extraction_requested,
+            "post-loop owner must admit dispatch later"
+        );
+        assert!(work.active_request.is_none());
+        assert_eq!(
+            state
+                .memory_extraction_service
+                .as_ref()
+                .unwrap()
+                .wait_for_pending(std::time::Duration::from_millis(20))
+                .await,
+            0
+        );
+        assert!(memoria.stored.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

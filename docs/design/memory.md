@@ -110,7 +110,9 @@ the durable journal for the existing extraction and governance algorithms. Norma
 handoff of authenticated canonical extraction input before terminal completion;
 expensive inference and Memoria work remain background operations. A missed
 handoff is recovered from immutable canonical context using the existing Session
-context coordinator. Destructive stages verify the canonical completed-turn
+context coordinator. Server's post-loop settlement remains its sole extraction
+dispatch point; deferring dispatch does not skip the bounded pre-terminal input
+publication. Destructive stages verify the canonical completed-turn
 watermark and wait for execution settlement. If freshness cannot be verified or
 materialization fails, working memory is retained.
 
