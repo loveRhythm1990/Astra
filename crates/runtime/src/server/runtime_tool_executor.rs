@@ -1656,13 +1656,15 @@ impl RuntimeToolExecutor {
 
     async fn execute_mcp_tool(
         &self,
-        name: &str,
-        args: &Value,
-        tool_call_id: Option<&str>,
-        semantic_read_condition: Option<&astra_turn_types::SemanticReadCondition>,
+        request: &ToolExecutionRequest,
         prepared: Option<&astra_mcp::PreparedMcpToolCall>,
-        admission_deadline: Option<std::time::Instant>,
+        cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        let name = request.tool_name.as_str();
+        let args = &request.args;
+        let tool_call_id = non_empty_identity(&request.tool_call_id);
+        let semantic_read_condition = request.policy.semantic_read_condition.as_ref();
+        let admission_deadline = request.policy.admission_deadline;
         let prepared = if self.agent_binding_mcp.is_none() {
             let Some(mgr) = &self.mcp_manager else {
                 return astra_tools::ToolResult::error(format!(
@@ -1687,6 +1689,9 @@ impl RuntimeToolExecutor {
         let mut seen_interaction_ids = HashSet::new();
         loop {
             let prior_dispatch = !seen_interaction_ids.is_empty();
+            if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+                return astra_tools::cancelled_tool_result(name, prior_dispatch);
+            }
             if let Some(result) =
                 astra_tools::dispatch_deadline_result(admission_deadline, prior_dispatch)
             {
@@ -1709,6 +1714,7 @@ impl RuntimeToolExecutor {
                         tool_call_id,
                         semantic_read_condition,
                         interaction_response.as_ref(),
+                        cancel_token,
                     )
                     .await
                     .map_err(|error| {
@@ -1732,7 +1738,7 @@ impl RuntimeToolExecutor {
                 prepared
                     .as_ref()
                     .expect("non-Agent-Binding MCP call was prepared before admission")
-                    .call(args.clone(), protocol_metadata)
+                    .call_with_cancel(args.clone(), protocol_metadata, cancel_token)
                     .await
                     .map(|result| {
                         astra_mcp::extract_tool_call_result_with_limit(
@@ -5476,14 +5482,7 @@ impl ServerLocalToolTransport<crate::server::tool_local_transport::RuntimeToolEx
                 Err(ServerWorkspaceAuthorityError::RecursiveRunScript) => unreachable!(),
             };
             let result = self
-                .execute_mcp_tool(
-                    &request.tool_name,
-                    &request.args,
-                    non_empty_identity(&request.tool_call_id),
-                    request.policy.semantic_read_condition.as_ref(),
-                    prepared.as_ref(),
-                    request.policy.admission_deadline,
-                )
+                .execute_mcp_tool(request, prepared.as_ref(), cancel_token)
                 .await;
             let result = finalize_mcp_workspace_effect(
                 &self.workspace_root,
@@ -13729,6 +13728,112 @@ pub(crate) mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn agent_binding_mcp_cancellation_retains_execution_until_provider_settles() {
+        for notification_status in [
+            Some(axum::http::StatusCode::ACCEPTED),
+            Some(axum::http::StatusCode::NOT_IMPLEMENTED),
+            None,
+        ] {
+            assert_agent_binding_mcp_cancellation_settlement(notification_status).await;
+        }
+    }
+
+    async fn assert_agent_binding_mcp_cancellation_settlement(
+        notification_status: Option<axum::http::StatusCode>,
+    ) {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notified = Arc::new(tokio::sync::Notify::new());
+        let settled = Arc::new(tokio::sync::Notify::new());
+        let request_id = Arc::new(StdMutex::new(Value::Null));
+        let app = axum::Router::new().route("/mcp", axum::routing::post({
+            let (started, notified, settled, request_id) = (
+                started.clone(), notified.clone(), settled.clone(), request_id.clone(),
+            );
+            move |axum::Json(body): axum::Json<Value>| {
+                let (started, notified, settled, request_id) = (
+                    started.clone(), notified.clone(), settled.clone(), request_id.clone(),
+                );
+                async move {
+                    match body["method"].as_str().unwrap() {
+                        "tools/call" => {
+                            assert_eq!(body["params"]["call_id"], "call-cancel-test");
+                            *request_id.lock().unwrap() = body["id"].clone();
+                            started.notify_one();
+                            settled.notified().await;
+                            (axum::http::StatusCode::OK, axum::Json(json!({
+                                "jsonrpc": "2.0", "id": body["id"],
+                                "result": {
+                                    "content": [{"type": "text", "text": "cleanup settled"}],
+                                    "_meta": {"astra.workspace_effect": {"settled": true}}
+                                }
+                            })))
+                        }
+                        "notifications/cancelled" => {
+                            assert_eq!(body["params"]["requestId"], *request_id.lock().unwrap());
+                            assert!(body.get("id").is_none());
+                            notified.notify_one();
+                            let status = match notification_status {
+                                Some(status) => status,
+                                None => std::future::pending().await,
+                            };
+                            (status, axum::Json(Value::Null))
+                        }
+                        other => panic!("unexpected method {other}"),
+                    }
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut exec, _dir) = test_executor();
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function", "function": {
+                "name": "mcp__controlled__write", "parameters": {"type": "object"}
+            }
+        })]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests_at_endpoint(
+                "controlled",
+                &["mcp__controlled__write"],
+                &endpoint,
+            )
+            .with_test_workspace_effect(astra_turn_types::ResolvedToolEffect::Mutating),
+        ));
+        let mut request = exec.tool_execution_request("mcp__controlled__write", &json!({}));
+        request.tool_call_id = "call-cancel-test".into();
+        let token = CancellationToken::new();
+        let execution = <RuntimeToolExecutor as ServerLocalToolTransport<
+            crate::server::tool_local_transport::RuntimeToolExecutionResult,
+        >>::execute_server_local_tool(&exec, &request, Some(&token));
+        tokio::pin!(execution);
+        tokio::select! {
+            result = &mut execution => panic!("must dispatch MCP tool: {:?}", result.result),
+            () = started.notified() => {}
+            () = tokio::time::sleep(Duration::from_secs(5)) => panic!("tool did not dispatch"),
+        }
+        token.cancel();
+        tokio::select! {
+            result = &mut execution => panic!("notification must not settle tool: {:?}", result.result),
+            () = notified.notified() => {}
+            () = tokio::time::sleep(Duration::from_secs(5)) => panic!("cancellation did not reach MCP provider"),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut execution)
+                .await
+                .is_err()
+        );
+        settled.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut execution)
+            .await
+            .unwrap()
+            .result;
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.output.contains("cleanup settled"), "{result:?}");
+        server.abort();
+    }
+
     async fn execute_provider_interaction_sequence(
         unique_request_ids: bool,
         decision: astra_tools::ProviderInteractionDecision,
@@ -13742,7 +13847,8 @@ pub(crate) mod tests {
                     |axum::extract::State((calls, unique_request_ids)): axum::extract::State<(
                         Arc<AtomicUsize>,
                         bool,
-                    )>| async move {
+                    )>,
+                     axum::Json(body): axum::Json<Value>| async move {
                         let call = calls.fetch_add(1, Ordering::SeqCst);
                         let request_id = if unique_request_ids {
                             format!("request-{call}")
@@ -13751,7 +13857,7 @@ pub(crate) mod tests {
                         };
                         axum::Json(json!({
                             "jsonrpc": "2.0",
-                            "id": "astra-agent-binding-tools-call",
+                            "id": body["id"],
                             "result": {
                                 "content": [{"type": "text", "text": "choose"}],
                                 "_meta": {

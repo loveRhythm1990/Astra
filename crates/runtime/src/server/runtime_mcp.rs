@@ -1025,6 +1025,39 @@ async fn post_agent_binding_mcp_rpc_with_risk(
     decode_agent_binding_mcp_rpc_response(&body).map_err(|error| error.after_send(risk))
 }
 
+async fn notify_agent_binding_mcp_cancelled(
+    endpoint_url: &str,
+    authorization: &str,
+    request_id: &str,
+) -> Result<(), AgentBindingMcpRpcError> {
+    // Notifications have no JSON-RPC id or response body. Do not acquire a
+    // tool permit: the request being cancelled may hold the last available one.
+    let response = agent_binding_mcp_http_client()
+        .post(endpoint_url)
+        .header(reqwest::header::AUTHORIZATION, authorization)
+        .header(
+            reqwest::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": request_id, "reason": "run cancelled"},
+        }))
+        .send()
+        .await
+        .map_err(|_| {
+            agent_binding_mcp_rpc_error("MCP cancellation notification transport failed")
+        })?;
+    if response.status() != StatusCode::ACCEPTED {
+        return Err(agent_binding_mcp_rpc_error(format!(
+            "MCP cancellation notification returned HTTP {}",
+            response.status()
+        )));
+    }
+    Ok(())
+}
+
 fn decode_agent_binding_mcp_rpc_response(body: &str) -> Result<Value, AgentBindingMcpRpcError> {
     if let Ok(value) = serde_json::from_str::<Value>(body) {
         return json_rpc_result(value);
@@ -1347,7 +1380,13 @@ impl AgentBindingMcpRuntime {
         tool_call_id: &str,
         semantic_read_condition: Option<&astra_turn_types::SemanticReadCondition>,
         provider_interaction_response: Option<&astra_turn_types::ProviderInteractionResponse>,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<McpToolCallResult, AgentBindingMcpRpcError> {
+        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Err(agent_binding_mcp_rpc_error(
+                "MCP tool cancelled before dispatch",
+            ));
+        }
         if tool_call_id.trim().is_empty() {
             return Err(agent_binding_mcp_rpc_error(
                 "Agent Binding MCP tool call identity is required",
@@ -1379,20 +1418,56 @@ impl AgentBindingMcpRuntime {
         if !protocol_metadata.is_empty() {
             params["_meta"] = Value::Object(protocol_metadata);
         }
+        // The business call id survives interaction rounds; a protocol request
+        // id identifies only this exchange and must never cancel another round.
+        let request_id = uuid::Uuid::new_v4().to_string();
         let payload = json!({
             "jsonrpc": "2.0",
-            "id": "astra-agent-binding-tools-call",
+            "id": request_id,
             "method": "tools/call",
             "params": params,
         });
-        let result = post_agent_binding_mcp_rpc_with_risk(
+        let execution = post_agent_binding_mcp_rpc_with_risk(
             &self.endpoint_url,
             &self.authorization,
             payload,
             Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS),
             AgentBindingMcpRpcRisk::ToolInvocation,
-        )
-        .await
+        );
+        tokio::pin!(execution);
+        let result = if let Some(cancel_token) = cancel_token {
+            tokio::select! {
+                biased;
+                result = &mut execution => result,
+                () = cancel_token.cancelled() => {
+                    // A notification requests cancellation; only the original
+                    // response can settle this invocation's ownership boundary.
+                    let notification = notify_agent_binding_mcp_cancelled(
+                        &self.endpoint_url, &self.authorization, &request_id,
+                    );
+                    tokio::pin!(notification);
+                    tokio::select! {
+                        biased;
+                        result = &mut execution => result,
+                        notified = &mut notification => {
+                            if let Err(error) = notified {
+                                tracing::warn!(
+                                    server = %self.server_name,
+                                    error = %error.redacted(&json!({
+                                        "authorization": &self.authorization,
+                                        "url": &self.endpoint_url,
+                                    })),
+                                    "MCP cancellation notification failed; retaining original invocation"
+                                );
+                            }
+                            execution.await
+                        }
+                    }
+                }
+            }
+        } else {
+            execution.await
+        }
         .map_err(|error| {
             error.redacted(&json!({
                 "authorization": &self.authorization,
@@ -2460,6 +2535,24 @@ mod tests {
         assert!(invocation_policy.requires_approval());
         assert!(!invocation_policy.parallelizable);
 
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        let pre_cancelled = bundle
+            .agent_binding_mcp
+            .as_ref()
+            .unwrap()
+            .call_tool_by_mcp_name(
+                "mcp__tools__query",
+                &json!({}),
+                "must-not-dispatch",
+                None,
+                None,
+                Some(&cancelled),
+            )
+            .await
+            .expect_err("pre-cancelled call must not dispatch");
+        assert!(!pre_cancelled.side_effects_maybe());
+
         for invalid_tool_call_id in ["", " \t"] {
             let missing_identity_error = bundle
                 .agent_binding_mcp
@@ -2469,6 +2562,7 @@ mod tests {
                     "mcp__tools__query",
                     &json!({"q": "hello"}),
                     invalid_tool_call_id,
+                    None,
                     None,
                     None,
                 )
@@ -2499,6 +2593,7 @@ mod tests {
                 "model-tool-call-42",
                 None,
                 None,
+                None,
             )
             .await
             .expect("tool call should succeed");
@@ -2527,6 +2622,7 @@ mod tests {
                     outcome: astra_turn_types::ProviderInteractionOutcome::Submitted,
                     payload: Some(json!({"selected": "opaque-1"})),
                 }),
+                None,
             )
             .await
             .expect("resumed tool call should preserve its identity and protocol metadata");
@@ -2539,7 +2635,8 @@ mod tests {
         assert_eq!(calls[0].1["method"], "tools/list");
         assert_eq!(calls[1].0, "Bearer runtime-grant");
         assert_eq!(calls[1].1["method"], "tools/call");
-        assert_eq!(calls[1].1["id"], "astra-agent-binding-tools-call");
+        assert!(calls[1].1["id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert_ne!(calls[1].1["id"], calls[2].1["id"]);
         assert_eq!(
             calls[1].1.pointer("/params/call_id"),
             Some(&json!("model-tool-call-42")),
@@ -2688,6 +2785,7 @@ mod tests {
                 &json!({"a": 2, "z": 1}),
                 "semantic-read-call",
                 Some(&condition),
+                None,
                 None,
             )
             .await

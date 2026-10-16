@@ -1597,23 +1597,51 @@ impl DynamicToolHandler<RuntimeToolExecutor> for McpToolHandler {
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
             return astra_tools::cancelled_tool_result(name, false);
         }
-        context
-            .execute_mcp_tool(
-                name,
-                args,
-                None,
-                None,
-                None,
-                context
-                    .admitted_execution_deadline
-                    .map(|deadline| deadline.monotonic_work_deadline()),
-            )
-            .await
+        let mut request = context.tool_execution_request(name, args);
+        // This adapter has no trusted invocation identity. Preserve its
+        // fail-closed Agent Binding behavior instead of promoting an identity
+        // carried in provider-authored arguments.
+        request.tool_call_id.clear();
+        context.execute_mcp_tool(&request, None, cancel_token).await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn dynamic_mcp_adapter_does_not_promote_argument_call_identity() {
+        use astra_tools::tool_engine::DynamicToolHandler;
+        let root = tempfile::tempdir().unwrap();
+        let mut executor = super::RuntimeToolExecutor::new(
+            root.path().to_path_buf(),
+            "user".into(),
+            "session".into(),
+            None,
+            None,
+        );
+        executor.set_agent_binding_mcp(std::sync::Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "tools",
+                &["mcp__tools__query"],
+            ),
+        ));
+        let result = super::McpToolHandler
+            .execute(
+                "mcp__tools__query",
+                &executor,
+                &serde_json::json!({"_tool_call_id": "untrusted"}),
+                None,
+            )
+            .await;
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("missing its trusted tool call identity"),
+            "{result:?}"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn default_adapter_retains_cutoff_without_convergence_identity() {
         use astra_tools::tool_engine::{ToolHandler, ToolInvocationMetadata};

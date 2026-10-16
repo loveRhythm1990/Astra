@@ -530,6 +530,24 @@ Cancellation is a state transition with cleanup obligations:
 
 Hard stop is reserved for safety or consistency boundaries. Prefer precise degraded states when possible.
 
+Server-local MCP invocations propagate the admitted run cancellation token to
+both the ordinary MCP client and stateless Agent Binding HTTP calls. Cancellation
+sends `notifications/cancelled` with the exact JSON-RPC request id. Agent Binding
+exchanges use distinct request ids while retaining their business `call_id`
+across provider-interaction rounds. Cancellation closes admission to later rounds.
+The notification does not settle the invocation: the original response remains
+owned and polled, including when the notification fails or its HTTP response is
+delayed. The ordinary client currently negotiates MCP 2025-11-25, whose
+[cancellation contract](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation)
+does not promise a response after cancellation. Retaining the receiver only
+preserves the chance to observe a racing completion; it does not require a
+cancelled provider to respond. A late response to a workspace-mutating call
+still needs the existing explicit workspace-effect settlement evidence. The
+notification acknowledgement, connection closure and token alone cannot prove
+process termination. Missing execution evidence retains the existing cleanup
+deadline and workspace quarantine. Complete cooperative cleanup convergence
+requires a provider-owned settlement contract beyond the one-way notification.
+
 ### Session cancellation convergence
 
 `POST /sessions/{id}/cancel` accepts cancellation through the canonical Run
