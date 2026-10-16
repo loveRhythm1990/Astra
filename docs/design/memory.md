@@ -147,8 +147,12 @@ CLI exit targets its idle generation; a follow-up turn invalidates that old
 maintenance request. Explicit close settles all already-admitted extraction and
 rejects writes after the closed generation is consolidated. The close transaction
 creates the journal even when the first turn's bounded handoff never published a
-row, allowing restart recovery to discover canonical input. Repeated close or
-exit requests retain journal progress instead of creating duplicate archives.
+row, allowing restart recovery to discover canonical input. A previously completed
+CLI-exit generation cannot complete an explicit close while the existing Session
+execution slot is occupied: close invalidates that generation's maintenance plan
+under the same fence and retains pending work for the admitted turn's late handoff
+or canonical recovery after settlement. Repeated close or exit requests on an idle,
+completed generation retain journal progress instead of creating duplicate archives.
 `GET /sessions/{session_id}/memory/status` exposes pending work, the settled turn,
 required/optional completion, failure flags and retry timing to the Session owner;
 it does not expose queued prompts, credentials or snapshot content.

@@ -457,6 +457,17 @@ async fn ensure_idle(
     user: &str,
     session: &str,
 ) -> Result<(), String> {
+    if !execution_is_idle(tx, user, session).await? {
+        return Err("session memory finalization waits for execution settlement".into());
+    }
+    Ok(())
+}
+
+async fn execution_is_idle(
+    tx: &mut Transaction<'_, MySql>,
+    user: &str,
+    session: &str,
+) -> Result<bool, String> {
     let slots: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
     )
@@ -465,10 +476,7 @@ async fn ensure_idle(
     .fetch_one(&mut **tx)
     .await
     .map_err(|error| error.to_string())?;
-    if slots != 0 {
-        return Err("session memory finalization waits for execution settlement".into());
-    }
-    Ok(())
+    Ok(slots == 0)
 }
 
 async fn ensure_work_row(
@@ -496,7 +504,13 @@ pub(crate) async fn request_finalization_tx(
     let Json(mut work) = sqlx::query_scalar::<_, Json<SessionMemoryWork>>("SELECT state_json FROM agent_session_memory_work WHERE user_id = ? AND session_id = ? FOR UPDATE")
         .bind(user).bind(session).fetch_one(&mut **tx).await.map_err(|error| error.to_string())?;
     work.canonical_turn = canonical_turn_tx(tx, user, session).await?;
-    if work.canonical_turn > work.completed_turn.unwrap_or(0) {
+    // An admitted turn may not have published its memory request or canonical
+    // watermark yet. The shared fence stops new admission, but cannot erase
+    // that existing execution debt. Invalidate the prior exit completion so
+    // its late handoff (or canonical recovery after restart) remains runnable.
+    if work.canonical_turn > work.completed_turn.unwrap_or(0)
+        || !execution_is_idle(tx, user, session).await?
+    {
         work.reset_plan();
     }
     work.finalize_requested = true;

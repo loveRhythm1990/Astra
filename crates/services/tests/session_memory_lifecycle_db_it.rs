@@ -6,6 +6,7 @@ use astra_services::{
 };
 use serde_json::json;
 use std::sync::Arc;
+mod common;
 #[path = "common/isolated_database.rs"]
 mod isolated_database;
 
@@ -243,8 +244,7 @@ async fn commit_canonical_turns(
         SessionContextCoordinator,
     };
     use astra_turn_types::{
-        ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
-        CanonicalDeltaModeV1, CanonicalTurnDeltaV1, SessionKeyV1, SessionSurfaceV1,
+        ActorContextV1, ActorKindV1, AuthorityEpochsV1, SessionKeyV1, SessionSurfaceV1,
     };
     let coordinator = DatabaseSessionContextCoordinator::new(pool);
     let key = SessionKeyV1::owner_session("server", user, session, "main");
@@ -276,19 +276,7 @@ async fn commit_canonical_turns(
         coordinator
             .commit_turn(
                 &reservation,
-                CanonicalTurnDeltaV1 {
-                    schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
-                    completed_turn: turn,
-                    journal_event_seq: u64::from(turn),
-                    conversation_seq: u64::from(turn),
-                    compaction_generation: 0,
-                    config_version_id: None,
-                    mode: CanonicalDeltaModeV1::Append,
-                    logical_segments: vec![vec![
-                        json!({"role":"user","content":format!("canonical-turn-{turn}")}),
-                        json!({"role":"assistant","content":"durable reply"}),
-                    ]],
-                },
+                canonical_delta(turn),
                 &format!("commit-{turn}"),
             )
             .await
@@ -436,4 +424,267 @@ async fn large_json_journal_survives_close_status_claim_and_recovery_reads() {
         2
     );
     restarted.release(&claim, true).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn close_during_resumed_turn_recovers_after_prior_exit_finalization() {
+    use astra_services::{
+        AcquireWriterAndReserveTurnOutcome, SessionContextCoordinator,
+        runs::{DatabaseRunStateStore, RunStateStore},
+    };
+    use astra_turn_types::{
+        ActorContextV1, ActorKindV1, AuthorityEpochsV1, SessionKeyV1, SessionSurfaceV1,
+    };
+    // Exercise both the normal late publication and a missed handoff recovered
+    // exclusively from canonical context after execution settlement/restart.
+    for missed_handoff in [false, true] {
+        let (pool, settings, user, session) = setup().await;
+        let coordinator = commit_canonical_turns(pool.clone(), &user, &session, 1).await;
+        let store = SessionMemoryLifecycleStore::new(pool.clone());
+        store
+            .publish(
+                &user,
+                &session,
+                json!({"session_facts":{"turn":1}}),
+                "generation-1".into(),
+            )
+            .await
+            .unwrap();
+        store.request_extraction(&user, &session).await.unwrap();
+        let extraction = store.claim(&user, &session).await.unwrap().unwrap();
+        store.finish_extraction(&extraction, true, 1).await.unwrap();
+        store.request_finalization(&user, &session).await.unwrap();
+        complete_finalization(&store, &user, &session, 1).await;
+        assert_eq!(
+            store.status(&user, &session).await.unwrap()["pending"],
+            false
+        );
+
+        // Admit through the actual Run store: a resumable Session remains
+        // active after CLI-exit maintenance and acquires its execution slot.
+        let runs = DatabaseRunStateStore::new(pool.clone());
+        let run = common::collaborator_fixture::record(&user, &session, None);
+        let run_id = run.run_id.clone();
+        runs.insert_run(run).await.unwrap();
+        let key = SessionKeyV1::owner_session("server", &user, &session, "main");
+        let actor = ActorContextV1::owner_user(
+            &user,
+            "memory-close-race",
+            ActorKindV1::Server,
+            SessionSurfaceV1::Server,
+            None,
+            AuthorityEpochsV1::default(),
+        );
+        let head = coordinator.load_head(&key).await.unwrap().unwrap();
+        let ready = coordinator
+            .acquire_writer_and_reserve_turn(
+                &key,
+                Some(&head.cursor),
+                &actor,
+                std::time::Duration::from_secs(30),
+                "follow-up-writer",
+                "follow-up-reservation",
+                None,
+            )
+            .await
+            .unwrap();
+        let AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } = ready else {
+            panic!("follow-up admission must succeed: {ready:?}")
+        };
+        let sessions = DatabaseSessionService::new(settings).with_pool(pool.clone());
+        close_owned_session(&sessions, &user, &session).await;
+        let status = store.status(&user, &session).await.unwrap();
+        assert_eq!(status["completed_turn"], 1);
+        assert_eq!(
+            status["pending"], true,
+            "close must retain admitted execution debt"
+        );
+        assert_eq!(status["consolidation_complete"], false);
+        assert_eq!(status["optional_complete"], false);
+        // Early worker discovery cannot authorize stale-generation cleanup.
+        let early = store.claim(&user, &session).await.unwrap().unwrap();
+        assert!(
+            store
+                .with_fenced_state(&user, &session, Some(&early.token), true, |_| Box::pin(
+                    async { Ok(()) }
+                ))
+                .await
+                .is_err()
+        );
+        store.release(&early, true).await.unwrap();
+        close_owned_session(&sessions, &user, &session).await;
+        if !missed_handoff {
+            store
+                .publish(
+                    &user,
+                    &session,
+                    json!({"session_facts":{"turn":2}}),
+                    "generation-2".into(),
+                )
+                .await
+                .unwrap();
+            store.request_extraction(&user, &session).await.unwrap();
+        }
+        coordinator
+            .commit_turn(&reservation, canonical_delta(2), "follow-up-commit")
+            .await
+            .unwrap();
+        coordinator.release_writer(&lease).await.unwrap();
+        assert!(
+            runs.update_run_status_with_events_if_current(
+                &user,
+                &session,
+                &run_id,
+                &["running"],
+                None,
+                "completed",
+                None,
+                None,
+                &[]
+            )
+            .await
+            .unwrap()
+        );
+
+        let restarted = SessionMemoryLifecycleStore::new(pool.clone());
+        assert!(
+            restarted
+                .list_due(64)
+                .await
+                .unwrap()
+                .contains(&(user.clone(), session.clone()))
+        );
+        let claim = restarted.claim(&user, &session).await.unwrap().unwrap();
+        if missed_handoff {
+            let head = restarted
+                .missing_input_head(&user, &session)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(head.cursor.completed_turn, 2);
+            let input = coordinator.materialize(&head).await.unwrap();
+            assert!(
+                input
+                    .messages
+                    .iter()
+                    .any(|message| message["content"] == "canonical-turn-2")
+            );
+            restarted
+                .publish_recovery(
+                    &claim,
+                    json!({"session_facts":{"turn":2},"messages":input.messages}),
+                    "generation-2".into(),
+                    2,
+                )
+                .await
+                .unwrap();
+        }
+        let recovered = restarted.load_claim_work(&claim).await.unwrap();
+        assert!(recovered.finalize_requested);
+        assert_eq!(
+            recovered.active_fingerprint.as_deref(),
+            Some("generation-2")
+        );
+        restarted.finish_extraction(&claim, true, 2).await.unwrap();
+        complete_finalization(&restarted, &user, &session, 2).await;
+        for _ in 0..2 {
+            close_owned_session(&sessions, &user, &session).await;
+            assert_eq!(
+                restarted.status(&user, &session).await.unwrap()["pending"],
+                false
+            );
+            assert!(restarted.claim(&user, &session).await.unwrap().is_none());
+        }
+        assert!(
+            !restarted
+                .list_due(64)
+                .await
+                .unwrap()
+                .contains(&(user.clone(), session.clone()))
+        );
+        let complete: sqlx::types::Json<
+            astra_services::session_memory_lifecycle::SessionMemoryWork,
+        > = sqlx::query_scalar(
+            "SELECT state_json FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user)
+        .bind(&session)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            complete.0.receipts.get("episode").map(String::as_str),
+            Some("receipt-turn-2")
+        );
+        assert!(
+            restarted
+                .publish(
+                    &user,
+                    &session,
+                    json!({"session_facts":{"turn":3}}),
+                    "generation-3".into()
+                )
+                .await
+                .is_err()
+        );
+    }
+}
+
+async fn close_owned_session(sessions: &DatabaseSessionService, user: &str, session: &str) {
+    sessions
+        .update_session(
+            session.into(),
+            user.into(),
+            SessionUpdateRequestData {
+                title: None,
+                metadata: None,
+                metadata_patch: None,
+                status: Some("closed".into()),
+            },
+        )
+        .await
+        .unwrap();
+}
+
+async fn complete_finalization(
+    store: &SessionMemoryLifecycleStore,
+    user: &str,
+    session: &str,
+    turn: u32,
+) {
+    // Service-layer checkpoint: remote episode/scene behavior is covered by the
+    // existing runtime loopback tests; this test owns the durable close race.
+    let claim = store.claim(user, session).await.unwrap().unwrap();
+    store
+        .with_fenced_state(user, session, Some(&claim.token), true, move |work| {
+            Box::pin(async move {
+                assert_eq!(work.completed_turn, Some(turn));
+                assert!(!work.extraction_pending());
+                work.consolidation_complete = true;
+                work.optional_complete = true;
+                work.receipts
+                    .insert("episode".into(), format!("receipt-turn-{turn}"));
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    store.release(&claim, true).await.unwrap();
+}
+
+fn canonical_delta(turn: u32) -> astra_turn_types::CanonicalTurnDeltaV1 {
+    astra_turn_types::CanonicalTurnDeltaV1 {
+        schema_version: astra_turn_types::CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+        completed_turn: turn,
+        journal_event_seq: u64::from(turn),
+        conversation_seq: u64::from(turn),
+        compaction_generation: 0,
+        config_version_id: None,
+        mode: astra_turn_types::CanonicalDeltaModeV1::Append,
+        logical_segments: vec![vec![
+            json!({"role":"user","content":format!("canonical-turn-{turn}")}),
+            json!({"role":"assistant","content":"durable reply"}),
+        ]],
+    }
 }
