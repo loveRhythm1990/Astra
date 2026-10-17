@@ -186,9 +186,18 @@ under the default device-state directory, keyed by the canonical checkout path.
 Isolated cache roots mirror that identity and reject conflicting values; they
 cannot create a second identity owner. Unix mount device/inode metadata may seed
 a first registration, but a changed mount number must not invalidate an already
-published identity. A bounded `.checkout` sidecar records a device/path/inode
-fingerprint without the volatile mount number. On Unix, a later inode change
-rejects directory replacement at the same path instead of reusing the old ID;
+published identity. A bounded `.checkout` sidecar records a
+device/path/filesystem-UUID/inode fingerprint without the volatile mount number.
+The filesystem UUID comes from macOS `ATTR_VOL_UUID` or Linux
+`FS_IOC_GETFSUUID`, read through the same open directory as its inode. A changed
+volume is rejected even when its root happens to have the same inode number.
+`st_dev`, mount IDs and `statfs.f_fsid` are not substitutes for this UUID:
+they can depend on mount allocation. Kernels/filesystems that cannot expose a
+nonzero UUID fail explicitly without adopting the existing ID or overwriting
+state; Linux requires support for `FS_IOC_GETFSUUID`. Filesystem clones retaining
+the same UUID and inode are outside this discriminator's guarantees.
+On Unix, a later inode change
+also rejects directory replacement at the same path instead of reusing the old ID;
 it requires explicit identity recovery/re-registration. Legacy `.id` files have
 no inode witness: their first upgraded start binds the current directory, so a
 replacement before that migration cannot be detected. Non-Unix binding checks
@@ -201,6 +210,19 @@ isolated cache is not adopted when the default-state owner is absent; the cache
 is left unchanged and requires explicit recovery. This does not change
 authenticated provider binding, repository attestation, or executor-local
 workspace coordination.
+
+For an **intentional checkout replacement**, stop all Astra/astra-edge processes
+using that checkout. Back up and remove only its canonical
+`edge-materializations/<canonical-path-hash>.id` **and the matching `.checkout`**
+under the default device-state root, together with that checkout's older path
+alias and isolated-cache `.id` mirrors. Removing `.id` alone does not reset the
+checkout guard. Register the replacement checkout again; do not treat this as
+permission to resume the previous checkout's Session/provider binding. Keep
+`device.id`, login credentials and unrelated checkout state. For a conflicting
+isolated cache/alias only, back up/remove only that conflicting mirror, retaining
+the canonical `.id` and `.checkout`. No automatic deletion or identity repair is
+performed. A missing/unsupported filesystem UUID needs an OS/filesystem fix,
+not identity-file deletion.
 
 Client URLs and normal user-facing controls identify Work and branch. Session
 and Run ids remain available in diagnostics and repair surfaces, not as the

@@ -33,16 +33,14 @@ fn persisted_identity_survives_a_filesystem_device_number_change() {
     )
     .unwrap();
     let legacy_bytes = format!("{legacy}\n").into_bytes();
+    // Publish the current volume/inode witness through the real owner, then
+    // restore only the historical ID. The mount number differs in its seed,
+    // not in the independent filesystem UUID.
+    load_or_create_materialization_id_in_roots(&workspace, device.path(), device.path()).unwrap();
     fs::write(&canonical_path, &legacy_bytes).unwrap();
     // An already published witness must also survive the mount-number change.
-    let mut binding_bytes = device_id.as_bytes().to_vec();
-    binding_bytes.push(0);
-    binding_bytes.extend_from_slice(workspace.to_string_lossy().as_bytes());
-    binding_bytes.push(0);
-    binding_bytes.extend_from_slice(&metadata.ino().to_le_bytes());
-    let binding = format!("checkout-{:x}", Sha256::digest(binding_bytes));
     let binding_path = canonical_path.with_extension("checkout");
-    fs::write(&binding_path, &binding).unwrap();
+    let binding = fs::read_to_string(&binding_path).unwrap();
 
     // CLI/default state and standalone Edge/isolated state use the same owner.
     assert_eq!(
@@ -78,6 +76,8 @@ fn an_isolated_cache_cannot_replace_the_canonical_identity() {
     let error = load_or_create_materialization_id_in_roots(&workspace, cache.path(), device.path())
         .unwrap_err();
     assert!(error.contains("does not match its canonical identity"));
+    assert!(error.contains("cache is not the identity owner"));
+    assert!(error.contains("only this conflicting cache .id"));
     assert_eq!(
         fs::read_to_string(materialization_id_path_in_state(&workspace, device.path())).unwrap(),
         canonical
@@ -100,11 +100,9 @@ fn a_legacy_cache_without_a_canonical_owner_is_not_adopted() {
     fs::write(&mirror, legacy_bytes).unwrap();
     assert!(!materialization_id_path_in_state(&workspace, device.path()).exists());
 
-    assert!(
-        load_or_create_materialization_id_in_roots(&workspace, cache.path(), device.path())
-            .unwrap_err()
-            .contains("does not match its canonical identity")
-    );
+    let error = load_or_create_materialization_id_in_roots(&workspace, cache.path(), device.path())
+        .unwrap_err();
+    assert!(error.contains("cache is not the identity owner and will not be adopted"));
     assert_eq!(fs::read(mirror).unwrap(), legacy_bytes);
 }
 
@@ -138,16 +136,82 @@ fn a_replacement_directory_at_the_same_path_cannot_reuse_the_identity() {
         fs::rename(&workspace, parent.path().join("previous-checkout")).unwrap();
         fs::create_dir(&workspace).unwrap();
         assert_ne!(workspace.metadata().unwrap().ino(), original_inode);
-        assert!(
+        let error =
             load_or_create_materialization_id_in_roots(&workspace, cache.path(), device.path())
-                .is_err()
+                .unwrap_err();
+        assert!(error.contains("differs from its saved binding"));
+        assert!(error.contains(&canonical_path.display().to_string()));
+        assert!(
+            error.contains(
+                &canonical_path
+                    .with_extension("checkout")
+                    .display()
+                    .to_string()
+            )
         );
-        assert_eq!(fs::read(canonical_path).unwrap(), original_bytes);
+        assert!(error.contains("Keep device.id and login credentials"));
+        assert_eq!(fs::read(&canonical_path).unwrap(), original_bytes);
         assert_eq!(
             fs::read_to_string(materialization_id_path_in_state(&workspace, cache.path())).unwrap(),
             original
         );
+
+        // Removing just .id is insufficient. The witness must remain a guard
+        // until the user explicitly resets both checkout-scoped owner files.
+        fs::remove_file(&canonical_path).unwrap();
+        assert!(
+            load_or_create_materialization_id_in_roots(&workspace, cache.path(), device.path())
+                .is_err()
+        );
+        assert!(!canonical_path.exists());
+        fs::remove_file(canonical_path.with_extension("checkout")).unwrap();
+        fs::remove_file(materialization_id_path_in_state(&workspace, cache.path())).unwrap();
+        let replacement =
+            load_or_create_materialization_id_in_roots(&workspace, cache.path(), device.path())
+                .unwrap();
+        assert_ne!(replacement, original);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_different_volume_with_the_same_inode_cannot_reuse_the_identity() {
+    use std::os::unix::fs::MetadataExt;
+
+    let device = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    let original =
+        load_or_create_materialization_id_in_roots(&workspace, cache.path(), device.path())
+            .unwrap();
+    let canonical_path = materialization_id_path_in_state(&workspace, device.path());
+    let binding_path = canonical_path.with_extension("checkout");
+    let current_binding = fs::read_to_string(&binding_path).unwrap();
+    let device_id = fs::read_to_string(canonical_path.parent().unwrap().join("device.id")).unwrap();
+    // Synthetic prior persisted snapshot: same device, canonical path and inode,
+    // but a distinct filesystem UUID. No mount or real user state is changed.
+    let prior_binding = [1_u8, 2]
+        .into_iter()
+        .map(|byte| {
+            let mut binding = Sha256::new();
+            binding.update(device_id.as_bytes());
+            binding.update([0]);
+            binding.update(workspace.to_string_lossy().as_bytes());
+            binding.update([0]);
+            binding.update([byte; 16]);
+            binding.update([0]);
+            binding.update(workspace.metadata().unwrap().ino().to_le_bytes());
+            format!("checkout-{:x}", binding.finalize())
+        })
+        .find(|binding| binding != &current_binding)
+        .unwrap();
+    fs::write(&binding_path, &prior_binding).unwrap();
+    let error = load_or_create_materialization_id_in_roots(&workspace, cache.path(), device.path())
+        .unwrap_err();
+    assert!(error.contains("differs from its saved binding"));
+    assert_eq!(fs::read_to_string(binding_path).unwrap(), prior_binding);
+    assert_eq!(fs::read_to_string(canonical_path).unwrap(), original);
 }
 
 #[test]

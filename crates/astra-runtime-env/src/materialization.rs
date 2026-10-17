@@ -9,6 +9,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+mod volume;
+
 fn canonical_workspace_dir(workspace_dir: &Path) -> Result<PathBuf, String> {
     workspace_dir.canonicalize().map_err(|error| {
         format!(
@@ -47,7 +50,7 @@ fn device_identity_path(state_root: &Path) -> PathBuf {
 /// to bind a cached identity to an independently persisted physical identity.
 fn load_or_create_identity_file(
     path: &Path,
-    expected: Option<&str>,
+    expected: Option<(&str, &str)>,
     create_value: impl Fn() -> String,
     description: &str,
 ) -> Result<String, String> {
@@ -81,9 +84,11 @@ fn load_or_create_identity_file(
                 if !crate::is_valid_provider_id(value) {
                     return Err(format!("{description} '{}' is invalid", path.display()));
                 }
-                if expected.is_some_and(|expected| expected != value) {
+                if let Some((expected, hint)) = expected
+                    && expected != value
+                {
                     return Err(format!(
-                        "{description} '{}' does not match its canonical identity",
+                        "{description} '{}' does not match its canonical identity. {hint}",
                         path.display()
                     ));
                 }
@@ -100,7 +105,7 @@ fn load_or_create_identity_file(
                         .unwrap_or("identity"),
                     uuid::Uuid::new_v4()
                 ));
-                let value = expected.map_or_else(&create_value, ToOwned::to_owned);
+                let value = expected.map_or_else(&create_value, |(value, _)| value.to_owned());
                 let publish = (|| -> Result<bool, String> {
                     let mut file = OpenOptions::new()
                         .write(true)
@@ -194,21 +199,40 @@ fn load_or_create_device_identity(state_root: &Path) -> Result<String, String> {
     )
 }
 
+#[cfg(unix)]
+fn checkout_binding(identity: &[u8], filesystem_uuid: &[u8], inode: u64) -> String {
+    let mut binding = Sha256::new();
+    binding.update(identity);
+    binding.update([0]);
+    binding.update(filesystem_uuid);
+    binding.update([0]);
+    binding.update(inode.to_le_bytes());
+    format!("checkout-{:x}", binding.finalize())
+}
+
 /// Seed a new checkout identity from the device and canonical directory. The
 /// Unix device/inode values seed the ID only. The separate checkout binding
-/// excludes the volatile mount number but retains the inode, so replacing a
-/// registered directory cannot silently inherit its predecessor's identity.
+/// excludes the volatile mount number but retains the filesystem UUID and
+/// inode, so a different volume with the same inode cannot inherit the ID.
 fn materialization_identity_for_workspace(
     workspace_dir: &Path,
     device_id: &str,
 ) -> Result<(String, String), String> {
     let workspace = canonical_workspace_dir(workspace_dir)?;
-    let metadata = fs::metadata(&workspace).map_err(|error| {
+    #[cfg(unix)]
+    let directory = fs::File::open(&workspace).map_err(|error| {
         format!(
             "failed to inspect canonical workspace directory '{}': {error}",
             workspace.display()
         )
     })?;
+    #[cfg(unix)]
+    let metadata = directory
+        .metadata()
+        .map_err(|error| format!("failed to inspect open workspace directory: {error}"))?;
+    #[cfg(not(unix))]
+    let metadata = fs::metadata(&workspace)
+        .map_err(|error| format!("failed to inspect workspace directory: {error}"))?;
     if !metadata.is_dir() {
         return Err(format!(
             "canonical workspace path '{}' is not a directory",
@@ -218,25 +242,32 @@ fn materialization_identity_for_workspace(
     let mut identity = device_id.as_bytes().to_vec();
     identity.push(0);
     identity.extend_from_slice(workspace.to_string_lossy().as_bytes());
-    let mut checkout_binding = Sha256::new();
-    checkout_binding.update(&identity);
     #[cfg(unix)]
-    {
+    let binding = {
         use std::os::unix::fs::MetadataExt;
 
+        let volume = volume::filesystem_uuid(&directory).map_err(|error| {
+            format!(
+                "Cannot establish a stable filesystem identity for workspace '{}': {error}. \
+                 Use a filesystem and OS that expose a filesystem UUID \
+                 (macOS ATTR_VOL_UUID or Linux FS_IOC_GETFSUUID); \
+                 no existing identity files were replaced.",
+                workspace.display()
+            )
+        })?;
+        let binding = checkout_binding(&identity, &volume, metadata.ino());
         identity.push(0);
         identity.extend_from_slice(&metadata.dev().to_le_bytes());
         identity.push(0);
         identity.extend_from_slice(&metadata.ino().to_le_bytes());
-        checkout_binding.update([0]);
-        checkout_binding.update(metadata.ino().to_le_bytes());
-    }
+        identity.push(0);
+        identity.extend_from_slice(&volume);
+        binding
+    };
+    #[cfg(not(unix))]
+    let binding = format!("checkout-{:x}", Sha256::digest(&identity));
     let digest = Sha256::digest(identity);
-    let binding = checkout_binding.finalize();
-    Ok((
-        format!("materialization-{digest:x}"),
-        format!("checkout-{binding:x}"),
-    ))
+    Ok((format!("materialization-{digest:x}"), binding))
 }
 
 pub fn load_or_create_materialization_id(workspace_dir: &Path) -> Result<String, String> {
@@ -279,13 +310,23 @@ pub fn load_or_create_materialization_id_in_roots(
     } else {
         None
     };
-    // Legacy .id files have no inode witness: their first upgraded start binds
+    // Legacy .id files have no checkout witness: their first upgraded start binds
     // the current directory. Publish that witness before a new owner, using
     // the same bounded, atomic no-replace storage. Later inode changes fail
     // closed without modifying the existing ID or any cache mirror.
     load_or_create_identity_file(
         &canonical_path.with_extension("checkout"),
-        Some(&checkout_binding),
+        Some((
+            &checkout_binding,
+            &format!(
+                "The checkout, filesystem, or local device identity differs from its saved binding. \
+                 If you intentionally replaced this checkout, stop its Astra/astra-edge processes, \
+                 back up and remove only '{}' and '{}', plus this checkout's alias/cache .id mirrors, \
+                 then register it again. Keep device.id and login credentials.",
+                canonical_path.display(),
+                canonical_path.with_extension("checkout").display()
+            ),
+        )),
         || checkout_binding.clone(),
         "workspace checkout binding",
     )?;
@@ -298,7 +339,12 @@ pub fn load_or_create_materialization_id_in_roots(
     if previous_id.is_some() {
         load_or_create_identity_file(
             &previous_path,
-            Some(&canonical_id),
+            Some((
+                &canonical_id,
+                "This path alias conflicts with the default-state owner. Stop its Astra/astra-edge \
+                 processes and back up/remove only the conflicting alias .id file before retrying; \
+                 keep the canonical .id/.checkout, device.id and login credentials.",
+            )),
             || canonical_id.clone(),
             "workspace materialization identity",
         )?;
@@ -307,7 +353,12 @@ pub fn load_or_create_materialization_id_in_roots(
     // A conflicting mirror still fails closed and is never overwritten.
     load_or_create_identity_file(
         &materialization_id_path_in_state(workspace_dir, cache_root),
-        Some(&canonical_id),
+        Some((
+            &canonical_id,
+            "This cache is not the identity owner and will not be adopted. Stop its Astra/astra-edge \
+             processes and back up/remove only this conflicting cache .id file before retrying; \
+             keep the default-state .id/.checkout, device.id and login credentials.",
+        )),
         || canonical_id.clone(),
         "workspace materialization identity",
     )
@@ -316,6 +367,16 @@ pub fn load_or_create_materialization_id_in_roots(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_binding_distinguishes_volumes_with_the_same_inode() {
+        let prefix = b"device-fixture\0/canonical/checkout";
+        let first = checkout_binding(prefix, &[1; 16], 2);
+        assert_eq!(first, checkout_binding(prefix, &[1; 16], 2));
+        assert_ne!(first, checkout_binding(prefix, &[2; 16], 2));
+        assert_ne!(first, checkout_binding(prefix, &[1; 16], 3));
+    }
 
     #[test]
     fn identity_is_stable_across_cache_roots_and_distinct_per_checkout() {
