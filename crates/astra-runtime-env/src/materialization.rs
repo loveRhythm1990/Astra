@@ -194,12 +194,10 @@ fn load_or_create_device_identity(state_root: &Path) -> Result<String, String> {
     )
 }
 
-/// Derive one checkout identity from a stable device identity and the
-/// canonical directory. On Unix, filesystem device/inode values additionally
-/// distinguish separate mounts that expose the same path. The persisted state
-/// file is a cache of this value, so changing the cache root cannot split one
-/// checkout into multiple claims and changing directory contents cannot alter
-/// it.
+/// Seed a new checkout identity from the device and canonical directory. The
+/// Unix device/inode values distinguish mounts when first registered; they are
+/// not persistent validators, because a mount number can change after reboot.
+/// Once published, the canonical identity file owns continuity across starts.
 fn materialization_identity_for_workspace(
     workspace_dir: &Path,
     device_id: &str,
@@ -246,11 +244,53 @@ pub fn load_or_create_materialization_id_in_roots(
     device_root: &Path,
 ) -> Result<String, String> {
     let device_id = load_or_create_device_identity(device_root)?;
-    let expected = materialization_identity_for_workspace(workspace_dir, &device_id)?;
+    let workspace = canonical_workspace_dir(workspace_dir)?;
+    let canonical_path = materialization_id_path_in_state(&workspace, device_root);
+    let previous_path = materialization_id_path_in_state(workspace_dir, device_root);
+    let seed = materialization_identity_for_workspace(&workspace, &device_id)?;
+    // Older clients keyed their default-state file by the caller's path, even
+    // though the ID used its canonical root. Preserve that published value
+    // when first resolving an alias into the canonical default-state owner.
+    let previous_exists = previous_path != canonical_path
+        && match fs::symlink_metadata(&previous_path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect workspace materialization identity: {error}"
+                ));
+            }
+        };
+    let previous_id = if previous_exists {
+        Some(load_or_create_identity_file(
+            &previous_path,
+            None,
+            || seed.clone(),
+            "workspace materialization identity",
+        )?)
+    } else {
+        None
+    };
+    let canonical_id = load_or_create_identity_file(
+        &canonical_path,
+        None,
+        || previous_id.as_ref().unwrap_or(&seed).clone(),
+        "workspace materialization identity",
+    )?;
+    if previous_id.is_some() {
+        load_or_create_identity_file(
+            &previous_path,
+            Some(&canonical_id),
+            || canonical_id.clone(),
+            "workspace materialization identity",
+        )?;
+    }
+    // Isolated state roots contain mirrors, not independent identity owners.
+    // A conflicting mirror still fails closed and is never overwritten.
     load_or_create_identity_file(
         &materialization_id_path_in_state(workspace_dir, cache_root),
-        Some(&expected),
-        || expected.clone(),
+        Some(&canonical_id),
+        || canonical_id.clone(),
         "workspace materialization identity",
     )
 }
