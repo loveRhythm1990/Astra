@@ -32,7 +32,17 @@ fn persisted_identity_survives_a_filesystem_device_number_change() {
         device_id,
     )
     .unwrap();
-    fs::write(&canonical_path, &legacy).unwrap();
+    let legacy_bytes = format!("{legacy}\n").into_bytes();
+    fs::write(&canonical_path, &legacy_bytes).unwrap();
+    // An already published witness must also survive the mount-number change.
+    let mut binding_bytes = device_id.as_bytes().to_vec();
+    binding_bytes.push(0);
+    binding_bytes.extend_from_slice(workspace.to_string_lossy().as_bytes());
+    binding_bytes.push(0);
+    binding_bytes.extend_from_slice(&metadata.ino().to_le_bytes());
+    let binding = format!("checkout-{:x}", Sha256::digest(binding_bytes));
+    let binding_path = canonical_path.with_extension("checkout");
+    fs::write(&binding_path, &binding).unwrap();
 
     // CLI/default state and standalone Edge/isolated state use the same owner.
     assert_eq!(
@@ -45,7 +55,8 @@ fn persisted_identity_survives_a_filesystem_device_number_change() {
             .unwrap(),
         legacy
     );
-    assert_eq!(fs::read_to_string(canonical_path).unwrap(), legacy);
+    assert_eq!(fs::read(canonical_path).unwrap(), legacy_bytes);
+    assert_eq!(fs::read_to_string(binding_path).unwrap(), binding);
     assert_eq!(
         fs::read_to_string(materialization_id_path_in_state(&workspace, cache.path())).unwrap(),
         legacy
@@ -78,6 +89,68 @@ fn an_isolated_cache_cannot_replace_the_canonical_identity() {
 }
 
 #[test]
+fn a_legacy_cache_without_a_canonical_owner_is_not_adopted() {
+    let device = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    let mirror = materialization_id_path_in_state(&workspace, cache.path());
+    fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+    let legacy_bytes = b"materialization-legacy-cache-only\n";
+    fs::write(&mirror, legacy_bytes).unwrap();
+    assert!(!materialization_id_path_in_state(&workspace, device.path()).exists());
+
+    assert!(
+        load_or_create_materialization_id_in_roots(&workspace, cache.path(), device.path())
+            .unwrap_err()
+            .contains("does not match its canonical identity")
+    );
+    assert_eq!(fs::read(mirror).unwrap(), legacy_bytes);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_replacement_directory_at_the_same_path_cannot_reuse_the_identity() {
+    use std::os::unix::fs::MetadataExt;
+
+    for legacy in [None, Some("materialization-migrated-checkout\n")] {
+        let device = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("checkout");
+        fs::create_dir(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let original_inode = workspace.metadata().unwrap().ino();
+        let canonical_path = materialization_id_path_in_state(&workspace, device.path());
+        if let Some(legacy) = legacy {
+            fs::create_dir_all(canonical_path.parent().unwrap()).unwrap();
+            fs::write(&canonical_path, legacy).unwrap();
+        }
+        let original =
+            load_or_create_materialization_id_in_roots(&workspace, cache.path(), device.path())
+                .unwrap();
+        let original_bytes = fs::read(&canonical_path).unwrap();
+        if let Some(legacy) = legacy {
+            assert_eq!(original_bytes, legacy.as_bytes());
+        }
+
+        // Keep the original directory alive so inode reuse cannot hide replacement.
+        fs::rename(&workspace, parent.path().join("previous-checkout")).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        assert_ne!(workspace.metadata().unwrap().ino(), original_inode);
+        assert!(
+            load_or_create_materialization_id_in_roots(&workspace, cache.path(), device.path())
+                .is_err()
+        );
+        assert_eq!(fs::read(canonical_path).unwrap(), original_bytes);
+        assert_eq!(
+            fs::read_to_string(materialization_id_path_in_state(&workspace, cache.path())).unwrap(),
+            original
+        );
+    }
+}
+
+#[test]
 fn malformed_canonical_identity_is_not_replaced() {
     let device = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
@@ -93,6 +166,74 @@ fn malformed_canonical_identity_is_not_replaced() {
         );
         assert_eq!(fs::read_to_string(&canonical_path).unwrap(), invalid);
     }
+}
+
+#[test]
+fn malformed_checkout_binding_is_not_replaced() {
+    let device = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    let original =
+        load_or_create_materialization_id_in_roots(&workspace, device.path(), device.path())
+            .unwrap();
+    let canonical_path = materialization_id_path_in_state(&workspace, device.path());
+    let binding_path = canonical_path.with_extension("checkout");
+    for invalid in ["invalid binding", &"a".repeat(129), "checkout-conflicting"] {
+        fs::write(&binding_path, invalid).unwrap();
+        assert!(
+            load_or_create_materialization_id_in_roots(&workspace, device.path(), device.path())
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(&binding_path).unwrap(), invalid);
+        assert_eq!(fs::read_to_string(&canonical_path).unwrap(), original);
+    }
+}
+
+#[test]
+fn an_interrupted_owner_publication_can_finish_for_the_same_checkout() {
+    let device = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    let original =
+        load_or_create_materialization_id_in_roots(&workspace, device.path(), device.path())
+            .unwrap();
+    let canonical_path = materialization_id_path_in_state(&workspace, device.path());
+    let binding_path = canonical_path.with_extension("checkout");
+    let binding = fs::read(&binding_path).unwrap();
+    // Model a stop after publishing the witness but before publishing the ID.
+    fs::remove_file(&canonical_path).unwrap();
+    assert_eq!(
+        load_or_create_materialization_id_in_roots(&workspace, device.path(), device.path())
+            .unwrap(),
+        original
+    );
+    assert_eq!(fs::read(binding_path).unwrap(), binding);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_checkout_binding_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let device = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    let canonical_path = materialization_id_path_in_state(&workspace, device.path());
+    fs::create_dir_all(canonical_path.parent().unwrap()).unwrap();
+    let target = device.path().join("binding-target");
+    fs::write(&target, "checkout-do-not-follow").unwrap();
+    let binding_path = canonical_path.with_extension("checkout");
+    symlink(&target, &binding_path).unwrap();
+    assert!(
+        load_or_create_materialization_id_in_roots(&workspace, device.path(), device.path())
+            .unwrap_err()
+            .contains("not a regular bounded file")
+    );
+    assert_eq!(
+        fs::read_to_string(target).unwrap(),
+        "checkout-do-not-follow"
+    );
+    assert!(!canonical_path.exists());
 }
 
 #[cfg(unix)]

@@ -195,13 +195,13 @@ fn load_or_create_device_identity(state_root: &Path) -> Result<String, String> {
 }
 
 /// Seed a new checkout identity from the device and canonical directory. The
-/// Unix device/inode values distinguish mounts when first registered; they are
-/// not persistent validators, because a mount number can change after reboot.
-/// Once published, the canonical identity file owns continuity across starts.
+/// Unix device/inode values seed the ID only. The separate checkout binding
+/// excludes the volatile mount number but retains the inode, so replacing a
+/// registered directory cannot silently inherit its predecessor's identity.
 fn materialization_identity_for_workspace(
     workspace_dir: &Path,
     device_id: &str,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     let workspace = canonical_workspace_dir(workspace_dir)?;
     let metadata = fs::metadata(&workspace).map_err(|error| {
         format!(
@@ -218,6 +218,8 @@ fn materialization_identity_for_workspace(
     let mut identity = device_id.as_bytes().to_vec();
     identity.push(0);
     identity.extend_from_slice(workspace.to_string_lossy().as_bytes());
+    let mut checkout_binding = Sha256::new();
+    checkout_binding.update(&identity);
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -226,9 +228,15 @@ fn materialization_identity_for_workspace(
         identity.extend_from_slice(&metadata.dev().to_le_bytes());
         identity.push(0);
         identity.extend_from_slice(&metadata.ino().to_le_bytes());
+        checkout_binding.update([0]);
+        checkout_binding.update(metadata.ino().to_le_bytes());
     }
     let digest = Sha256::digest(identity);
-    Ok(format!("materialization-{digest:x}"))
+    let binding = checkout_binding.finalize();
+    Ok((
+        format!("materialization-{digest:x}"),
+        format!("checkout-{binding:x}"),
+    ))
 }
 
 pub fn load_or_create_materialization_id(workspace_dir: &Path) -> Result<String, String> {
@@ -247,7 +255,7 @@ pub fn load_or_create_materialization_id_in_roots(
     let workspace = canonical_workspace_dir(workspace_dir)?;
     let canonical_path = materialization_id_path_in_state(&workspace, device_root);
     let previous_path = materialization_id_path_in_state(workspace_dir, device_root);
-    let seed = materialization_identity_for_workspace(&workspace, &device_id)?;
+    let (seed, checkout_binding) = materialization_identity_for_workspace(&workspace, &device_id)?;
     // Older clients keyed their default-state file by the caller's path, even
     // though the ID used its canonical root. Preserve that published value
     // when first resolving an alias into the canonical default-state owner.
@@ -271,6 +279,16 @@ pub fn load_or_create_materialization_id_in_roots(
     } else {
         None
     };
+    // Legacy .id files have no inode witness: their first upgraded start binds
+    // the current directory. Publish that witness before a new owner, using
+    // the same bounded, atomic no-replace storage. Later inode changes fail
+    // closed without modifying the existing ID or any cache mirror.
+    load_or_create_identity_file(
+        &canonical_path.with_extension("checkout"),
+        Some(&checkout_binding),
+        || checkout_binding.clone(),
+        "workspace checkout binding",
+    )?;
     let canonical_id = load_or_create_identity_file(
         &canonical_path,
         None,
