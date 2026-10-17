@@ -6,6 +6,24 @@ pub(super) fn filesystem_uuid(directory: &File) -> io::Result<Vec<u8>> {
     validate_uuid(read_uuid(directory)?)
 }
 
+/// Only an unavailable Linux API permits the original device/inode check.
+/// Invalid UUID data, permission failures and transient I/O errors are not
+/// evidence that the API is unavailable and must keep failing closed.
+pub(super) fn uuid_api_unavailable(error: &io::Error) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::ENOTTY | libc::EOPNOTSUPP | libc::ENOSYS)
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 fn validate_uuid(uuid: Vec<u8>) -> io::Result<Vec<u8>> {
     if uuid.is_empty() || uuid.len() > 16 || uuid.iter().all(|byte| *byte == 0) {
         return Err(io::Error::new(
@@ -67,8 +85,8 @@ fn read_uuid(directory: &File) -> io::Result<Vec<u8>> {
     use std::os::fd::AsRawFd;
 
     // Linux UAPI: FS_IOC_GETFSUUID = _IOR(0x15, 0, struct fsuuid2).
-    // The external UUID is independent of st_dev. Unsupported kernels or
-    // filesystems must fail explicitly, not silently bind by inode alone.
+    // The external UUID is independent of st_dev. An unavailable API is
+    // classified above; its caller must retain strict device AND inode checks.
     #[repr(C)]
     struct FsUuid {
         length: u8,
@@ -114,5 +132,19 @@ mod tests {
         }
         assert_eq!(validate_uuid(vec![1; 16]).unwrap(), vec![1; 16]);
         assert_eq!(validate_uuid(vec![1; 4]).unwrap(), vec![1; 4]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_unavailable_linux_api_errors_allow_legacy_validation() {
+        for errno in [libc::ENOTTY, libc::EOPNOTSUPP, libc::ENOSYS] {
+            assert!(uuid_api_unavailable(&io::Error::from_raw_os_error(errno)));
+        }
+        for errno in [libc::EACCES, libc::EIO, libc::EINTR, libc::EINVAL] {
+            assert!(!uuid_api_unavailable(&io::Error::from_raw_os_error(errno)));
+        }
+        assert!(!uuid_api_unavailable(
+            &validate_uuid(vec![0; 16]).unwrap_err()
+        ));
     }
 }

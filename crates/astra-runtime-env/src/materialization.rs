@@ -210,14 +210,21 @@ fn checkout_binding(identity: &[u8], filesystem_uuid: &[u8], inode: u64) -> Stri
     format!("checkout-{:x}", binding.finalize())
 }
 
-/// Seed a new checkout identity from the device and canonical directory. The
-/// Unix device/inode values seed the ID only. The separate checkout binding
-/// excludes the volatile mount number but retains the filesystem UUID and
-/// inode, so a different volume with the same inode cannot inherit the ID.
+/// Seed a new checkout identity from the device and canonical directory.
+/// With a UUID, device/inode values only seed the ID and the separate binding
+/// excludes the volatile mount number. Without the Linux UUID API, the original
+/// device/inode seed remains the expected value on every start.
+struct CheckoutIdentity {
+    seed: String,
+    // None means the Linux UUID API is unavailable. Keep the original strict
+    // device/inode identity comparison; do not publish an inode-only witness.
+    binding: Option<String>,
+}
+
 fn materialization_identity_for_workspace(
     workspace_dir: &Path,
     device_id: &str,
-) -> Result<(String, String), String> {
+) -> Result<CheckoutIdentity, String> {
     let workspace = canonical_workspace_dir(workspace_dir)?;
     #[cfg(unix)]
     let directory = fs::File::open(&workspace).map_err(|error| {
@@ -246,28 +253,39 @@ fn materialization_identity_for_workspace(
     let binding = {
         use std::os::unix::fs::MetadataExt;
 
-        let volume = volume::filesystem_uuid(&directory).map_err(|error| {
-            format!(
-                "Cannot establish a stable filesystem identity for workspace '{}': {error}. \
+        let volume = match volume::filesystem_uuid(&directory) {
+            Ok(uuid) => Some(uuid),
+            Err(error) if volume::uuid_api_unavailable(&error) => None,
+            Err(error) => {
+                return Err(format!(
+                    "Cannot establish a stable filesystem identity for workspace '{}': {error}. \
                  Use a filesystem and OS that expose a filesystem UUID \
                  (macOS ATTR_VOL_UUID or Linux FS_IOC_GETFSUUID); \
                  no existing identity files were replaced.",
-                workspace.display()
-            )
-        })?;
-        let binding = checkout_binding(&identity, &volume, metadata.ino());
+                    workspace.display()
+                ));
+            }
+        };
+        let binding = volume
+            .as_deref()
+            .map(|uuid| checkout_binding(&identity, uuid, metadata.ino()));
         identity.push(0);
         identity.extend_from_slice(&metadata.dev().to_le_bytes());
         identity.push(0);
         identity.extend_from_slice(&metadata.ino().to_le_bytes());
-        identity.push(0);
-        identity.extend_from_slice(&volume);
+        if let Some(uuid) = volume {
+            identity.push(0);
+            identity.extend_from_slice(&uuid);
+        }
         binding
     };
     #[cfg(not(unix))]
-    let binding = format!("checkout-{:x}", Sha256::digest(&identity));
+    let binding = Some(format!("checkout-{:x}", Sha256::digest(&identity)));
     let digest = Sha256::digest(identity);
-    Ok((format!("materialization-{digest:x}"), binding))
+    Ok(CheckoutIdentity {
+        seed: format!("materialization-{digest:x}"),
+        binding,
+    })
 }
 
 pub fn load_or_create_materialization_id(workspace_dir: &Path) -> Result<String, String> {
@@ -282,11 +300,52 @@ pub fn load_or_create_materialization_id_in_roots(
     cache_root: &Path,
     device_root: &Path,
 ) -> Result<String, String> {
+    load_or_create_materialization_id_with_resolver(
+        workspace_dir,
+        cache_root,
+        device_root,
+        materialization_identity_for_workspace,
+    )
+}
+
+fn load_or_create_materialization_id_with_resolver(
+    workspace_dir: &Path,
+    cache_root: &Path,
+    device_root: &Path,
+    resolve_identity: impl FnOnce(&Path, &str) -> Result<CheckoutIdentity, String>,
+) -> Result<String, String> {
     let device_id = load_or_create_device_identity(device_root)?;
     let workspace = canonical_workspace_dir(workspace_dir)?;
     let canonical_path = materialization_id_path_in_state(&workspace, device_root);
     let previous_path = materialization_id_path_in_state(workspace_dir, device_root);
-    let (seed, checkout_binding) = materialization_identity_for_workspace(&workspace, &device_id)?;
+    let CheckoutIdentity { seed, binding } = resolve_identity(&workspace, &device_id)?;
+    let checkout_path = canonical_path.with_extension("checkout");
+    let legacy_validation = if binding.is_none() {
+        match fs::symlink_metadata(&checkout_path) {
+            Ok(_) => {
+                return Err(format!(
+                    "Cannot verify the saved filesystem UUID binding '{}': the Linux UUID API is \
+                 unavailable. Use an OS/filesystem that supports FS_IOC_GETFSUUID; \
+                 the saved binding was not removed or downgraded. Keep existing identity files.",
+                    checkout_path.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect workspace checkout binding: {error}"
+                ));
+            }
+        }
+        Some((
+            seed.as_str(),
+            "The Linux UUID API is unavailable, so this checkout must still match its original \
+             device and inode. A changed mount or directory cannot be verified. Restore the \
+             original checkout or use a UUID-capable OS/filesystem; do not clear login credentials.",
+        ))
+    } else {
+        None
+    };
     // Older clients keyed their default-state file by the caller's path, even
     // though the ID used its canonical root. Preserve that published value
     // when first resolving an alias into the canonical default-state owner.
@@ -303,36 +362,37 @@ pub fn load_or_create_materialization_id_in_roots(
     let previous_id = if previous_exists {
         Some(load_or_create_identity_file(
             &previous_path,
-            None,
+            legacy_validation,
             || seed.clone(),
             "workspace materialization identity",
         )?)
     } else {
         None
     };
-    // Legacy .id files have no checkout witness: their first upgraded start binds
-    // the current directory. Publish that witness before a new owner, using
-    // the same bounded, atomic no-replace storage. Later inode changes fail
-    // closed without modifying the existing ID or any cache mirror.
-    load_or_create_identity_file(
-        &canonical_path.with_extension("checkout"),
-        Some((
-            &checkout_binding,
-            &format!(
-                "The checkout, filesystem, or local device identity differs from its saved binding. \
+    // With UUID evidence, bind a legacy .id's current checkout before publishing
+    // a new owner. Without it, retain exact legacy validation and do not publish
+    // a weaker inode-only witness. Both paths use the same atomic file owner.
+    if let Some(checkout_binding) = binding {
+        load_or_create_identity_file(
+            &checkout_path,
+            Some((
+                &checkout_binding,
+                &format!(
+                    "The checkout, filesystem, or local device identity differs from its saved binding. \
                  If you intentionally replaced this checkout, stop its Astra/astra-edge processes, \
                  back up and remove only '{}' and '{}', plus this checkout's alias/cache .id mirrors, \
                  then register it again. Keep device.id and login credentials.",
-                canonical_path.display(),
-                canonical_path.with_extension("checkout").display()
-            ),
-        )),
-        || checkout_binding.clone(),
-        "workspace checkout binding",
-    )?;
+                    canonical_path.display(),
+                    canonical_path.with_extension("checkout").display()
+                ),
+            )),
+            || checkout_binding.clone(),
+            "workspace checkout binding",
+        )?;
+    }
     let canonical_id = load_or_create_identity_file(
         &canonical_path,
-        None,
+        legacy_validation,
         || previous_id.as_ref().unwrap_or(&seed).clone(),
         "workspace materialization identity",
     )?;
@@ -367,6 +427,178 @@ pub fn load_or_create_materialization_id_in_roots(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn legacy_checkout_identity(
+        workspace: &Path,
+        device: &str,
+    ) -> Result<CheckoutIdentity, String> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = workspace.metadata().map_err(|error| error.to_string())?;
+        let mut bytes = device.as_bytes().to_vec();
+        bytes.push(0);
+        bytes.extend_from_slice(workspace.to_string_lossy().as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&metadata.dev().to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&metadata.ino().to_le_bytes());
+        Ok(CheckoutIdentity {
+            seed: format!("materialization-{:x}", Sha256::digest(bytes)),
+            binding: None,
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_uuid_api_preserves_unchanged_legacy_identity_bytes() {
+        let device = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let device_id = load_or_create_device_identity(device.path()).unwrap();
+        let legacy = legacy_checkout_identity(&workspace, &device_id)
+            .unwrap()
+            .seed;
+        let owner = materialization_id_path_in_state(&workspace, device.path());
+        let original_bytes = format!("{legacy}\n").into_bytes();
+        fs::write(&owner, &original_bytes).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                load_or_create_materialization_id_with_resolver(
+                    &workspace,
+                    cache.path(),
+                    device.path(),
+                    legacy_checkout_identity,
+                )
+                .unwrap(),
+                legacy
+            );
+            assert_eq!(fs::read(&owner).unwrap(), original_bytes);
+            assert!(!owner.with_extension("checkout").exists());
+        }
+        // Once a UUID becomes available, the same legacy owner can acquire a
+        // stable witness without rotating the ID or rewriting its bytes.
+        assert_eq!(
+            load_or_create_materialization_id_in_roots(&workspace, cache.path(), device.path())
+                .unwrap(),
+            legacy
+        );
+        assert_eq!(fs::read(&owner).unwrap(), original_bytes);
+        assert!(owner.with_extension("checkout").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_uuid_api_can_register_a_new_checkout_without_an_inode_only_witness() {
+        let device = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let first = load_or_create_materialization_id_with_resolver(
+            &workspace,
+            cache.path(),
+            device.path(),
+            legacy_checkout_identity,
+        )
+        .unwrap();
+        assert_eq!(
+            load_or_create_materialization_id_with_resolver(
+                &workspace,
+                cache.path(),
+                device.path(),
+                legacy_checkout_identity,
+            )
+            .unwrap(),
+            first
+        );
+        let owner = materialization_id_path_in_state(&workspace, device.path());
+        assert_eq!(fs::read_to_string(&owner).unwrap(), first);
+        assert!(!owner.with_extension("checkout").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_uuid_api_rejects_changed_device_or_inode_without_rewriting_state() {
+        use std::os::unix::fs::MetadataExt;
+
+        let device = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("checkout");
+        fs::create_dir(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let original = load_or_create_materialization_id_with_resolver(
+            &workspace,
+            cache.path(),
+            device.path(),
+            legacy_checkout_identity,
+        )
+        .unwrap();
+        let owner = materialization_id_path_in_state(&workspace, device.path());
+        // Model a changed mount number with all other facts held fixed.
+        let changed_device = |workspace: &Path, device: &str| {
+            let mut identity = legacy_checkout_identity(workspace, device)?;
+            let metadata = workspace.metadata().unwrap();
+            let mut bytes = device.as_bytes().to_vec();
+            bytes.push(0);
+            bytes.extend_from_slice(workspace.to_string_lossy().as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(&(metadata.dev() ^ 1).to_le_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(&metadata.ino().to_le_bytes());
+            identity.seed = format!("materialization-{:x}", Sha256::digest(bytes));
+            Ok(identity)
+        };
+        let error = load_or_create_materialization_id_with_resolver(
+            &workspace,
+            cache.path(),
+            device.path(),
+            changed_device,
+        )
+        .unwrap_err();
+        assert!(error.contains("must still match its original device and inode"));
+        assert_eq!(fs::read_to_string(&owner).unwrap(), original);
+        let old_inode = workspace.metadata().unwrap().ino();
+        fs::rename(&workspace, parent.path().join("previous-checkout")).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        assert_ne!(workspace.metadata().unwrap().ino(), old_inode);
+        assert!(
+            load_or_create_materialization_id_with_resolver(
+                &workspace,
+                cache.path(),
+                device.path(),
+                legacy_checkout_identity,
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&owner).unwrap(), original);
+        assert!(!owner.with_extension("checkout").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_uuid_api_never_discards_a_published_uuid_witness() {
+        let device = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        load_or_create_materialization_id_in_roots(&workspace, cache.path(), device.path())
+            .unwrap();
+        let owner = materialization_id_path_in_state(&workspace, device.path());
+        let original = fs::read(&owner).unwrap();
+        let witness = fs::read(owner.with_extension("checkout")).unwrap();
+        let error = load_or_create_materialization_id_with_resolver(
+            &workspace,
+            cache.path(),
+            device.path(),
+            legacy_checkout_identity,
+        )
+        .unwrap_err();
+        assert!(error.contains("saved binding was not removed or downgraded"));
+        assert_eq!(fs::read(&owner).unwrap(), original);
+        assert_eq!(fs::read(owner.with_extension("checkout")).unwrap(), witness);
+    }
 
     #[cfg(unix)]
     #[test]
