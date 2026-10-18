@@ -99,6 +99,27 @@ A run may appear stuck because of:
 
 The projection should expose the specific reason and next action.
 
+A safe provider recovery publishes its scheduled attempt before waiting again,
+without inventing task progress or adding an assistant-authored history message.
+When recovery is exhausted, live and replayed interruption projections carry the
+same provider cause, factual completed-call/checkpoint counts and explicit next
+action. A zero-tool recovery does not erase preceding tool evidence. Selecting a
+different model still requires ordinary authorization and admission.
+
+Each `LlmRoundStarted` retains the exact durable invocation identity and logical
+attempt index. It is closed by `LlmRoundCompleted` or typed `LlmRoundFailed`,
+including pre-dispatch rejection, streaming interruption and cancellation. A
+known completed provider response stays completed if its durable receipt later
+fails; that separate settlement failure does not authorize its output. Failure
+traces retain safe kind/stage, actual dispatch facts, latency and qualified usage
+when available. Terminal trace usage is qualified from that invocation's canonical
+attempt facts before emission, including pending receipt settlement. Earlier
+logical continuations contribute to turn totals, not this invocation's trace.
+Missing usage stays unknown. They do not store raw provider
+errors, prompts or reasoning. Capture readers recognize failure events in both
+raw and persisted artifact envelopes. Normal `StepIncomplete` on a tool-round
+yield is not a failed task; final run errors close the actual current step.
+
 ## Stream events
 
 Stream events are transport projections of durable or near-durable facts. They should carry enough information to repair UI state after reconnect.
@@ -124,6 +145,16 @@ again. Live delivery, replay, and size-bounded projections preserve these
 distinctions. A shortened preview is not an authoritative receipt; control
 identities remain exact or are explicitly omitted, never shortened into a
 different identity.
+
+Pure single-edit argument validation and invocation normalization author their
+own no-execution fact before target binding or content reads. Invalid, mixed
+single/batch, and identical replacements retain the original error/recovery
+evidence, with `execution_started=false`, `execution_fact=not_executed` and
+`disposition=rejected` through CLI and server execution, durable terminal
+replay, and canonical callback journal recording. Such rejection does not
+replenish provider recovery. A missing target, failed content match, unchanged workspace or
+`ToolInvalidArgs` kind alone cannot establish that execution never began;
+later failures retain their source-owned facts.
 
 Malformed non-critical stream events should be isolated when possible. Identity or cursor corruption should fail closed with structured error and should not corrupt durable run state.
 

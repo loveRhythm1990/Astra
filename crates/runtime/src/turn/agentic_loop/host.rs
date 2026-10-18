@@ -774,6 +774,10 @@ pub trait AgenticLoopHost: Send {
     /// source of control state.
     fn on_turn_phase(&mut self, _receipt: TurnPhaseReceipt) {}
 
+    /// Observe a bounded recovery reserved by the shared owner, before the
+    /// next provider wait. This is progress evidence, never retry authority.
+    fn on_provider_recovery(&mut self, _state: &AgenticLoopState, _reason: astra_core::ErrorKind) {}
+
     /// Asynchronous hosts publish admission at the background task's boundary.
     fn owns_semantic_admission_timing(&self) -> bool {
         false
@@ -2412,7 +2416,7 @@ pub struct ErrorRecoveryState {
 /// Bounded, run-local adaptations learned from typed provider outcomes.
 ///
 /// These facts retain one-shot request adaptations and whether the loop has
-/// already consumed its bounded action-convergence recovery. Continuation must
+/// already consumed its bounded safe provider recovery. Continuation must
 /// preserve them: resetting the consumed flag would grant recovery again.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2424,10 +2428,10 @@ pub struct ProviderAdaptationState {
     pub output_cap_action_first_pending: bool,
     /// A provider attempt spent its action-progress window on provisional
     /// reasoning without producing visible text or choosing a tool. Exactly
-    /// one logical recovery round may suppress thinking and request action.
-    pub action_convergence_attempted: bool,
-    /// One-shot wire adaptation consumed by the next primary provider call.
-    pub force_next_thinking_off: bool,
+    /// one capability-aware logical recovery may request an actionable response.
+    pub safe_recovery_attempted: bool,
+    /// One-shot recovery reservation consumed at the next primary dispatch.
+    pub safe_recovery_pending: bool,
 }
 
 // ─── Loop state ──────────────────────────────────────────────────────────────
@@ -2871,10 +2875,6 @@ pub enum VolatileKind {
     /// Bounded execution observations and requirements for the next Work
     /// decision. Observational only; settlement admission retains authority.
     WorkEvidenceContext,
-    /// External-effect rows rebuilt from the tool ledger at prompt assembly.
-    /// Compaction may drop the original tool messages; this snapshot is not
-    /// part of that history and is not a completion receipt.
-    ExternalEffectLedger,
     /// A provider response completed before newly applied runtime input.
     /// The stale response is not executable; the next request re-evaluates.
     RuntimeInputBoundary,
@@ -2970,7 +2970,6 @@ impl VolatileKind {
                 | Self::ActiveWorkSnapshot
                 | Self::CanonicalWorkState
                 | Self::WorkEvidenceContext
-                | Self::ExternalEffectLedger,
         )
     }
 
@@ -2989,7 +2988,6 @@ impl VolatileKind {
             | Self::ActiveWorkSnapshot
             | Self::CanonicalWorkState
             | Self::WorkEvidenceContext
-            | Self::ExternalEffectLedger
             | Self::RuntimeInputBoundary
             | Self::FinalAnswerSettlement
             | Self::CanonicalWorkEstablishmentRetry
@@ -7042,12 +7040,19 @@ pub(crate) mod tests {
         let mut host = MockHost::new(Vec::new());
         host.hydration_error = true;
         let mut state = make_test_loop_state();
+        let hub = make_hub();
+        state.telemetry.observability_hub = Some(hub.clone());
         let error = run_agentic_loop_with_host(&mut host, &mut state)
             .await
             .unwrap_err();
         assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
         assert_eq!(state.charged_iterations, 0);
         assert_eq!(host.turn_count(), 0);
+        let signals = hub.recent_feedback_signals();
+        assert_eq!(signals.len(), 1, "{signals:?}");
+        assert!(
+            matches!(&signals[0].signal_type, astra_core::feedback::SignalType::TaskFailure { reason } if reason.contains("WAL unavailable"))
+        );
     }
 
     #[tokio::test]
@@ -10117,10 +10122,18 @@ pub(crate) mod tests {
     async fn cancel_flag_none_does_not_cancel() {
         let mut host = MockHost::new(vec![text_result("ok", 10, 5, Some(42))]);
         let mut state = make_state();
+        let hub = make_hub();
+        state.telemetry.observability_hub = Some(hub.clone());
         state.cancellation.flag = None; // default
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
         assert_eq!(state.final_text, "ok");
+        let signals = hub.recent_feedback_signals();
+        assert_eq!(signals.len(), 1, "{signals:?}");
+        assert_eq!(
+            signals[0].signal_type,
+            astra_core::feedback::SignalType::TaskSuccess
+        );
     }
 
     #[tokio::test]
@@ -10139,12 +10152,20 @@ pub(crate) mod tests {
         let flag = Arc::new(AtomicBool::new(true));
         let mut host = MockHost::new(vec![text_result("should not run", 10, 5, Some(42))]);
         let mut state = make_state();
+        let hub = make_hub();
+        state.telemetry.observability_hub = Some(hub.clone());
         state.cancellation.flag = Some(flag);
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(matches!(outcome, Ok(AgenticLoopOutcome::Cancelled)));
         // No turns executed — host never called
         assert_eq!(host.current_turn, 0);
         assert!(state.final_text.is_empty());
+        let signals = hub.recent_feedback_signals();
+        assert_eq!(signals.len(), 1, "{signals:?}");
+        assert_eq!(
+            signals[0].signal_type,
+            astra_core::feedback::SignalType::Interruption
+        );
     }
 
     #[tokio::test]

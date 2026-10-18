@@ -29801,11 +29801,8 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
         .original
         .provider_adaptation
         .output_cap_action_first_pending = true;
-    facts
-        .original
-        .provider_adaptation
-        .action_convergence_attempted = true;
-    facts.original.provider_adaptation.force_next_thinking_off = true;
+    facts.original.provider_adaptation.safe_recovery_attempted = true;
+    facts.original.provider_adaptation.safe_recovery_pending = true;
     facts.original.skill_produced_output = true;
     facts.original.skill_execution.effort = Some(crate::skills::manifest::EffortLevel::High);
     facts.original.skill_execution.sandbox_policy = Some(
@@ -29941,8 +29938,8 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     assert!(state.hooks.completion_settlement.text_only);
     assert_eq!(state.error_recovery.consecutive_same_error, 2);
     assert!(state.provider_adaptation.output_cap_action_first_pending);
-    assert!(state.provider_adaptation.action_convergence_attempted);
-    assert!(state.provider_adaptation.force_next_thinking_off);
+    assert!(state.provider_adaptation.safe_recovery_attempted);
+    assert!(state.provider_adaptation.safe_recovery_pending);
     assert!(state.skill_produced_output);
     assert_eq!(
         serde_json::to_value(&state.skills.execution).unwrap(),
@@ -29970,7 +29967,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     assert_eq!(restored.total_cache_read, 101);
     assert_eq!(restored.session_turn, 7);
     assert_eq!(restored.message, "original task");
-    assert!(restored.provider_adaptation.action_convergence_attempted);
+    assert!(restored.provider_adaptation.safe_recovery_attempted);
     assert!(restored.skill_produced_output);
     assert_eq!(serde_json::to_value(restored).unwrap(), wire);
     for field in wire.as_object().unwrap().keys() {
@@ -38717,4 +38714,48 @@ async fn first_workspace_provisioning_race_selects_one_executor_without_loser_cl
         .execute(pool.get())
         .await
         .unwrap();
+}
+
+// Exercise the real finalizer with the admitted host/loop fixture's outcome.
+pub(crate) fn assert_empty_recovery_run_finalization(
+    outcome: Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    state: &AgenticLoopState,
+) {
+    let (events, status, error) =
+        AgenticRunLifecycleService::finalize_run_events(outcome, vec![], state);
+    assert_eq!(status, RunStatus::Paused, "{events:?}");
+    assert_eq!(error.as_deref(), Some("user_intervention"));
+    let interrupted = events
+        .iter()
+        .find(|event| event["event_type"] == "run_interrupted")
+        .unwrap();
+    assert_eq!(interrupted["data"]["kind"], "empty_completion");
+    assert_eq!(interrupted["data"]["waiting_for"], "user_intervention");
+    assert!(
+        serde_json::to_string(interrupted)
+            .unwrap()
+            .contains("authorized model")
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event["event_type"] != "run_error")
+    );
+    // A later real failure or cancellation must still override this interruption.
+    for (kind, expected) in [
+        (astra_core::ErrorKind::DatabaseError, RunStatus::Failed),
+        (astra_core::ErrorKind::Cancelled, RunStatus::Cancelled),
+    ] {
+        let (events, status, _) = AgenticRunLifecycleService::finalize_run_events(
+            Err(astra_core::ClassifiedError::new(kind, "later failure")),
+            vec![],
+            state,
+        );
+        assert_eq!(status, expected);
+        assert!(
+            events
+                .iter()
+                .all(|event| event["event_type"] != "run_interrupted")
+        );
+    }
 }
