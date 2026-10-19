@@ -233,10 +233,18 @@ Interactive cancellation and drain continue to await that same owned future;
 dropping it releases its state within the caller's existing lease scope. This
 bounds embedded caller state without changing execution or settlement ownership.
 
-Explicit interactive user cancellation retains that physical response through
-a bounded, identity-only admission drain if the Server run header has not yet
-arrived. The shared SSE owner stops before tools or approvals from that same
-chunk. Drain and exact-run cancellation share the existing ten-second deadline;
+Explicit interactive user cancellation uses only the accepted run identity on
+that physical response. If it is not yet observed, cancellation first drains
+for that identity and then cancels the exact execution. An already-observed
+run is cancelled alongside local drain so a blocked callback cannot consume
+the entire cancellation budget before the remote request is sent. If the CLI
+confirms that admission was never dispatched, or receives a typed pre-admission
+rejection, cancellation returns without a remote-active warning or another wait.
+A dispatched request whose identity remains unknown is still unconfirmed;
+absence of a run header alone is not proof that nothing was admitted.
+The opted-in shared SSE owner stops before tools or approvals from that same
+chunk; zero-grace hosts keep their existing chunk handling.
+Drain and exact-run cancellation share one existing ten-second deadline;
 a second interrupt may force an unverified exit. Cancellation uses only the
 run identity observed on that response, never an active-run lookup by Session.
 Unconfirmed identity or execution settlement remains visible with explicit

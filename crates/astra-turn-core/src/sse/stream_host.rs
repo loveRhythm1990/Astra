@@ -803,7 +803,8 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             // Capture only the accepted identity needed by explicit-cancel
             // settlement. Never consume another event or flush an approval/tool
             // from the same chunk once that identity arrives.
-            if stop_at_terminal.is_none()
+            if !admission_grace.is_zero()
+                && stop_at_terminal.is_none()
                 && cancel_token.is_some_and(|token| token.is_cancelled())
                 && (accum.run_id.is_some() || !pending.is_empty() || accum.stream_complete)
             {
@@ -1885,6 +1886,7 @@ impl SseStreamHost for NoopSseStreamHost {
 #[cfg(test)]
 struct RecordingSseStreamHost {
     cancelled_admission_grace: std::time::Duration,
+    cancel_after_accepted_event: Option<tokio_util::sync::CancellationToken>,
     render_effects: Vec<SseRenderEffect>,
     tool_outputs: std::collections::HashMap<String, String>,
     approval_kinds: Vec<ApprovalKind>,
@@ -1911,6 +1913,7 @@ impl RecordingSseStreamHost {
     fn new() -> Self {
         Self {
             cancelled_admission_grace: std::time::Duration::ZERO,
+            cancel_after_accepted_event: None,
             render_effects: Vec::new(),
             tool_outputs: std::collections::HashMap::new(),
             approval_kinds: Vec::new(),
@@ -1969,6 +1972,9 @@ impl SseStreamHost for RecordingSseStreamHost {
 
     async fn on_accepted_sse_event(&mut self, event: &Value) -> Result<(), String> {
         self.accepted_sse_events.push(event.clone());
+        if let Some(cancel) = &self.cancel_after_accepted_event {
+            cancel.cancel();
+        }
         Ok(())
     }
 
@@ -3711,6 +3717,35 @@ mod tests {
                 .unwrap_or("")
                 .contains("Cancelled")
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_per_event_stop_requires_host_opt_in() {
+        for opted_in in [false, true] {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let mut chunks = stream::iter(vec![Ok(concat!(
+                "data: {\"type\":\"session_info\",\"session_id\":\"session\",\"run_id\":\"run\"}\n\n",
+                "data: {\"type\":\"text_delta\",\"content\":\"same chunk\"}\n\n",
+                "data: [DONE]\n\n"
+            ).as_bytes().to_vec())]);
+            let mut host = RecordingSseStreamHost::new();
+            host.cancel_after_accepted_event = Some(cancel.clone());
+            if opted_in {
+                host.cancelled_admission_grace = std::time::Duration::from_secs(1);
+            }
+            let (result, _) = consume_sse_stream_cancellable(
+                &mut chunks,
+                &mut host,
+                std::time::Duration::from_secs(60),
+                Some(&cancel),
+                None,
+            )
+            .await;
+            assert_eq!(
+                result.accum.full_text,
+                if opted_in { "" } else { "same chunk" }
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

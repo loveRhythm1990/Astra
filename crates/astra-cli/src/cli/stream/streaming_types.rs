@@ -5,6 +5,10 @@
 
 use std::collections::BTreeSet;
 
+/// Total budget for interactive response drain and exact-run cancellation.
+pub(crate) const INTERACTIVE_CANCEL_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
 /// Re-export of the verdict audit event type for convenience.
 pub(crate) type VerdictEvent = astra_turn_core::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 
@@ -440,6 +444,9 @@ pub(crate) struct PartialTurnData {
     /// request is not a failed turn and must not be reconciled or journaled as
     /// one.
     pub admission_rejected: bool,
+    /// The CLI admission owner confirms that no Server execution request was
+    /// dispatched. False means unknown, not proof that admission happened.
+    pub server_admission_not_dispatched: bool,
     pub last_heavy_checkpoint: Option<astra_pipeline::step_protocol::StepCheckpoint>,
     /// Partial text the model generated before the turn was interrupted.
     /// Preserved in conversation history so the next turn has context.

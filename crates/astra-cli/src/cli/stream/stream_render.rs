@@ -4398,7 +4398,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         if self.incremental_state.is_some() {
             // The interactive owner still enforces its original ten-second
             // cancellation deadline, including admission and exact-run settle.
-            std::time::Duration::from_secs(10)
+            crate::cli::stream::streaming_types::INTERACTIVE_CANCEL_TIMEOUT
         } else {
             std::time::Duration::ZERO
         }

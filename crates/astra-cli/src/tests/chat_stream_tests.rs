@@ -55,6 +55,62 @@ fn basic_chat_context<'a>(
 
 // ── chat_stream (SSE agentic loop) ────────────────────────────────────
 
+#[tokio::test]
+async fn server_admission_dispatch_evidence_comes_from_the_actual_request_boundary() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    for (cancel_before_dispatch, cancel_before_retry) in
+        [(true, false), (false, false), (false, true)]
+    {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let observed = dispatches.clone();
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let cancel_at_server = cancel.clone();
+        let app = Router::new().route(
+            "/chat/stream",
+            post(move || {
+                let observed = observed.clone();
+                let cancel = cancel_at_server.clone();
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let status = if cancel_before_retry {
+                        cancel.cancel();
+                        axum::http::StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    };
+                    // No identity or typed pre-admission rejection: admission is
+                    // ambiguous even though this response has already finished.
+                    (status, [("retry-after", "0")], "synthetic upstream failure")
+                }
+            }),
+        );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let registry = astra_runtime::skills::empty_unified_registry();
+        let context = basic_chat_context(&api, &registry, "synthetic request");
+        let mut pm = PermissionManager::new(true);
+        if cancel_before_dispatch {
+            cancel.cancel();
+        }
+        let mut params = ChatTurnParams::basic_cli(&context, "synthetic-token", None, &mut pm);
+        params.cancel_token = Some(cancel);
+        let failure = stream_chat_sse(params).await.unwrap_err();
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            usize::from(!cancel_before_dispatch)
+        );
+        assert_eq!(
+            failure.partial.server_admission_not_dispatched,
+            cancel_before_dispatch
+        );
+        assert!(!failure.partial.admission_rejected);
+    }
+}
+
 /// Build a canonical SSE response for the mock chat-turn endpoint. Exposed
 /// to sibling test modules (e.g. `resume_tests`) so they don't have to
 /// duplicate the payload literal.
