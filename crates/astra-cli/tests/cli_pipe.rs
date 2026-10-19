@@ -280,7 +280,6 @@ async fn active_stream_closed_after_run_binding_cancels_exact_server_run() {
             "pipe-e2e",
             "--model",
             "mock-model",
-            "--bare",
             "--no-instructions",
             "--print",
             "--output-format",
@@ -543,7 +542,6 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
                 "pipe-e2e",
                 "--model",
                 "mock-model",
-                "--bare",
                 "--no-instructions",
             ]);
             if mode == "chat-json" {
@@ -823,7 +821,6 @@ async fn assert_one_shot_sigint(
             "sigint-test",
             "--model",
             "mock-model",
-            "--bare",
             "--no-instructions",
             "chat",
             "--json",
@@ -998,7 +995,7 @@ async fn one_shot_sigint_exits_while_stdin_writer_remains_open() {
 
     let home = tempfile::tempdir().unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_astra"))
-        .args(["--bare", "--no-instructions", "chat", "--json", "--stdin"])
+        .args(["--no-instructions", "chat", "--json", "--stdin"])
         .current_dir(home.path())
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", home.path().join(".config"))
@@ -1127,7 +1124,6 @@ async fn one_shot_sigint_keeps_identity_failure_when_event_writer_also_fails() {
                 "synthetic-double-failure",
                 "--model",
                 "mock-model",
-                "--bare",
                 "--no-instructions",
                 "chat",
                 "--json",
