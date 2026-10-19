@@ -229,6 +229,10 @@ subsequent local workspace or context-trace projections. Server cursors are neve
 Ordinary local and fresh attachments do not perform this additional request.
 
 The shared CLI stream entrypoint heap-pins its execution future for all callers.
+Admission bookkeeping keeps the inner execution independently heap-pinned;
+boxing only an outer async wrapper does not bound that wrapper's poll stack.
+Interactive cancellation settlement likewise heap-pins its state at its owner,
+so its inactive branches do not enlarge ordinary tool-callback poll stacks.
 Interactive cancellation and drain continue to await that same owned future;
 dropping it releases its state within the caller's existing lease scope. This
 bounds embedded caller state without changing execution or settlement ownership.

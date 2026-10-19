@@ -129,7 +129,10 @@ pub(crate) fn stream_chat_sse<'a>(
         // Owned by this physical request, not inferred from an error string or
         // absence of a run header. Keep it sticky across admission retries.
         let mut server_admission_dispatched = false;
-        let mut result = stream_chat_sse_inner(p, &mut server_admission_dispatched).await;
+        // Boxing only this wrapper still embeds the large execution future in
+        // its poll frame. Pin execution independently so cold local callbacks
+        // keep their stack headroom, including after a Server session restore.
+        let mut result = Box::pin(stream_chat_sse_inner(p, &mut server_admission_dispatched)).await;
         if let Err(failure) = &mut result {
             failure.partial.server_admission_not_dispatched = !server_admission_dispatched;
         }

@@ -401,7 +401,32 @@ pub(crate) fn report_server_run_detach_after_internal_failure(
 /// Retain the same physical response while explicit user cancellation settles.
 /// Admission can precede observation of its run header. The SSE owner drains
 /// that identity without executing tools; never discover a target by Session.
-pub(crate) async fn settle_interactive_user_cancel<F>(
+/// Keep settlement state on the heap: its branches otherwise enlarge the
+/// ordinary turn's poll stack even when the user never cancels.
+pub(crate) fn settle_interactive_user_cancel<F>(
+    stream_fut: &mut std::pin::Pin<&mut F>,
+    api: &astra_thin_client::ThinClient,
+    bearer: &str,
+    auth_owner: Option<&crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
+    incremental_state: &Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>,
+    source: &'static str,
+    timeout: std::time::Duration,
+) -> impl std::future::Future<Output = Result<StreamResult, crate::TurnFailure>>
+where
+    F: std::future::Future<Output = Result<StreamResult, crate::TurnFailure>>,
+{
+    Box::pin(settle_interactive_user_cancel_inner(
+        stream_fut,
+        api,
+        bearer,
+        auth_owner,
+        incremental_state,
+        source,
+        timeout,
+    ))
+}
+
+async fn settle_interactive_user_cancel_inner<F>(
     stream_fut: &mut std::pin::Pin<&mut F>,
     api: &astra_thin_client::ThinClient,
     bearer: &str,
@@ -712,6 +737,31 @@ mod tests {
     use crate::cli::session::session_state::SessionState;
     use crate::cli::turn::local_run_control::LocalRunControl;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn interactive_cancel_future_is_heap_pinned() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let incremental =
+            Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
+        let mut stream = std::pin::pin!(std::future::pending::<
+            Result<super::StreamResult, crate::TurnFailure>,
+        >());
+        let settlement = super::settle_interactive_user_cancel(
+            &mut stream,
+            &api,
+            "synthetic-token",
+            None,
+            &incremental,
+            "test",
+            std::time::Duration::from_secs(10),
+        );
+
+        assert_eq!(
+            std::mem::size_of_val(&settlement),
+            std::mem::size_of::<usize>(),
+            "cancellation state must not enlarge the ordinary turn's embedded future"
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn interactive_cancel_without_admission_identity_remains_unconfirmed() {
