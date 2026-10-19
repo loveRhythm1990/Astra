@@ -244,6 +244,10 @@ run is cancelled alongside local drain so a blocked callback cannot consume
 the entire cancellation budget before the remote request is sent. If the CLI
 confirms that admission was never dispatched, or receives a typed pre-admission
 rejection, cancellation returns without a remote-active warning or another wait.
+Each physical admission attempt checks cancellation and publishes sticky
+dispatch evidence after asynchronous credential preparation, with no intervening
+await before sending. Stopping while credentials are pending cannot start a
+new admission when they resolve; an earlier dispatched attempt remains ambiguous.
 A dispatched request whose identity remains unknown is still unconfirmed;
 absence of a run header alone is not proof that nothing was admitted.
 The opted-in shared SSE owner stops before tools or approvals from that same

@@ -1512,8 +1512,9 @@ async fn chat_turn_post_payload_after_prepare(
         CHAT_TURN_POST_MAX_RETRIES,
         quiet,
         || {
-            // Retain an already-issued response for exact-owner recovery, but
-            // do not dispatch or retry admission after the user has stopped.
+            // The thin client invokes this after asynchronous credential
+            // preparation, immediately before sending. Retain an already-issued
+            // response for recovery, but never start a new attempt after Stop.
             if cancel_token.is_some_and(|token| token.is_cancelled()) {
                 return Err(astra_thin_client::ThinClientError::InvalidInput(
                     "turn cancelled before Server admission dispatch".into(),

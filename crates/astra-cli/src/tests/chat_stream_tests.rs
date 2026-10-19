@@ -56,6 +56,104 @@ fn basic_chat_context<'a>(
 // ── chat_stream (SSE agentic loop) ────────────────────────────────────
 
 #[tokio::test]
+async fn server_admission_cancelled_during_bearer_resolution_never_dispatches_a_new_attempt() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug)]
+    struct AdmissionBearer {
+        calls: AtomicUsize,
+        blocked_attempt: usize,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl astra_thin_client::client::BearerProvider for AdmissionBearer {
+        fn token(
+            &self,
+        ) -> futures_util::future::BoxFuture<'_, Result<String, astra_thin_client::ThinClientError>>
+        {
+            Box::pin(async move {
+                // The production entrypoint first authenticates GET /models;
+                // block the subsequent admission, not that preflight read.
+                if self.calls.fetch_add(1, Ordering::SeqCst) == self.blocked_attempt + 1 {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                Ok("synthetic-admission-token".into())
+            })
+        }
+    }
+
+    // Also cover a retry: cancelling authentication must not dispatch another
+    // attempt or erase evidence that the first attempt was already sent.
+    for blocked_attempt in [0, 1] {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let observed = dispatches.clone();
+        let app = Router::new().route(
+            "/chat/stream",
+            post(move || {
+                let observed = observed.clone();
+                async move {
+                    let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                    let status = if blocked_attempt == 1 && attempt == 0 {
+                        axum::http::StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    };
+                    (
+                        status,
+                        [("retry-after", "0")],
+                        "synthetic admission response",
+                    )
+                }
+            }),
+        );
+        let base = spawn_mock(app).await;
+        let bearer = Arc::new(AdmissionBearer {
+            calls: AtomicUsize::new(0),
+            blocked_attempt,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let api = astra_thin_client::ThinClient::new(&base, None)
+            .unwrap()
+            .with_bearer_provider(bearer.clone());
+        let registry = astra_runtime::skills::empty_unified_registry();
+        let context = basic_chat_context(&api, &registry, "synthetic request");
+        let mut pm = PermissionManager::new(true);
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let mut params = ChatTurnParams::basic_cli(&context, "synthetic-token", None, &mut pm);
+        params.cancel_token = Some(cancel.clone());
+        let mut stream = Box::pin(stream_chat_sse(params));
+        tokio::select! {
+            result = &mut stream => panic!("admission finished before bearer release: {result:?}"),
+            entered = tokio::time::timeout(std::time::Duration::from_secs(10), bearer.entered.notified()) => {
+                entered.expect("admission must reach its bearer preparation");
+            }
+        }
+        assert_eq!(dispatches.load(Ordering::SeqCst), blocked_attempt);
+        assert_eq!(bearer.calls.load(Ordering::SeqCst), blocked_attempt + 2);
+        cancel.cancel();
+        bearer.release.notify_one();
+        // Keep polling the same production future, just as interactive
+        // cancellation does while looking for the physical response identity.
+        let failure = tokio::time::timeout(std::time::Duration::from_secs(5), stream)
+            .await
+            .expect("cancelled admission must finish")
+            .unwrap_err();
+        assert_eq!(dispatches.load(Ordering::SeqCst), blocked_attempt);
+        assert_eq!(
+            failure.partial.server_admission_not_dispatched,
+            blocked_attempt == 0
+        );
+        assert!(!failure.partial.admission_rejected);
+    }
+}
+
+#[tokio::test]
 async fn server_admission_dispatch_evidence_comes_from_the_actual_request_boundary() {
     use std::sync::{
         Arc,
