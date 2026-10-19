@@ -233,6 +233,16 @@ Interactive cancellation and drain continue to await that same owned future;
 dropping it releases its state within the caller's existing lease scope. This
 bounds embedded caller state without changing execution or settlement ownership.
 
+Explicit interactive user cancellation retains that physical response through
+a bounded, identity-only admission drain if the Server run header has not yet
+arrived. The shared SSE owner stops before tools or approvals from that same
+chunk. Drain and exact-run cancellation share the existing ten-second deadline;
+a second interrupt may force an unverified exit. Cancellation uses only the
+run identity observed on that response, never an active-run lookup by Session.
+Unconfirmed identity or execution settlement remains visible with explicit
+recovery guidance. An ordinary transport or callback detach does not gain
+user-cancellation authority.
+
 Server recovery preserves the opaque execution handoff checkpoint and fences
 its custody to the adopted owner generation. It does not reconstruct execution
 of the original run. Continuing a session in a new run consumes canonical

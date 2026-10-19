@@ -1412,6 +1412,7 @@ struct ChatTurnPostPayloadRequest<'a> {
     stream_json_emitter:
         Option<&'a std::sync::Arc<crate::cli::stream::stream_json::StreamJsonEmitter>>,
     execution_time_budget_clock: Option<&'a crate::cli::chat_stream::ExecutionTimeBudgetClock>,
+    cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
     prepare: PrepareChatTurnRequest<'a>,
 }
 
@@ -1461,6 +1462,7 @@ async fn chat_turn_post_payload_after_prepare(
         stream_event_tx,
         stream_json_emitter,
         execution_time_budget_clock,
+        cancel_token,
         prepare,
     } = request;
     let prep_line = ChatTurnPrepLineGuard::maybe_start(ui.show_prep_line, ui.prep_ui_phase.clone());
@@ -1507,6 +1509,13 @@ async fn chat_turn_post_payload_after_prepare(
         CHAT_TURN_POST_MAX_RETRIES,
         quiet,
         || {
+            // Retain an already-issued response for exact-owner recovery, but
+            // do not dispatch or retry admission after the user has stopped.
+            if cancel_token.is_some_and(|token| token.is_cancelled()) {
+                return Err(astra_thin_client::ThinClientError::InvalidInput(
+                    "turn cancelled before Server admission dispatch".into(),
+                ));
+            }
             let mut payload = server_payload.clone();
             if let Some(clock) = execution_time_budget_clock {
                 let remaining_seconds = clock.remaining().remaining_seconds;
@@ -1649,6 +1658,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             stream_event_tx: stream_event_tx.as_ref(),
             stream_json_emitter: stream_json_emitter.as_ref(),
             execution_time_budget_clock: execution_time_budget,
+            cancel_token,
             prepare: PrepareChatTurnRequest {
                 completion_checks,
                 tool_surface_config,

@@ -309,15 +309,13 @@ async fn await_stream_with_interrupts<'a>(
         _ = tokio::signal::ctrl_c() => {
             prepared.run_control.request_cancel_for_user();
             cancel_token_for_signal.cancel();
-            notify_server_to_cancel_run(api, bearer, auth_owner.as_ref(), &incremental_state, "Ctrl+C");
             if tui_cancel_token.is_none() {
                 eprintln!("\n{}", "  Interrupted. (press Ctrl+C again to force-exit, or wait up to 10s for graceful drain)".dim());
             }
-            let drained = drain_after_cancel(
+            let drained = settle_interactive_user_cancel(
                 &mut stream_fut,
-                drain_timeout,
-                "Ctrl+C",
-                incremental_state.clone(),
+                api, bearer, auth_owner.as_ref(), &incremental_state,
+                "Ctrl+C", drain_timeout,
             ).await;
             (drained, true)
         }
@@ -329,12 +327,10 @@ async fn await_stream_with_interrupts<'a>(
         } => {
             prepared.run_control.request_cancel_for_user();
             cancel_token_for_signal.cancel();
-            notify_server_to_cancel_run(api, bearer, auth_owner.as_ref(), &incremental_state, "TUI cancel");
-            let drained = drain_after_cancel(
+            let drained = settle_interactive_user_cancel(
                 &mut stream_fut,
-                drain_timeout,
-                "TUI cancel",
-                incremental_state.clone(),
+                api, bearer, auth_owner.as_ref(), &incremental_state,
+                "TUI cancel", drain_timeout,
             ).await;
             (drained, true)
         }
@@ -399,61 +395,87 @@ pub(crate) fn report_server_run_detach_after_internal_failure(
     );
 }
 
-/// Fire-and-forget: tell the server to cancel the durable run that is
-/// currently streaming. Without this call, the only effect of a user
-/// cancellation is closing the local SSE stream — the server-side run
-/// keeps executing tool calls and burning tokens until it finishes
-/// naturally. We snapshot the run_id from the incremental state (the SSE
-/// loop populates it as soon as the server emits the run header), then
-/// dispatch a DELETE in the background so cancellation does not block
-/// the drain path. Errors are logged at warn level only — the user has
-/// already asked to stop, and surfacing a cancel-API failure on top of
-/// that adds noise without giving them an action to take.
-fn notify_server_to_cancel_run(
+/// Retain the same physical response while explicit user cancellation settles.
+/// Admission can precede observation of its run header. The SSE owner drains
+/// that identity without executing tools; never discover a target by Session.
+pub(crate) async fn settle_interactive_user_cancel<F>(
+    stream_fut: &mut std::pin::Pin<&mut F>,
     api: &astra_thin_client::ThinClient,
     bearer: &str,
     auth_owner: Option<&crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     incremental_state: &Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>,
     source: &'static str,
-) {
-    let snap = incremental_state.snapshot();
-    let Some(run_id) = snap.run_id else {
-        tracing::debug!(
-            target: "astra::cli::cancel",
-            source,
-            "no run_id captured yet; server-side cancel skipped"
-        );
-        return;
-    };
-    let api = api.clone();
-    let bearer = bearer.to_string();
-    let auth_owner = auth_owner.cloned();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    tokio::spawn(async move {
-        match super::turn_facade::cancel_exact_run_until_settled_with_deadline(
-            &api,
-            &bearer,
-            &run_id,
-            auth_owner.as_ref(),
-            deadline,
-        )
-        .await
-        {
-            Ok(_) => tracing::info!(
-                target: "astra::cli::cancel",
-                run_id = %run_id,
-                source,
-                "server-side run cancellation settled"
-            ),
-            Err(e) => tracing::warn!(
-                target: "astra::cli::cancel",
-                run_id = %run_id,
-                source,
-                error = %e,
-                "server-side run cancellation failed"
-            ),
+    timeout: std::time::Duration,
+) -> Result<StreamResult, crate::TurnFailure>
+where
+    F: std::future::Future<Output = Result<StreamResult, crate::TurnFailure>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let settle = async {
+        loop {
+            if let Some(run_id) = incremental_state
+                .snapshot()
+                .run_id
+                .filter(|id| !id.trim().is_empty())
+            {
+                return super::turn_facade::cancel_exact_run_until_settled_with_deadline(
+                    api, bearer, &run_id, auth_owner, deadline,
+                )
+                .await;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(
+                    "Server admission identity was not observed before cancellation deadline"
+                        .into(),
+                );
+            }
+            tokio::time::sleep(remaining.min(std::time::Duration::from_millis(25))).await;
         }
-    });
+    };
+    let drain = drain_after_cancel(stream_fut, timeout, source, incremental_state.clone());
+    let (result, settled) = tokio::select! {
+        biased;
+        _ = tokio::signal::ctrl_c() => (
+            super::turn_cancellation::fabricate_user_cancel_failure(
+                "user_interrupted (force-exit)", incremental_state.clone(),
+            ),
+            Err("forced exit before cancellation was confirmed".to_string()),
+        ),
+        pair = async { tokio::join!(drain, settle) } => pair,
+    };
+    let snapshot = incremental_state.snapshot();
+    match settled {
+        Ok(()) => result.map_err(|mut failure| {
+            failure.partial.run_id = failure.partial.run_id.or(snapshot.run_id);
+            failure.partial.remote_cancel_required = false;
+            failure.partial.remote_cancel_run_id = None;
+            failure
+        }),
+        Err(error) => {
+            let error = astra_logging::redact_known_secret_patterns(&error);
+            tracing::warn!(
+                target: "astra::cli::cancel",
+                source, run_id = ?snapshot.run_id, error = %error,
+                "explicit user cancellation remains unconfirmed"
+            );
+            let mut failure = match result {
+                Err(failure) => failure,
+                Ok(_) => super::turn_cancellation::fabricate_user_cancel_failure(
+                    "user_interrupted (remote cancellation unconfirmed)",
+                    incremental_state.clone(),
+                )
+                .expect_err("cancellation failure retains the incremental prefix"),
+            };
+            failure.partial.run_id = failure.partial.run_id.or(snapshot.run_id);
+            failure
+                .partial
+                .remote_cancel_run_id
+                .clone_from(&failure.partial.run_id);
+            failure.partial.remote_cancel_required = true;
+            Err(failure)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -666,6 +688,118 @@ mod tests {
     use crate::cli::session::session_state::SessionState;
     use crate::cli::turn::local_run_control::LocalRunControl;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn interactive_cancel_without_admission_identity_remains_unconfirmed() {
+        let server = wiremock::MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let incremental =
+            Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
+        let mut stream = std::pin::pin!(async {
+            super::super::turn_cancellation::fabricate_user_cancel_failure(
+                "cancelled",
+                incremental.clone(),
+            )
+        });
+        let result = super::settle_interactive_user_cancel(
+            &mut stream,
+            &api,
+            "test-token",
+            None,
+            &incremental,
+            "test",
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(result.partial.remote_cancel_required);
+        assert!(result.partial.run_id.is_none());
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "never select an unrelated run by session"
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_cancel_failure_is_not_treated_as_settled() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/chat/runs/run-owned"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let incremental =
+            Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
+        incremental.set_run_id("run-owned".into());
+        let mut stream = std::pin::pin!(async {
+            super::super::turn_cancellation::fabricate_user_cancel_failure(
+                "cancelled",
+                incremental.clone(),
+            )
+        });
+        let failure = super::settle_interactive_user_cancel(
+            &mut stream,
+            &api,
+            "test-token",
+            None,
+            &incremental,
+            "test",
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(failure.partial.remote_cancel_required);
+        assert_eq!(
+            failure.partial.remote_cancel_run_id.as_deref(),
+            Some("run-owned")
+        );
+        assert!(!failure.is_clean_local_cancel());
+    }
+
+    #[tokio::test]
+    async fn interactive_cancel_pending_ack_does_not_outlive_the_settlement_deadline() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/chat/runs/run-owned"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "execution_settled": false
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let incremental =
+            Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
+        incremental.set_run_id("run-owned".into());
+        let mut stream = std::pin::pin!(async {
+            super::super::turn_cancellation::fabricate_user_cancel_failure(
+                "cancelled",
+                incremental.clone(),
+            )
+        });
+        let failure = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::settle_interactive_user_cancel(
+                &mut stream,
+                &api,
+                "test-token",
+                None,
+                &incremental,
+                "test",
+                std::time::Duration::from_millis(40),
+            ),
+        )
+        .await
+        .expect("bounded pending acknowledgement")
+        .unwrap_err();
+        assert!(failure.partial.remote_cancel_required);
+    }
 
     #[tokio::test]
     async fn clean_stream_detach_does_not_cancel_shared_local_work() {
