@@ -12,6 +12,9 @@ fn valid_git_sha(value: &str) -> bool {
 
 fn git_text(workspace: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
+        // `status` may otherwise refresh the index's stat cache. The index is
+        // a build input below, so that write would invalidate our own output.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(workspace)
         .args(args)
@@ -35,10 +38,14 @@ fn git_path(workspace: &Path, name: &str) -> Option<PathBuf> {
     })
 }
 
-fn watch_git_path(workspace: &Path, name: &str) {
-    if let Some(path) = git_path(workspace, name) {
+fn watch_git_path(workspace: &Path, name: &str) -> bool {
+    // Cargo treats a missing watched path as changed on every invocation.
+    // Reflogs, packed refs, and loose refs are all optional Git files.
+    if let Some(path) = git_path(workspace, name).filter(|path| path.exists()) {
         println!("cargo:rerun-if-changed={}", path.display());
+        return true;
     }
+    false
 }
 
 fn main() {
@@ -60,8 +67,24 @@ fn main() {
     watch_git_path(&workspace, "index");
     watch_git_path(&workspace, "logs/HEAD");
     watch_git_path(&workspace, "packed-refs");
-    if let Some(symbolic_ref) = git_text(&workspace, &["symbolic-ref", "-q", "HEAD"]) {
-        watch_git_path(&workspace, &symbolic_ref);
+    if let Some(symbolic_ref) = git_text(&workspace, &["symbolic-ref", "-q", "HEAD"])
+        && !watch_git_path(&workspace, &symbolic_ref)
+    {
+        // A packed branch can acquire a loose ref without changing HEAD,
+        // index, or packed-refs. Watch refs for that creation, including
+        // the shared ref directory in linked worktrees.
+        watch_git_path(&workspace, "refs");
+    }
+    // Unstaged edits do not change the index. Once optional Git files stop
+    // forcing a rerun, watch tracked sources explicitly so a downstream-only
+    // edit cannot retain a clean identity in core. Keep deleted tracked paths:
+    // they conservatively rerun until restored or staged, rather than watching
+    // the whole workspace (which would include generated target/ artifacts).
+    let tracked_sources = git_text(&workspace, &["ls-files", "-z"]);
+    if let Some(paths) = &tracked_sources {
+        for path in paths.split('\0').filter(|path| !path.is_empty()) {
+            println!("cargo:rerun-if-changed={}", workspace.join(path).display());
+        }
     }
 
     // Container builds intentionally exclude `.git` from their context. Their
@@ -81,12 +104,15 @@ fn main() {
     let git_dirty = match env::var(BUILD_SOURCE_GIT_DIRTY_ENV).as_deref() {
         Ok("true") => true,
         Ok("false") => false,
-        _ => git_text(
-            &workspace,
-            &["status", "--porcelain=v1", "--untracked-files=no"],
-        )
-        .map(|status| !status.is_empty())
-        .unwrap_or(true),
+        _ => {
+            tracked_sources.is_none()
+                || git_text(
+                    &workspace,
+                    &["status", "--porcelain=v1", "--untracked-files=no"],
+                )
+                .map(|status| !status.is_empty())
+                .unwrap_or(true)
+        }
     };
     let attestation_nonce = env::var(BUILD_ATTESTATION_NONCE_ENV)
         .ok()
