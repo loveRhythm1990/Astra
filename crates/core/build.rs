@@ -52,6 +52,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed={BUILD_ATTESTATION_NONCE_ENV}");
     println!("cargo:rerun-if-env-changed={BUILD_SOURCE_GIT_SHA_ENV}");
     println!("cargo:rerun-if-env-changed={BUILD_SOURCE_GIT_DIRTY_ENV}");
+    let attestation_nonce = env::var(BUILD_ATTESTATION_NONCE_ENV)
+        .ok()
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()));
     let build_target = env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
     let build_profile = env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string());
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
@@ -71,16 +74,26 @@ fn main() {
         && !watch_git_path(&workspace, &symbolic_ref)
     {
         // A packed branch can acquire a loose ref without changing HEAD,
-        // index, or packed-refs. Watch refs for that creation, including
-        // the shared ref directory in linked worktrees.
-        watch_git_path(&workspace, "refs");
+        // index, or packed-refs. For local branches, watch heads rather than
+        // all refs so loose remote/tag updates from fetch do not invalidate us.
+        // rev-parse resolves the shared directory for linked worktrees.
+        let namespace = if symbolic_ref.starts_with("refs/heads/") {
+            "refs/heads"
+        } else {
+            "refs"
+        };
+        watch_git_path(&workspace, namespace);
     }
-    // Unstaged edits do not change the index. Once optional Git files stop
-    // forcing a rerun, watch tracked sources explicitly so a downstream-only
-    // edit cannot retain a clean identity in core. Keep deleted tracked paths:
-    // they conservatively rerun until restored or staged, rather than watching
-    // the whole workspace (which would include generated target/ artifacts).
-    let tracked_sources = git_text(&workspace, &["ls-files", "-z"]);
+    // Attestation requires a valid embedded nonce. Only those builds need to
+    // invalidate core on every tracked edit, even when the nonce is reused.
+    // Ordinary builds keep a dirty-state snapshot at metadata refresh time;
+    // docs/web edits must not rebuild the foundational crate and its dependents.
+    // Trusted launchers can supply explicit source identity through the watched
+    // env vars. Deleted tracked paths conservatively rerun attestation builds
+    // until restored or staged, without recursively watching target/ artifacts.
+    let tracked_sources = attestation_nonce
+        .as_ref()
+        .and_then(|_| git_text(&workspace, &["ls-files", "-z"]));
     if let Some(paths) = &tracked_sources {
         for path in paths.split('\0').filter(|path| !path.is_empty()) {
             println!("cargo:rerun-if-changed={}", workspace.join(path).display());
@@ -105,7 +118,7 @@ fn main() {
         Ok("true") => true,
         Ok("false") => false,
         _ => {
-            tracked_sources.is_none()
+            (attestation_nonce.is_some() && tracked_sources.is_none())
                 || git_text(
                     &workspace,
                     &["status", "--porcelain=v1", "--untracked-files=no"],
@@ -114,13 +127,12 @@ fn main() {
                 .unwrap_or(true)
         }
     };
-    let attestation_nonce = env::var(BUILD_ATTESTATION_NONCE_ENV)
-        .ok()
-        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .unwrap_or_else(|| "absent".to_string());
     println!("cargo:rustc-env=ASTRA_BUILD_GIT_SHA={git_sha}");
     println!("cargo:rustc-env=ASTRA_BUILD_GIT_DIRTY={git_dirty}");
-    println!("cargo:rustc-env=ASTRA_BUILD_ATTESTATION_NONCE={attestation_nonce}");
+    println!(
+        "cargo:rustc-env=ASTRA_BUILD_ATTESTATION_NONCE={}",
+        attestation_nonce.as_deref().unwrap_or("absent")
+    );
     println!("cargo:rustc-env=ASTRA_BUILD_TARGET={build_target}");
     println!("cargo:rustc-env=ASTRA_BUILD_PROFILE={build_profile}");
 }

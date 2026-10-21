@@ -45,6 +45,10 @@ class BuildMetadataTests(unittest.TestCase):
         )
         shutil.copyfile(ROOT / "rust-toolchain.toml", self.repo / "rust-toolchain.toml")
         (self.repo / ".gitignore").write_text("/target/\n")
+        for path in ("README.md", "docs/notes.md", "web/app.js"):
+            tracked = self.repo / path
+            tracked.parent.mkdir(parents=True, exist_ok=True)
+            tracked.write_text("fixture\n")
         for name in ("core", "app"):
             package = self.repo / "crates" / name
             (package / "src").mkdir(parents=True)
@@ -77,11 +81,13 @@ fn main() { println!("{:?}", fixture_core::identity()); }
     def git(self, *args):
         return self.run_command("git", *args).stdout.strip()
 
-    def build(self, *, fresh=False, expected=None):
+    def build(self, *, fresh=False, fresh_core=False, expected=None):
         result = self.run_command("cargo", "run", "--locked", "--offline", "--verbose",
                                   "-p", "fixture_app")
-        if fresh:
+        if fresh or fresh_core:
             self.assertIn("Fresh fixture_core", result.stderr)
+            self.assertNotIn("Compiling fixture_core", result.stderr)
+        if fresh:
             self.assertIn("Fresh fixture_app", result.stderr)
             self.assertNotIn("Compiling fixture_", result.stderr)
         identity = json.loads(result.stdout)
@@ -139,6 +145,13 @@ fn main() { println!("{:?}", fixture_core::identity()); }
                     expected = [self.git("rev-parse", "HEAD"), "false", "absent"]
                     self.build(expected=expected)
                     self.build(fresh=True, expected=expected)
+                    # Fetch-like loose remote/tag updates must not invalidate
+                    # a packed local branch, including in linked worktrees.
+                    remote_sha = self.git("commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "remote")
+                    for ref in ("refs/remotes/origin/main", "refs/tags/fixture"):
+                        for sha in (expected[0], remote_sha):
+                            self.git("update-ref", ref, sha)
+                            self.build(fresh=True, expected=expected)
                     # Move only the ref (no checkout/index refresh/reflog). This
                     # creates a loose ref for a previously packed branch.
                     new_sha = self.git("commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "empty")
@@ -179,25 +192,62 @@ fn main() { println!("{:?}", fixture_core::identity()); }
             self.build(expected=expected)
             self.build(fresh=True, expected=expected)
 
-    def test_unstaged_tracked_changes_cannot_reuse_a_clean_identity(self):
+    def test_non_attested_builds_do_not_rebuild_for_unrelated_tracked_edits(self):
+        paths = [self.repo / name for name in ("README.md", "docs/notes.md", "web/app.js")]
+        downstream = self.repo / "crates/app/src/main.rs"
+        source = downstream.read_text()
+        sha = self.git("rev-parse", "HEAD")
+        for nonce in (None, "invalid", "g" * 64):
+            with self.subTest(nonce=nonce):
+                for path in paths:
+                    path.write_text("fixture\n")
+                downstream.write_text(source)
+                if nonce is not None:
+                    self.env["ASTRA_BUILD_ATTESTATION_NONCE"] = nonce
+                expected = [sha, "false", "absent"]
+                self.build(expected=expected)
+                for path in paths:
+                    path.touch()
+                    self.build(fresh=True, expected=expected)
+                    path.write_text("first edit\n")
+                    self.build(fresh=True, expected=expected)
+                    path.write_text("already dirty, edited again\n")
+                    self.build(fresh=True, expected=expected)
+                downstream.write_text(source + "\n// downstream-only edit\n")
+                self.build(fresh_core=True, expected=expected)
+
+    def test_attestation_rechecks_dirty_state_with_the_same_valid_nonce(self):
         sha = self.git("rev-parse", "HEAD")
         self.build(expected=[sha, "false", "absent"])
+        readme = self.repo / "README.md"
+        readme.write_text("unstaged edit before attestation\n")
+        self.build(fresh=True, expected=[sha, "false", "absent"])
+        nonce = "a" * 64
+        self.env["ASTRA_BUILD_ATTESTATION_NONCE"] = nonce
+        self.build(expected=[sha, "true", nonce])
+        readme.write_text("fixture\n")
+        self.build(expected=[sha, "false", nonce])
         tracked = self.repo / "crates/app/src/main.rs"
         original = tracked.read_text()
         tracked.write_text(original + "\n// local change\n")
-        # No git add/status: changing a downstream source file must invalidate
-        # the clean identity embedded by core, independently of the index.
-        self.build(expected=[sha, "true", "absent"])
-        self.build(fresh=True, expected=[sha, "true", "absent"])
+        # Reusing an attestation nonce must still detect unstaged downstream
+        # edits without git add/status or an index refresh.
+        self.build(expected=[sha, "true", nonce])
+        self.build(fresh=True, expected=[sha, "true", nonce])
         tracked.write_text(original)
-        self.build(expected=[sha, "false", "absent"])
-        self.build(fresh=True, expected=[sha, "false", "absent"])
+        self.build(expected=[sha, "false", nonce])
+        self.build(fresh=True, expected=[sha, "false", nonce])
         tracked = self.repo / ".gitignore"
         original = tracked.read_text()
         tracked.unlink()
-        self.build(expected=[sha, "true", "absent"])
+        self.build(expected=[sha, "true", nonce])
         tracked.write_text(original)
+        self.build(expected=[sha, "false", nonce])
+        self.build(fresh=True, expected=[sha, "false", nonce])
+        # Leaving attestation mode must remove the broad source watches.
+        del self.env["ASTRA_BUILD_ATTESTATION_NONCE"]
         self.build(expected=[sha, "false", "absent"])
+        readme.write_text("ordinary development again\n")
         self.build(fresh=True, expected=[sha, "false", "absent"])
 
 

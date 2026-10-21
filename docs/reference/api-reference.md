@@ -367,10 +367,15 @@ the replica should be removed from service routing.
 ### GET /health
 
 Aggregate diagnostic state, including optional Memoria degradation and build
-identity. `build_git_dirty` is `true` when the binary was built from tracked
-source changes; local launchers must not reuse such a process after a checkout
-change. This endpoint is for observation; use `/live` and `/ready` for
-orchestrator probes.
+identity. `build_git_dirty` records tracked source changes at the last build
+metadata refresh (or the trusted build orchestrator's explicit source identity).
+Ordinary Cargo builds do not refresh core metadata on every unstaged file edit,
+so this field alone is not proof that a reused local build matches the current
+checkout. Local launchers must check the checkout and supply its current source
+identity when building; `scripts/dev/start-api.sh` does both. Production baseline
+builds with a valid attestation nonce additionally track all tracked files,
+including edits made while reusing that nonce. This endpoint is for observation;
+use `/live` and `/ready` for orchestrator probes.
 
 ```json
 {
