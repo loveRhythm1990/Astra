@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Exercise core's actual build script with offline Cargo/Git fixtures."""
+"""Exercise core metadata and public artifact identity with Cargo/Git fixtures."""
 
+import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 
@@ -21,7 +23,8 @@ class BuildMetadataTests(unittest.TestCase):
         self.repo = self.root / "source"
         self.repo.mkdir()
         # Keep local build overrides, Git configuration, and compiler caches out
-        # of the fixture. No network, credentials, or workspace dependencies.
+        # of the fixture. These minimal fixtures build offline; the public-probe
+        # regression explicitly fetches its serialization dependencies first.
         self.env = {
             key: value for key, value in os.environ.items()
             if not key.startswith(("ASTRA_", "GIT_", "CARGO_", "RUSTC_"))
@@ -119,7 +122,9 @@ fn main() { println!("{:?}", fixture_core::identity()); }
                     os.utime(tracked, ns=(stat.st_atime_ns, stat.st_mtime_ns - 10_000_000_000))
                     index = clone / ".git/index"
                     before = (index.read_bytes(), index.stat().st_mtime_ns)
-                    expected = [self.git("rev-parse", "HEAD"), "false", "absent"]
+                    nonce = "a" * 64
+                    self.env["ASTRA_BUILD_ATTESTATION_NONCE"] = nonce
+                    expected = [self.git("rev-parse", "HEAD"), "false", nonce]
                     self.build(expected=expected)
                     self.assertTrue(
                         (index.read_bytes(), index.stat().st_mtime_ns) == before,
@@ -142,7 +147,7 @@ fn main() { println!("{:?}", fixture_core::identity()); }
                     self.env["CARGO_TARGET_DIR"] = str(worktree / "target")
                 try:
                     self.git("pack-refs", "--all", "--prune")
-                    expected = [self.git("rev-parse", "HEAD"), "false", "absent"]
+                    expected = [self.git("rev-parse", "HEAD"), "true", "absent"]
                     self.build(expected=expected)
                     self.build(fresh=True, expected=expected)
                     # Fetch-like loose remote/tag updates must not invalidate
@@ -167,19 +172,21 @@ fn main() { println!("{:?}", fixture_core::identity()); }
                     self.env["CARGO_TARGET_DIR"] = str(source / "target")
 
     def test_detached_head_staged_changes_and_nonce_invalidate_identity(self):
+        self.env["ASTRA_BUILD_ATTESTATION_NONCE"] = "a" * 64
         self.git("checkout", "--detach")
         sha = self.git("rev-parse", "HEAD")
-        self.build(expected=[sha, "false", "absent"])
+        self.build(expected=[sha, "false", "a" * 64])
         (self.repo / "tracked.txt").write_text("changed\n")
         self.git("add", "tracked.txt")
-        self.build(expected=[sha, "true", "absent"])
-        self.build(fresh=True, expected=[sha, "true", "absent"])
+        self.build(expected=[sha, "true", "a" * 64])
+        self.build(fresh=True, expected=[sha, "true", "a" * 64])
         self.git("commit", "-m", "tracked change")
         sha = self.git("rev-parse", "HEAD")
-        self.build(expected=[sha, "false", "absent"])
+        self.build(expected=[sha, "false", "a" * 64])
         for nonce in ("a" * 64, "b" * 64, "invalid"):
             self.env["ASTRA_BUILD_ATTESTATION_NONCE"] = nonce
-            expected = [sha, "false", nonce if len(nonce) == 64 else "absent"]
+            expected = [sha, "false" if len(nonce) == 64 else "true",
+                        nonce if len(nonce) == 64 else "absent"]
             self.build(expected=expected)
             self.build(fresh=True, expected=expected)
 
@@ -191,6 +198,20 @@ fn main() { println!("{:?}", fixture_core::identity()); }
             expected = [sha, dirty, "absent"] if dirty != "invalid" else ["unknown", "true", "absent"]
             self.build(expected=expected)
             self.build(fresh=True, expected=expected)
+
+    def test_incomplete_source_declarations_cannot_claim_clean(self):
+        sha = self.git("rev-parse", "HEAD")
+        for source_sha, dirty in ((None, "false"), ("invalid", "false"),
+                                  (sha, None), (sha, "invalid")):
+            with self.subTest(source_sha=source_sha, dirty=dirty):
+                for name, value in (("ASTRA_BUILD_SOURCE_GIT_SHA", source_sha),
+                                    ("ASTRA_BUILD_SOURCE_GIT_DIRTY", dirty)):
+                    if value is None:
+                        self.env.pop(name, None)
+                    else:
+                        self.env[name] = value
+                self.build(expected=[sha, "true", "absent"])
+                self.build(fresh=True, expected=[sha, "true", "absent"])
 
     def test_non_attested_builds_do_not_rebuild_for_unrelated_tracked_edits(self):
         paths = [self.repo / name for name in ("README.md", "docs/notes.md", "web/app.js")]
@@ -204,7 +225,7 @@ fn main() { println!("{:?}", fixture_core::identity()); }
                 downstream.write_text(source)
                 if nonce is not None:
                     self.env["ASTRA_BUILD_ATTESTATION_NONCE"] = nonce
-                expected = [sha, "false", "absent"]
+                expected = [sha, "true", "absent"]
                 self.build(expected=expected)
                 for path in paths:
                     path.touch()
@@ -216,12 +237,97 @@ fn main() { println!("{:?}", fixture_core::identity()); }
                 downstream.write_text(source + "\n// downstream-only edit\n")
                 self.build(fresh_core=True, expected=expected)
 
+    def test_real_edited_artifact_cannot_pass_clean_probe_after_source_restore(self):
+        # Compile the unmodified production JSON entrypoint, not a fake probe or
+        # a JSON projection of the fixture's env vars. Seed resolution from the
+        # repository lockfile; only this fixture needs serde's small dependency
+        # closure. Fetch it before switching back to fully offline builds.
+        lock = tomllib.loads((ROOT / "Cargo.lock").read_text())
+        versions = {p["name"]: p["version"] for p in lock["package"]}
+        manifest = self.repo / "crates/core/Cargo.toml"
+        with manifest.open("a") as output:
+            output.write('[dependencies]\n')
+            output.write(f'serde = {{ version = "={versions["serde"]}", features = ["derive"] }}\n')
+            output.write(f'serde_json = "={versions["serde_json"]}"\n')
+        shutil.copyfile(ROOT / "Cargo.lock", self.repo / "Cargo.lock")
+        shutil.copyfile(ROOT / "crates/core/src/build_info.rs",
+                        self.repo / "crates/core/src/build_info.rs")
+        (self.repo / "crates/core/src/lib.rs").write_text('''
+pub mod build_info;
+pub mod history_work_baseline {
+    pub const BUILD_GIT_SHA: &str = env!("ASTRA_BUILD_GIT_SHA");
+    pub const BUILD_GIT_DIRTY: &str = env!("ASTRA_BUILD_GIT_DIRTY");
+}
+''')
+        downstream = self.repo / "crates/app/src/main.rs"
+        original = '''fn main() {
+    if fixture_core::build_info::write_json_if_requested().unwrap() { return; }
+    println!("original behavior");
+}
+'''
+        downstream.write_text(original)
+        self.env["CARGO_NET_OFFLINE"] = "false"
+        self.run_command("cargo", "fetch")
+        resolved = tomllib.loads((self.repo / "Cargo.lock").read_text())
+        pinned = {(p["name"], p["version"], p.get("checksum")) for p in lock["package"]}
+        for package in resolved["package"]:
+            if "source" in package:
+                self.assertIn((package["name"], package["version"], package.get("checksum")), pinned)
+        self.env["CARGO_NET_OFFLINE"] = "true"
+        self.git("add", ".")
+        self.git("commit", "-m", "production identity fixture")
+        sha = self.git("rev-parse", "HEAD")
+        spec = importlib.util.spec_from_file_location(
+            "build_metadata_preflight", ROOT / "scripts/harness/preflight.py")
+        preflight = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(preflight)
+        binary = self.repo / "target/debug/fixture_app"
+
+        def probe():
+            return preflight.probe_build_info(
+                binary, expected_git_sha=sha, expected_target=None)
+
+        for mode in ("ordinary", "invalid-nonce", "attested", "explicit"):
+            with self.subTest(mode=mode):
+                self.env.pop("ASTRA_BUILD_ATTESTATION_NONCE", None)
+                self.env.pop("ASTRA_BUILD_SOURCE_GIT_SHA", None)
+                self.env.pop("ASTRA_BUILD_SOURCE_GIT_DIRTY", None)
+                if mode == "attested":
+                    self.env["ASTRA_BUILD_ATTESTATION_NONCE"] = "a" * 64
+                elif mode == "invalid-nonce":
+                    self.env["ASTRA_BUILD_ATTESTATION_NONCE"] = "invalid"
+                elif mode == "explicit":
+                    self.env["ASTRA_BUILD_SOURCE_GIT_SHA"] = sha
+                    self.env["ASTRA_BUILD_SOURCE_GIT_DIRTY"] = "false"
+                self.run_command("cargo", "build", "--locked", "--offline", "-p", "fixture_app")
+                self.assertEqual(self.run_command(str(binary)).stdout.strip(), "original behavior")
+                clean_ok, clean_detail = probe()
+                downstream.write_text(original.replace("original behavior", "edited behavior"))
+                if mode == "explicit":
+                    # The trusted launcher refreshes its declaration each time.
+                    self.env["ASTRA_BUILD_SOURCE_GIT_DIRTY"] = "true"
+                result = self.run_command("cargo", "build", "--locked", "--offline",
+                                          "--verbose", "-p", "fixture_app")
+                if mode in ("ordinary", "invalid-nonce"):
+                    self.assertIn("Fresh fixture_core", result.stderr)
+                    self.assertNotIn("Compiling fixture_core", result.stderr)
+                self.assertEqual(self.run_command(str(binary)).stdout.strip(), "edited behavior")
+                downstream.write_text(original)
+                self.assertEqual(self.git("status", "--porcelain=v1", "--untracked-files=no"), "")
+                # Do not rebuild: the checkout is clean, but the retained binary
+                # demonstrably still executes the edited code.
+                self.assertEqual(self.run_command(str(binary)).stdout.strip(), "edited behavior")
+                ok, detail = probe()
+                self.assertFalse(ok, detail)
+                self.assertIn("git_dirty", detail)
+                self.assertEqual(clean_ok, mode in ("attested", "explicit"), clean_detail)
+
     def test_attestation_rechecks_dirty_state_with_the_same_valid_nonce(self):
         sha = self.git("rev-parse", "HEAD")
-        self.build(expected=[sha, "false", "absent"])
+        self.build(expected=[sha, "true", "absent"])
         readme = self.repo / "README.md"
         readme.write_text("unstaged edit before attestation\n")
-        self.build(fresh=True, expected=[sha, "false", "absent"])
+        self.build(fresh=True, expected=[sha, "true", "absent"])
         nonce = "a" * 64
         self.env["ASTRA_BUILD_ATTESTATION_NONCE"] = nonce
         self.build(expected=[sha, "true", nonce])
@@ -246,9 +352,9 @@ fn main() { println!("{:?}", fixture_core::identity()); }
         self.build(fresh=True, expected=[sha, "false", nonce])
         # Leaving attestation mode must remove the broad source watches.
         del self.env["ASTRA_BUILD_ATTESTATION_NONCE"]
-        self.build(expected=[sha, "false", "absent"])
+        self.build(expected=[sha, "true", "absent"])
         readme.write_text("ordinary development again\n")
-        self.build(fresh=True, expected=[sha, "false", "absent"])
+        self.build(fresh=True, expected=[sha, "true", "absent"])
 
 
 if __name__ == "__main__":

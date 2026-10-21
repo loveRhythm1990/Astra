@@ -86,8 +86,9 @@ fn main() {
     }
     // Attestation requires a valid embedded nonce. Only those builds need to
     // invalidate core on every tracked edit, even when the nonce is reused.
-    // Ordinary builds keep a dirty-state snapshot at metadata refresh time;
-    // docs/web edits must not rebuild the foundational crate and its dependents.
+    // Ordinary builds conservatively declare dirty/unknown, never an unchecked
+    // clean snapshot: docs/web edits must not rebuild core and its dependents,
+    // but an edited downstream binary must not pass clean-artifact verification.
     // Trusted launchers can supply explicit source identity through the watched
     // env vars. Deleted tracked paths conservatively rerun attestation builds
     // until restored or staged, without recursively watching target/ artifacts.
@@ -103,22 +104,26 @@ fn main() {
     // Container builds intentionally exclude `.git` from their context. Their
     // trusted build orchestrator passes the same source identity used for OCI
     // image metadata so the binary and image remain auditable as one artifact.
-    let git_sha = env::var(BUILD_SOURCE_GIT_SHA_ENV)
+    let source_git_sha = env::var(BUILD_SOURCE_GIT_SHA_ENV)
         .ok()
-        .filter(|sha| valid_git_sha(sha))
+        .filter(|sha| valid_git_sha(sha));
+    let git_sha = source_git_sha
+        .clone()
         .or_else(|| {
             git_text(&workspace, &["rev-parse", "--verify", "HEAD^{commit}"])
                 .filter(|sha| valid_git_sha(sha))
         })
         .unwrap_or_else(|| "unknown".to_string());
-    // Executable identity gates only on tracked source changes.  Benchmark
-    // artifacts, logs, and user worktrees are intentionally untracked and
-    // must not make an otherwise reproducible build unverifiable.
+    // Only a complete orchestrator declaration or a source-watched attestation
+    // build can claim clean identity. Missing/malformed declarations fail closed
+    // for ordinary builds, including the very first build of a clean checkout.
+    // Untracked benchmark artifacts and logs are not source identity inputs.
     let git_dirty = match env::var(BUILD_SOURCE_GIT_DIRTY_ENV).as_deref() {
         Ok("true") => true,
-        Ok("false") => false,
+        Ok("false") if source_git_sha.is_some() => false,
         _ => {
-            (attestation_nonce.is_some() && tracked_sources.is_none())
+            attestation_nonce.is_none()
+                || tracked_sources.is_none()
                 || git_text(
                     &workspace,
                     &["status", "--porcelain=v1", "--untracked-files=no"],

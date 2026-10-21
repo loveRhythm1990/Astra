@@ -65,6 +65,13 @@ Revision verification requires the built-in CLI executor and is unavailable in
 dashboard mode. Embedded identity is a build declaration: use the trusted build
 workflow to refresh source metadata, particularly after uncommitted edits;
 this check does not fingerprint runtime configuration or all dependencies.
+Ordinary Cargo builds without a source declaration or valid attestation nonce
+report an unverified (`git_dirty=true`) identity and cannot enter this mode.
+Use the manual harness workflow, or build all compared binaries with a valid
+64-hex `ASTRA_BUILD_ATTESTATION_NONCE`; source-watched builds then detect
+unstaged changes even when that nonce is reused. A trusted source orchestrator
+may instead refresh both `ASTRA_BUILD_SOURCE_GIT_SHA` and
+`ASTRA_BUILD_SOURCE_GIT_DIRTY` for every build, as the manual workflow does.
 Preflight resolves the legacy execution profile before checking health and
 passes that same explicit profile to health, model probes and case execution;
 it does not validate a native MOI endpoint and then execute on a legacy one.

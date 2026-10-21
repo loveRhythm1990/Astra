@@ -367,14 +367,24 @@ the replica should be removed from service routing.
 ### GET /health
 
 Aggregate diagnostic state, including optional Memoria degradation and build
-identity. `build_git_dirty` records tracked source changes at the last build
-metadata refresh (or the trusted build orchestrator's explicit source identity).
-Ordinary Cargo builds do not refresh core metadata on every unstaged file edit,
-so this field alone is not proof that a reused local build matches the current
-checkout. Local launchers must check the checkout and supply its current source
-identity when building; `scripts/dev/start-api.sh` does both. Production baseline
-builds with a valid attestation nonce additionally track all tracked files,
-including edits made while reusing that nonce. This endpoint is for observation;
+identity. `build_git_dirty=false` is an explicit clean-build declaration;
+`true` means tracked source changes **or an unverified source state**. Ordinary
+Cargo builds (debug or release) without a valid attestation nonce or a complete
+trusted source declaration conservatively report `true`, even in a clean
+checkout. They do not watch every tracked file, so unrelated edits can reuse
+core without leaving an old clean identity that artifact verification accepts.
+
+Identity-sensitive builds must either use a valid 64-hex
+`ASTRA_BUILD_ATTESTATION_NONCE` (which watches all tracked files, even when the
+nonce is reused), or a trusted orchestrator must supply both the full
+`ASTRA_BUILD_SOURCE_GIT_SHA` and `ASTRA_BUILD_SOURCE_GIT_DIRTY=true|false` for the
+exact source being compiled. The orchestrator must refresh that declaration on
+every build and prevent source changes during compilation; setting a constant
+`false` in a development shell is not verification. Container/manual harness
+builds and `scripts/dev/start-api.sh` use the explicit declaration. Missing or
+malformed declarations cannot establish a clean identity. The same conservative
+boolean is exposed through `--build-info-json`, so existing clean-artifact probes
+reject ordinary unverified builds. This endpoint is for observation;
 use `/live` and `/ready` for orchestrator probes.
 
 ```json
