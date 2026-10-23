@@ -1,8 +1,11 @@
-name: Mac CI hosted result observer
+name: Mac CI result observer
 on:
   workflow_run:
     workflows: [Test Suite]
     types: [completed]
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
 permissions:
   contents: read
 cache-mode: none
@@ -34,7 +37,14 @@ jobs:
           permission-environments: read
       # No PR checkout, downloaded artifacts, code execution or cached scripts.
       - name: Observe ordinary hosted results
+        if: github.event_name == 'workflow_run'
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           ASTRA_MACOS_APP_ID: ${{ vars.ASTRA_MACOS_APP_ID }}
         run: python3 scripts/ci/macos_runner.py observe
+      - name: Reconcile missing and expired results
+        if: github.event_name != 'workflow_run'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          ASTRA_MACOS_APP_ID: ${{ vars.ASTRA_MACOS_APP_ID }}
+        run: python3 scripts/ci/macos_runner.py reconcile

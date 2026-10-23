@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: Member PR to re-authorize and execute on hosted macOS
+        description: PR to re-authorize with hosted routing (non-members keep ordinary PR approval)
         required: true
         type: string
 

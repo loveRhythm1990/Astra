@@ -48,8 +48,11 @@ A dedicated GitHub App publishes three contexts on H:
 - `Mac CI: reflow`
 - `Mac CI: coordination`
 
-All three must be required with their source bound to that App. Control checks
-this source binding before dispatch. Its private key and installation token
+All three must be required with their source bound to that App, together with
+strict up-to-date branch checks. Source binding prevents impersonation; the
+up-to-date rule prevents a historical check on H from satisfying a different
+base tuple after main advances. Control verifies both requirements before
+dispatch. Its private key and installation token
 remain on GitHub-hosted Ubuntu control jobs, never on PR execution machines.
 Store the private key only in the `astra-macos-control` GitHub Environment,
 restricted by a custom branch rule to branch `main` alone (no tag rule).
@@ -65,13 +68,32 @@ best-effort deduplication hint. Delegated copies use cheap Ubuntu notification
 jobs. The hint cannot publish or replace the three required App checks. Missing
 hints preserve hosted execution, so a control race can cause duplicate work,
 not missing coverage. A forged hint leaves the member's trusted checks pending.
+Only the scope job receives the extra Actions/checks/PR read permissions. The
+hint waits up to a 90-second polling budget for delayed control, bounded by a
+two-minute step timeout; a known ordinary route or permission denial returns
+immediately. Separate event queues can still outlast that budget. Such runs keep
+hosted execution and can duplicate work; this is not claimed eliminated. The
+activation pilot must demonstrate `delegated=true` with an actual fork PR's
+`GITHUB_TOKEN`, not only a fixture or a personal token.
 
 Non-members retain ordinary fork approval. `macos-results.yml` observes the
 completed Test Suite through `workflow_run`, reads GitHub metadata only, and
 publishes the ordinary path's actual three hosted results. It never downloads
 artifacts or executes PR code. Approval-pending, missing, stale, cancelled or
-failed execution cannot become a successful skip. This retains the pre-existing
-PR-modifiable test-definition limitation for non-member hosted tests.
+failed execution cannot become a successful skip. A completed ordinary run with
+missing/skipped selected lanes fails explicitly, including scope disagreement,
+instead of staying pending forever. This retains the pre-existing PR-modifiable
+test-definition limitation for non-member hosted tests.
+
+The same metadata-only observer reconciles pending contexts every 15 minutes
+(and supports manual dispatch), recovering lost completion notifications.
+Authorization expires three hours after planning. At expiry, pending contexts
+are failed with a recovery instruction; expiry never means tests passed. Active
+API/Actions outages or delayed cron execution can delay reconciliation, so this
+is not a platform availability guarantee. Expired authorization is rejected by
+the runner hook and result publisher. After resolving approval/unavailability,
+start fresh trusted control and rerun the applicable tests as required. The
+reconciler never executes PR code, auto-approves forks or relaxes result checks.
 
 Both privileged-event workflows explicitly restrict remote cache tokens with
 `cache-mode: read` or `none`. Disabling a client upload is not the authorization
@@ -213,8 +235,8 @@ infrastructure fallback.
    The App needs repository Actions/contents/PR read, administration read,
    checks write and environments read; organization Members and self-hosted
    runners/groups read.
-4. Make the three contexts required with source pinned to the App. Preserve the
-   existing protected checks. The migration control refuses dispatch until this
+4. Make the three contexts required with source pinned to the App, and enforce
+   strict up-to-date branch checks. Preserve the existing protected checks. The migration control refuses dispatch until this
    binding is visible through the rules/protection APIs.
 5. Set `ASTRA_MACOS_MIGRATION_ENABLED=true` only after the preceding acceptance.
    For main, separately set `ASTRA_MACOS_MAIN_GROUP_ID` and
@@ -227,8 +249,18 @@ The application PR does not modify live groups, secrets, branch protection,
 remote clusters or runner services. Current caller API queries for runners and
 groups returned 403; none of those settings is claimed verified or enabled.
 
-For rollback, keep required result publication working until in-flight PRs are
-settled. Remove the three new App-required contexts through reviewed policy
-change, disable `ASTRA_MACOS_MIGRATION_ENABLED`, then remove/disable the admitted
-runner registration as needed. Ordinary hosted execution is retained throughout
-when no valid delegation hint exists. Do not turn missing App results into pass.
+For rollback, pause merges and cancel in-flight Mac CI work/disable admitted
+registrations through the reviewed operations process. Set
+`ASTRA_MACOS_MIGRATION_ENABLED=false` first. Rerun ordinary Test Suite for
+in-flight PRs and verify actual hosted macOS execution of the three lanes; an
+older delegated echo is not proof. Only then remove the three App-required
+contexts through reviewed protection configuration, and resume merges. Keep the
+App contexts blocking during this transition. Disabling the flag does not revoke
+already-issued runner authorization by itself. Never remove the App-required
+contexts while delegated legacy checks alone could permit merging.
+
+Legacy job names retain the requested platform for protected-check compatibility.
+A delegated job's summary explicitly identifies its Ubuntu notification role;
+actual execution is attested by the three App-owned contexts and their run/job
+metadata. Main push concurrency intentionally keeps only the newest generation,
+as ordinary Test Suite already does; cancelled results do not become passes.

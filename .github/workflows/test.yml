@@ -2,8 +2,6 @@ name: Test Suite
 
 permissions:
   contents: read
-  checks: read
-  pull-requests: read
 
 on:
   push:
@@ -22,6 +20,11 @@ env:
 jobs:
   scope:
     name: Determine test scope
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+      actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -44,7 +47,10 @@ jobs:
         run: python3 scripts/ci/ci_scope.py
       - name: Read trusted macOS execution hint
         id: mac
-        if: vars.ASTRA_MACOS_MIGRATION_ENABLED == 'true'
+        if: >-
+          vars.ASTRA_MACOS_MIGRATION_ENABLED == 'true' &&
+          (steps.scope.outputs.test_cli == 'true' || steps.scope.outputs.test_core == 'true')
+        timeout-minutes: 2
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -264,7 +270,9 @@ jobs:
     steps:
       - name: Delegated to App-verified macOS execution
         if: env.RUN_LANE != 'true'
-        run: echo 'Protected Mac CI checks are independently required.'
+        run: |
+          echo 'Requested macOS lane delegated to protected Mac CI; this Ubuntu job only reports delegation.'
+          echo 'Execution results are the three App-owned Mac CI checks. The platform in this legacy check name is the requested platform.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         if: env.RUN_LANE == 'true'
         with:
@@ -323,7 +331,9 @@ jobs:
     steps:
       - name: Delegated to App-verified macOS execution
         if: env.RUN_LANE != 'true'
-        run: echo 'Protected Mac CI checks are independently required.'
+        run: |
+          echo 'Requested macOS lane delegated to protected Mac CI; this Ubuntu job only reports delegation.'
+          echo 'Execution results are the three App-owned Mac CI checks. The platform in this legacy check name is the requested platform.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         if: env.RUN_LANE == 'true'
         with:

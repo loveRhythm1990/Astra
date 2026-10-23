@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -63,6 +64,7 @@ class PolicyTests(unittest.TestCase):
         a.data[self.group_path + "/runners"] = {"runners": [{"name": "fixture-arm", "status": "online", "busy": False,
             "labels": [{"name": n} for n in ("self-hosted", "macOS", "ARM64", "mac-arm64-mini", "astra-macos-admitted")]}]}
         a.data[f"/repos/{m.REPO}/rules/branches/main"] = [{"type": "required_status_checks", "parameters": {
+            "strict_required_status_checks_policy": True,
             "required_status_checks": [{"context": c, "integration_id": 5} for c in m.CONTEXTS]}}]
         a.data[f"/repos/{m.REPO}/environments/astra-macos-control"] = {
             "deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True}}
@@ -76,7 +78,8 @@ class PolicyTests(unittest.TestCase):
         a.data[self.run_path + "/attempts/1/jobs"] = {"jobs": [self.active]}
         a.data[self.run_path + "/jobs?filter=latest"] = {"jobs": [self.active]}
         self.plan = {**m.source(a, 42), "schema": 1, "app_id": 5, "run_id": 100,
-                     "attempt": 1, "route": "self-hosted", "group_id": 9}
+                     "attempt": 1, "route": "self-hosted", "group_id": 9,
+                     "expires_at": int(time.time()) + m.AUTHORIZATION_SECONDS}
         self.config = {"app_id": 5, "kind": "pr", "group_id": 9, "runner_name": "fixture-arm"}
         self.request = {"run_id": 100, "attempt": 1, "head": H}
 
@@ -152,6 +155,11 @@ class PolicyTests(unittest.TestCase):
                 self.api.data[f"/repos/{m.REPO}/rules/branches/main"][0]["parameters"]["required_status_checks"][0]["integration_id"] = source
                 with self.assertRaises(m.Unavailable):
                     m.require_check_sources(self.api, 5)
+
+    def test_up_to_date_branch_enforcement_is_required_for_tuple_bound_checks(self):
+        self.api.data[f"/repos/{m.REPO}/rules/branches/main"][0]["parameters"]["strict_required_status_checks_policy"] = False
+        with self.assertRaises(m.Unavailable):
+            m.require_check_sources(self.api, 5)
 
     def test_private_member_personal_fork_is_admitted_and_each_attempt_rechecks(self):
         self.authorize()
@@ -268,7 +276,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_ordinary_hosted_results_require_matching_source_all_three_jobs_and_real_macos(self):
         runs_path = f"/repos/{m.REPO}/actions/workflows/test.yml/runs?event=pull_request&head_sha={H}"
-        self.api.data[runs_path] = {"workflow_runs": [{"id": 200, "head_repository": {"id": 2},
+        self.api.data[runs_path] = {"workflow_runs": [{"id": 200, "status": "completed", "head_repository": {"id": 2},
             "pull_requests": [{"number": 42, "head": {"sha": H}, "base": {"sha": B}}]}]}
         names = ("Terminal: default-reader (macos-15)", "Terminal: reflow (macos-15)",
                  "macOS workspace coordination contracts")
@@ -281,6 +289,8 @@ class PolicyTests(unittest.TestCase):
             self.assertNotEqual(m.hosted_result(self.api, self.plan), "success")
             jobs[0] = before
         jobs.pop()
+        self.assertEqual(m.hosted_result(self.api, self.plan), "failure")
+        self.api.data[runs_path]["workflow_runs"][0]["status"] = "in_progress"
         self.assertIsNone(m.hosted_result(self.api, self.plan))
         self.api.data[runs_path]["workflow_runs"][0]["pull_requests"][0]["base"]["sha"] = "d" * 40
         self.assertIsNone(m.hosted_result(self.api, self.plan))
@@ -318,6 +328,119 @@ class PolicyTests(unittest.TestCase):
                 api.pages("/fixture/jobs", "jobs")
         with self.assertRaises(m.Unavailable):
             api.request("https://fixture.invalid/token")
+
+    def test_ordinary_hint_returns_without_sleep_and_permission_denial_is_immediate(self):
+        event = {"number": 42, "pull_request": {"head": {"sha": H}, "base": {"ref": "main"}}}
+        m.save_checks(self.api, {**self.plan, "route": "ordinary"})
+        with patch.object(m.time, "sleep") as sleep:
+            self.assertFalse(m.hint(self.api, event, 5))
+            sleep.assert_not_called()
+        self.api.checks.clear()
+        self.authorize()
+        self.api.status[self.run_path] = 403
+        with patch.object(m.time, "sleep") as sleep:
+            self.assertFalse(m.hint(self.api, event, 5))
+            sleep.assert_not_called()
+
+    def test_hint_waits_for_delayed_plan_and_exhausted_budget_keeps_hosted(self):
+        event = {"number": 42, "pull_request": {"head": {"sha": H}, "base": {"ref": "main"}}}
+        self.authorize()
+        records = copy.deepcopy(self.api.checks)
+        self.api.checks.clear()
+        def publish_after_first_sleep(_seconds):
+            self.api.checks = records
+        with patch.object(m.time, "sleep", side_effect=publish_after_first_sleep) as sleep:
+            self.assertTrue(m.hint(self.api, event, 5))
+            self.assertEqual(sleep.call_count, 1)
+        self.api.checks.clear()
+        with patch.object(m.time, "sleep") as sleep, patch.object(m.time, "monotonic", side_effect=[0, 91]):
+            self.assertFalse(m.hint(self.api, event, 5))
+            sleep.assert_not_called()
+
+    def test_expired_authorization_rejects_actual_rerun_and_publication(self):
+        self.plan["expires_at"] = 1
+        self.authorize()
+        with self.assertRaises(m.Unavailable):
+            m.admit(self.api, self.request, self.config)
+        with self.assertRaises(m.Unavailable):
+            m.finish(self.api, self.plan)
+        self.assertTrue(all(c["status"] == "in_progress" for c in self.api.checks))
+
+    def prepare_ordinary_reconciliation(self):
+        self.api.status["/orgs/matrixorigin/members/fixture-member"] = 404
+        self.plan["route"] = "ordinary"
+        self.authorize()
+        self.api.data[f"/repos/{m.REPO}/pulls?state=open&base=main"] = [
+            {"number": 42, "head": {"sha": H}}]
+        self.api.data[f"/repos/{m.REPO}/actions/workflows/test.yml/runs?event=pull_request&head_sha={H}"] = {
+            "workflow_runs": [{"id": 200, "status": "completed", "head_repository": {"id": 2},
+                "pull_requests": [{"number": 42, "head": {"sha": H}, "base": {"sha": B}}]}]}
+        self.jobs200 = f"/repos/{m.REPO}/actions/runs/200/jobs?filter=latest"
+        self.api.data[self.jobs200] = {"jobs": [
+            {"name": name, "status": "completed", "conclusion": "success", "labels": ["macos-15"]}
+            for name in ("Terminal: default-reader (macos-15)", "Terminal: reflow (macos-15)",
+                         "macOS workspace coordination contracts")]}
+
+    def test_reconciliation_recovers_a_lost_completion_notification(self):
+        self.prepare_ordinary_reconciliation()
+        m.reconcile(self.api, 5)
+        self.assertTrue(all(c["status"] == "completed" and c["conclusion"] == "success" for c in self.api.checks))
+        writes = len(self.api.writes)
+        m.reconcile(self.api, 5)
+        self.assertEqual(len(self.api.writes), writes)
+
+    def test_completed_run_with_missing_or_skipped_lanes_fails_instead_of_pending(self):
+        for mode in ("missing", "skipped"):
+            with self.subTest(mode=mode):
+                self.api.checks.clear()
+                self.prepare_ordinary_reconciliation()
+                if mode == "missing":
+                    self.api.data[self.jobs200]["jobs"].pop()
+                else:
+                    self.api.data[self.jobs200]["jobs"][0]["conclusion"] = "skipped"
+                m.reconcile(self.api, 5)
+                self.assertTrue(all(c["status"] == "completed" and c["conclusion"] == "failure" for c in self.api.checks))
+
+    def test_approval_pending_expires_and_does_not_become_a_successful_skip(self):
+        self.prepare_ordinary_reconciliation()
+        self.api.data[f"/repos/{m.REPO}/actions/workflows/test.yml/runs?event=pull_request&head_sha={H}"]["workflow_runs"] = []
+        m.reconcile(self.api, 5)
+        self.assertTrue(all(c["status"] == "in_progress" for c in self.api.checks))
+        with patch.object(m.time, "time", return_value=self.plan["expires_at"] + 1):
+            m.reconcile(self.api, 5)
+        self.assertTrue(all(c["status"] == "completed" and c["conclusion"] == "failure" for c in self.api.checks))
+        self.assertTrue(all("expired" in c["output"]["summary"] for c in self.api.checks))
+
+    def test_legacy_authorization_without_deadline_fails_closed_instead_of_staying_pending(self):
+        self.prepare_ordinary_reconciliation()
+        del self.plan["expires_at"]
+        m.save_checks(self.api, self.plan)
+        m.reconcile(self.api, 5)
+        self.assertTrue(all(c["conclusion"] == "failure" for c in self.api.checks))
+        with self.assertRaises(m.Unavailable):
+            m.require_unexpired(self.plan)
+
+    def test_one_unavailable_pr_does_not_starve_reconciliation_of_other_prs(self):
+        self.prepare_ordinary_reconciliation()
+        self.api.data[f"/repos/{m.REPO}/pulls?state=open&base=main"].insert(0,
+            {"number": 43, "head": {"sha": "d" * 40}})
+        pages = self.api.pages
+        def flaky_pages(path, key=None):
+            if path == f"/repos/{m.REPO}/commits/{'d' * 40}/check-runs":
+                raise m.Unavailable("fixture unavailable")
+            return pages(path, key)
+        with patch.object(self.api, "pages", side_effect=flaky_pages):
+            m.reconcile(self.api, 5)
+        self.assertTrue(all(c["conclusion"] == "success" for c in self.api.checks))
+
+    def test_expiry_reconciliation_does_not_downgrade_already_successful_results(self):
+        self.prepare_ordinary_reconciliation()
+        m.save_checks(self.api, self.plan, "success")
+        with patch.object(m.time, "time", return_value=self.plan["expires_at"] + 1):
+            m.reconcile(self.api, 5)
+            m.save_checks(self.api, self.plan, "failure", only_pending=True)
+        self.assertTrue(all(c["conclusion"] == "success" for c in self.api.checks))
+
 
 
 
@@ -362,6 +485,20 @@ sys.exit(17 if failed else 0)
                             self.assertIn("--test-threads=1", commands[-1])
                         if not fail and lane == "reflow":
                             self.assertEqual([c[:2] for c in commands], [["cargo", "build"], ["npm", "ci"], ["npm", "test"]])
+
+    def test_hint_permissions_are_scoped_and_reconciliation_stays_metadata_only(self):
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        top = workflow.split("\non:", 1)[0]
+        self.assertNotIn("actions: read", top)
+        self.assertNotIn("checks: read", top)
+        scope = workflow.split("\n  scope:\n", 1)[1].split("\n  cli-test-build:\n", 1)[0]
+        for permission in ("actions: read", "checks: read", "pull-requests: read", "contents: read"):
+            self.assertIn(permission, scope)
+        observer = (ROOT / ".github/workflows/macos-results.yml").read_text()
+        self.assertIn("cron: '*/15 * * * *'", observer)
+        self.assertIn("macos_runner.py reconcile", observer)
+        self.assertNotIn("permission-actions: write", observer)
+        self.assertNotIn("_mac_source", observer)
 
     def test_credential_owner_and_cache_boundary_are_outside_pr_execution(self):
         workflow = (ROOT / ".github/workflows/macos-trusted.yml").read_text()

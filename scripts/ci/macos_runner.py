@@ -25,9 +25,15 @@ WORKFLOW = ".github/workflows/macos-trusted.yml"
 WORKFLOW_REF = f"{REPO}/{WORKFLOW}@refs/heads/main"
 CONTEXTS = ("Mac CI: default reader", "Mac CI: reflow", "Mac CI: coordination")
 SHA = re.compile(r"^[0-9a-f]{40}$")
+AUTHORIZATION_SECONDS = 3 * 60 * 60
+HINT_WAIT_SECONDS = 90
 
 
 class Unavailable(Exception):
+    pass
+
+
+class PermissionDenied(Unavailable):
     pass
 
 
@@ -61,6 +67,8 @@ class API:
 
     def get(self, path):
         status, value = self.request(path)
+        if status in (401, 403):
+            raise PermissionDenied("API permission unavailable")
         if status != 200:
             raise Unavailable(f"GitHub API returned {status}")
         return value
@@ -130,16 +138,22 @@ def require_check_sources(api, app_id):
     if len(branches) != 1 or branches[0].get("name") != "main" or branches[0].get("type") != "branch":
         raise Unavailable("control environment allows an untrusted branch or tag")
     required = {}
+    up_to_date = False
     for rule in api.get(f"/repos/{REPO}/rules/branches/main"):
         if rule["type"] == "required_status_checks":
+            up_to_date |= rule["parameters"].get("strict_required_status_checks_policy") is True
             for check in rule["parameters"]["required_status_checks"]:
                 required[check["context"]] = check.get("integration_id")
     status, protection = api.request(f"/repos/{REPO}/branches/main/protection")
     if status == 200:
-        for check in (protection.get("required_status_checks") or {}).get("checks", []):
+        protected_checks = protection.get("required_status_checks") or {}
+        up_to_date |= protected_checks.get("strict") is True
+        for check in protected_checks.get("checks", []):
             required[check["context"]] = check.get("app_id")
     elif status != 404:
         raise Unavailable("cannot verify required-check source binding")
+    if not up_to_date:
+        raise Unavailable("main must require checks on an up-to-date branch")
     if any(required.get(name) != app_id for name in CONTEXTS):
         raise Unavailable("three Mac CI checks must be required from the dedicated App")
 
@@ -163,7 +177,7 @@ def checks(api, head):
     return api.pages(f"/repos/{REPO}/commits/{head}/check-runs", "check_runs")
 
 
-def save_checks(api, plan, conclusion=None, summary="Awaiting verified execution"):
+def save_checks(api, plan, conclusion=None, summary="Awaiting verified execution", *, only_pending=False):
     existing = {name: [] for name in CONTEXTS}
     for check in checks(api, plan["head"]):
         if check["name"] in existing and check.get("app", {}).get("id") == plan["app_id"]:
@@ -177,6 +191,8 @@ def save_checks(api, plan, conclusion=None, summary="Awaiting verified execution
             data["conclusion"] = conclusion
         previous = max(existing[name], key=lambda c: c["id"], default=None)
         if previous:
+            if only_pending and previous["status"] == "completed":
+                continue
             try:
                 old = json.loads(previous["output"]["text"])
                 if (old["run_id"], old["attempt"]) > (plan["run_id"], plan["attempt"]):
@@ -227,7 +243,18 @@ def validate_run(api, plan, attempt=None):
     return run
 
 
+def expired(plan):
+    deadline = plan.get("expires_at")
+    return not isinstance(deadline, int) or time.time() >= deadline
+
+
+def require_unexpired(plan):
+    if expired(plan):
+        raise Unavailable("authorization expired; start fresh trusted control")
+
+
 def refresh(api, plan):
+    require_unexpired(plan)
     if plan["kind"] == "pr":
         current = source(api, plan["pr"])
         if not same_source(current, plan) or not member(api, current["author"]):
@@ -300,7 +327,8 @@ def hosted_result(api, plan):
                   "macOS workspace coordination contracts"}
         actual = {j["name"]: j for j in jobs if j["name"] in wanted}
         if set(actual) != wanted or any(j["status"] != "completed" for j in actual.values()):
-            return None
+            # A completed run cannot later gain skipped/missing lane execution.
+            return "failure" if run["status"] == "completed" else None
         return "success" if all(j["conclusion"] == "success" and "macos-15" in j["labels"]
                                  for j in actual.values()) else "failure"
     return None
@@ -328,7 +356,8 @@ def plan_command(api, event, app_id):
         plan = {"kind": "main", "pr": 0, "base": event["before"], "head": head, "merge": head}
         trusted = os.environ.get("ASTRA_MACOS_MAIN_ISOLATED") == "true"
     plan.update(schema=1, run_id=int(os.environ["GITHUB_RUN_ID"]), app_id=app_id,
-                attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]), route="ordinary", group_id=0)
+                attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]), route="ordinary", group_id=0,
+                expires_at=int(time.time()) + AUTHORIZATION_SECONDS)
     if not selected(api, plan):
         plan["route"] = "unaffected"
         save_checks(api, plan, "success", "Canonical scope does not select these lanes")
@@ -359,7 +388,8 @@ def hint(api, event, app_id):
     number = event.get("number", 0)
     if not isinstance(head, str) or not SHA.fullmatch(head):
         return False
-    for _ in range(10):
+    deadline = time.monotonic() + HINT_WAIT_SECONDS
+    for _ in range(HINT_WAIT_SECONDS // 2 + 1):
         try:
             rows = checks(api, head)
             run_ids = {int(c["external_id"].split(":")[1]) for c in rows
@@ -367,21 +397,35 @@ def hint(api, event, app_id):
                        and c.get("external_id", "").startswith("astra-macos-v1:")}
             for run_id in sorted(run_ids, reverse=True):
                 plan = authorization(api, head, run_id, app_id)
-                if plan["pr"] != number or plan["route"] not in ("self-hosted", "hosted"):
+                if plan["pr"] != number:
                     continue
+                require_unexpired(plan)
                 validate_run(api, plan)
                 if number and not same_source(plan, source(api, number)):
                     continue
-                return True
+                # Once trusted control has chosen ordinary hosted execution,
+                # there is no reason to keep delaying a non-member's scope job.
+                if plan["route"] in ("ordinary", "unaffected", "disabled"):
+                    return False
+                if plan["route"] in ("self-hosted", "hosted"):
+                    return True
+        except PermissionDenied:
+            print("::notice::Mac CI hint lacks API access; retaining hosted execution.")
+            return False
         except (Unavailable, ValueError, KeyError):
             pass
-        time.sleep(2)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(2, remaining))
+    print("::notice::Mac CI routing hint unavailable within budget; retaining hosted execution.")
     return False
 
 
 def finish(api, plan):
     if plan["route"] in ("disabled", "unaffected"):
-        return
+        return True
+    require_unexpired(plan)
     if plan["route"] == "ordinary":
         if plan["kind"] != "pr" or not same_source(plan, source(api, plan["pr"])):
             raise Unavailable("hosted result is stale")
@@ -396,11 +440,43 @@ def finish(api, plan):
     if result is not None:
         observed = {**plan, "attempt": validate_run(api, plan)["run_attempt"]}
         save_checks(api, observed, "success" if result == "success" else "failure", "Verified macOS execution: " + result)
+        return True
+    return False
+
+
+def reconcile(api, app_id):
+    """Repair lost completion notifications and fail expired pending checks."""
+    require_check_sources(api, app_id)
+    prs = api.pages(f"/repos/{REPO}/pulls?state=open&base=main")
+    for pr in prs:
+        try:
+            rows = checks(api, pr["head"]["sha"])
+            latest = {}
+            for row in rows:
+                if row["name"] in CONTEXTS and row.get("app", {}).get("id") == app_id:
+                    if row["name"] not in latest or row["id"] > latest[row["name"]]["id"]:
+                        latest[row["name"]] = row
+            if not latest or (len(latest) == len(CONTEXTS) and
+                              all(c["status"] == "completed" for c in latest.values())):
+                continue
+            plan = json.loads(max(latest.values(), key=lambda c: c["id"])["output"]["text"])
+            if (plan["schema"] != 1 or plan["app_id"] != app_id or plan["kind"] != "pr"
+                    or plan["head"] != pr["head"]["sha"] or plan["pr"] != pr["number"]):
+                continue
+            if expired(plan):
+                save_checks(api, plan, "failure",
+                    "Mac CI authorization expired; resolve approval/runner state and start fresh Mac CI control",
+                    only_pending=True)
+            else:
+                finish(api, plan)
+        except (Unavailable, KeyError, TypeError, ValueError):
+            # Other PRs still get reconciliation during a transient per-PR failure.
+            print("::notice::A pending Mac CI result could not be reconciled; no success published.")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("plan", "hint", "finish", "refresh", "admit", "observe"))
+    parser.add_argument("command", choices=("plan", "hint", "finish", "refresh", "admit", "observe", "reconcile"))
     parser.add_argument("--plan")
     parser.add_argument("--config")
     args = parser.parse_args()
@@ -422,6 +498,8 @@ def main():
             plan_command(api, event, app_id)
         elif args.command == "hint":
             outputs({"delegated": str(hint(api, event, app_id)).lower()})
+        elif args.command == "reconcile":
+            reconcile(api, app_id)
         elif args.command == "observe":
             run = api.get(f"/repos/{REPO}/actions/runs/{int(event['workflow_run']['id'])}")
             if run["event"] != "pull_request" or run["path"] != ".github/workflows/test.yml":
