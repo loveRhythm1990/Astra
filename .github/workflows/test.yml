@@ -2,6 +2,8 @@ name: Test Suite
 
 permissions:
   contents: read
+  checks: read
+  pull-requests: read
 
 on:
   push:
@@ -23,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
+      macos_delegated: ${{ steps.mac.outputs.delegated }}
       test_cli: ${{ steps.scope.outputs.test_cli }}
       test_runtime: ${{ steps.scope.outputs.test_runtime }}
       test_services: ${{ steps.scope.outputs.test_services }}
@@ -39,6 +42,15 @@ jobs:
       - name: Classify changed paths
         id: scope
         run: python3 scripts/ci/ci_scope.py
+      - name: Read trusted macOS execution hint
+        id: mac
+        if: vars.ASTRA_MACOS_MIGRATION_ENABLED == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASTRA_MACOS_APP_ID: ${{ vars.ASTRA_MACOS_APP_ID }}
+        # A missing/forged hint cannot satisfy the App-owned required results.
+        run: python3 scripts/ci/macos_runner.py hint
 
   # Package groups remain parallel. CLI builds and executes its full inventory
   # once; stable protected labels require that same completed test result.
@@ -240,7 +252,9 @@ jobs:
     name: "Terminal: ${{ matrix.segment }} (${{ matrix.os }})"
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-15' && matrix.segment != 'dev-tty-reader' && needs.scope.outputs.macos_delegated == 'true' && 'ubuntu-latest' || matrix.os }}
+    env:
+      RUN_LANE: ${{ !(matrix.os == 'macos-15' && matrix.segment != 'dev-tty-reader' && needs.scope.outputs.macos_delegated == 'true') }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -248,50 +262,32 @@ jobs:
         os: [ubuntu-latest, macos-15]
         segment: [default-reader, dev-tty-reader, reflow]
     steps:
+      - name: Delegated to App-verified macOS execution
+        if: env.RUN_LANE != 'true'
+        run: echo 'Protected Mac CI checks are independently required.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: env.RUN_LANE == 'true'
         with:
           persist-credentials: false
       - uses: ./.github/actions/rust-setup
+        if: env.RUN_LANE == 'true'
         with:
           shared-key: ci-terminal-pty
-          # One writer per OS populates the shared dependency cache on pushes.
           save-cache: ${{ github.event_name == 'push' && matrix.segment == 'default-reader' }}
           install-nextest: false
-      # Separate runners keep dev-tty feature unification out of the default
-      # reader and avoid serializing two lib builds and the reflow binary build.
-      - name: Test default terminal reader through PTYs
-        if: matrix.segment == 'default-reader'
-        run: |
-          cargo test --locked -p astra-cli --lib tui::terminal_startup -- --test-threads=2
-      - name: Initialize system Git for macOS CLI observation
-        if: matrix.os == 'macos-15' && matrix.segment == 'default-reader'
-        timeout-minutes: 1
-        run: |
-          time /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent LANG=C LC_ALL=C \
-            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
-            GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 \
-            /usr/bin/git -C "$GITHUB_WORKSPACE" -c core.fsmonitor=false \
-            -c core.untrackedCache=false rev-parse --show-toplevel
-      - name: Test macOS CLI Bash execution
-        if: matrix.os == 'macos-15' && matrix.segment == 'default-reader'
-        # Reuse the default-feature CLI test executable already built above.
-        run: >-
-          cargo test --locked --manifest-path Cargo.toml -p astra-cli
-          --lib edge_tools::shell::tests::bash_echo_returns_output -- --exact
-      - name: Test dev-tty terminal reader through PTYs
-        if: matrix.segment == 'dev-tty-reader'
-        run: |
-          cargo test --locked -p astra-cli --lib --features crossterm/use-dev-tty tui::terminal_startup -- --test-threads=2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        if: matrix.segment == 'reflow'
+        if: env.RUN_LANE == 'true' && matrix.segment == 'reflow'
         with:
           node-version-file: .nvmrc
+      - name: Test default terminal reader and macOS CLI Bash
+        if: env.RUN_LANE == 'true' && matrix.segment == 'default-reader'
+        run: bash scripts/ci/run-macos-lanes.sh default-reader
+      - name: Test dev-tty terminal reader through PTYs
+        if: matrix.segment == 'dev-tty-reader'
+        run: cargo test --locked -p astra-cli --lib --features crossterm/use-dev-tty tui::terminal_startup -- --test-threads=2
       - name: Test inline terminal resize with xterm reflow
-        if: matrix.segment == 'reflow'
-        run: |
-          cargo build --locked -p astra-cli --bin astra
-          npm ci --ignore-scripts --prefix scripts/tui-reflow
-          ASTRA_TEST_BINARY="$PWD/target/debug/astra" npm test --prefix scripts/tui-reflow
+        if: env.RUN_LANE == 'true' && matrix.segment == 'reflow'
+        run: bash scripts/ci/run-macos-lanes.sh reflow
 
   macos-workspace-coordination:
     name: "Test: macOS workspace coordination"
@@ -320,42 +316,27 @@ jobs:
     name: "macOS workspace coordination contracts"
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_core == 'true' || needs.scope.outputs.test_cli == 'true') }}
-    runs-on: macos-15
+    runs-on: ${{ needs.scope.outputs.macos_delegated == 'true' && 'ubuntu-latest' || 'macos-15' }}
+    env:
+      RUN_LANE: ${{ needs.scope.outputs.macos_delegated != 'true' }}
     timeout-minutes: 30
     steps:
+      - name: Delegated to App-verified macOS execution
+        if: env.RUN_LANE != 'true'
+        run: echo 'Protected Mac CI checks are independently required.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: env.RUN_LANE == 'true'
         with:
           persist-credentials: false
       - uses: ./.github/actions/rust-setup
+        if: env.RUN_LANE == 'true'
         with:
-          # Reuse the CLI dependency cache; default-reader is its only writer.
           shared-key: ci-terminal-pty
           save-cache: "false"
           install-nextest: "false"
-      - name: Lint macOS workspace coordination
-        run: >-
-          cargo clippy --locked --manifest-path Cargo.toml -p astra-tools
-          --all-targets -- -D warnings
-      - name: Initialize system Git for bounded observation probes
-        timeout-minutes: 1
-        # Checkout uses Homebrew Git, but the hardened observer selects
-        # /usr/bin/git with a cleared environment. Initialize that executable
-        # before its first use under the production two-second probe deadline.
-        # Keep the timing visible so runner startup failures are diagnosable.
-        run: |
-          time /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent LANG=C LC_ALL=C \
-            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
-            GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 \
-            /usr/bin/git -C "$GITHUB_WORKSPACE" -c core.fsmonitor=false \
-            -c core.untrackedCache=false rev-parse --show-toplevel
       - name: Test macOS workspace coordination invariants
-        # Several invariants launch re-exec lock contenders while fingerprint
-        # probes deliberately have a short wall-clock deadline. Keep the module
-        # serial on shared CI hosts; the contender test supplies explicit
-        # cross-process concurrency without starving unrelated probes.
-        run: >-
-          cargo test --locked --manifest-path Cargo.toml -p astra-tools
-          workspace_observation::tests:: -- --test-threads=1
+        if: env.RUN_LANE == 'true'
+        run: bash scripts/ci/run-macos-lanes.sh coordination
 
   # Preserve the required core check while its package groups run separately.
   # The aggregate requires all selected online jobs, including integration.

@@ -1,0 +1,12 @@
+#!/bin/bash
+# Root-owned fixed sudo target; no command arguments or caller paths allowed.
+set -euo pipefail
+[ "$#" -eq 0 ]
+case "${SUDO_USER:-}" in
+  astra-ci-pr) policy=/etc/astra-ci/pr.json ;;
+  astra-ci-main) policy=/etc/astra-ci/main.json ;;
+  *) echo 'Unrecognized runner identity' >&2; exit 1 ;;
+esac
+exec /usr/bin/env -i PATH=/usr/bin:/bin \
+  /opt/astra-ci/python/bin/python3 -I /opt/astra-ci/lib/macos_runner.py \
+  admit --config "$policy"

@@ -119,3 +119,11 @@ before rerunning CI:
 
 This separation prevents permission failures from being treated as flaky CI
 and keeps external-fork behavior part of the repository's delivery contract.
+
+## Self-hosted macOS migration
+
+The three-lane member/main migration, dedicated result source, runner-side
+admission, isolation requirements and explicit activation/rollback steps are
+documented in [Self-hosted macOS CI](macos-ci-runner.md). Migration is opt-in;
+ordinary hosted execution remains the default until administration and host
+acceptance are complete.
