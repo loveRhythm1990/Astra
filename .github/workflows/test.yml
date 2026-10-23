@@ -22,13 +22,9 @@ jobs:
     name: Determine test scope
     permissions:
       contents: read
-      checks: read
-      pull-requests: read
-      actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      macos_delegated: ${{ steps.mac.outputs.delegated }}
       test_cli: ${{ steps.scope.outputs.test_cli }}
       test_runtime: ${{ steps.scope.outputs.test_runtime }}
       test_services: ${{ steps.scope.outputs.test_services }}
@@ -45,11 +41,31 @@ jobs:
       - name: Classify changed paths
         id: scope
         run: python3 scripts/ci/ci_scope.py
+
+  macos-routing:
+    name: Read macOS delegation
+    needs: scope
+    if: >-
+      !cancelled() && vars.ASTRA_MACOS_MIGRATION_ENABLED == 'true' &&
+      (needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+      actions: read
+    outputs:
+      macos_delegated: ${{ steps.mac.outputs.delegated }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Read trusted macOS execution hint
         id: mac
         if: >-
           vars.ASTRA_MACOS_MIGRATION_ENABLED == 'true' &&
-          (steps.scope.outputs.test_cli == 'true' || steps.scope.outputs.test_core == 'true')
+          (needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true')
         timeout-minutes: 2
         continue-on-error: true
         env:
@@ -256,11 +272,11 @@ jobs:
 
   terminal-pty-shards:
     name: "Terminal: ${{ matrix.segment }} (${{ matrix.os }})"
-    needs: scope
+    needs: [scope, macos-routing]
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
-    runs-on: ${{ matrix.os == 'macos-15' && matrix.segment != 'dev-tty-reader' && needs.scope.outputs.macos_delegated == 'true' && 'ubuntu-latest' || matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-15' && matrix.segment != 'dev-tty-reader' && needs.macos-routing.outputs.macos_delegated == 'true' && 'ubuntu-latest' || matrix.os }}
     env:
-      RUN_LANE: ${{ !(matrix.os == 'macos-15' && matrix.segment != 'dev-tty-reader' && needs.scope.outputs.macos_delegated == 'true') }}
+      RUN_LANE: ${{ !(matrix.os == 'macos-15' && matrix.segment != 'dev-tty-reader' && needs.macos-routing.outputs.macos_delegated == 'true') }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -322,11 +338,11 @@ jobs:
 
   macos-workspace-coordination-tests:
     name: "macOS workspace coordination contracts"
-    needs: scope
+    needs: [scope, macos-routing]
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_core == 'true' || needs.scope.outputs.test_cli == 'true') }}
-    runs-on: ${{ needs.scope.outputs.macos_delegated == 'true' && 'ubuntu-latest' || 'macos-15' }}
+    runs-on: ${{ needs.macos-routing.outputs.macos_delegated == 'true' && 'ubuntu-latest' || 'macos-15' }}
     env:
-      RUN_LANE: ${{ needs.scope.outputs.macos_delegated != 'true' }}
+      RUN_LANE: ${{ needs.macos-routing.outputs.macos_delegated != 'true' }}
     timeout-minutes: 30
     steps:
       - name: Delegated to App-verified macOS execution

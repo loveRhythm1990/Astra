@@ -8,10 +8,14 @@ is configured, admitted, compatible, or faster than hosted runners.
 ## Workload and routing
 
 The migrated unit runs default-reader PTYs and the CLI Bash regression, reflow,
-and workspace coordination. It runs sequentially on one runner and reuses its
+and workspace coordination. On the mini it runs sequentially and reuses its
 build directory. This avoids scheduling three simultaneous Rust builds on a
 single small machine. The canonical commands live in
 `scripts/ci/run-macos-lanes.sh` and are shared with ordinary hosted CI.
+Protected hosted fallback runs three parallel jobs, with read-only Rust artifact
+and compiler caches. It does not serialize three hosted Macs onto one job.
+Build reuse on the mini and hosted cache hit rates still require measurement;
+adding the durations of the previous independent jobs is not a latency forecast.
 
 | Event | Execution |
 | --- | --- |
@@ -40,7 +44,11 @@ members execute PR code through that event. The controller independently reads
 the current base B, head H and merge M and requires exactly two ordered parents
 `M^1=B` and `M^2=H`. It checks out immutable M. Null/stale merges, force-pushes,
 base advancement or changed repository identity cannot silently select another
-revision.
+revision. Planning retries a not-yet-ready merge up to 12 times (two seconds
+between attempts), re-reading the full tuple and retaining the event's head.
+Exhaustion creates three explicit failed, retryable App checks instead of
+silently leaving the required contexts absent. A later head is never substituted
+into an earlier event's plan.
 
 A dedicated GitHub App publishes three contexts on H:
 
@@ -61,15 +69,20 @@ could otherwise request it. PR refs and feature-branch dispatches must be denied
 by the environment policy. Control verifies that exact policy before dispatch.
 The publisher reads actual GitHub run/job/step results; it does not accept PR
 artifacts or shell-supplied success flags. A successful combined job satisfies
-all three contexts; any actual test failure fails them conservatively.
+all three contexts; hosted fallback must prove all three parallel macOS jobs
+and their execution steps succeeded. Any actual test failure fails the contexts
+conservatively and cannot be masked by fallback.
 
 The ordinary `pull_request` workflow reads App-owned authorization as a
 best-effort deduplication hint. Delegated copies use cheap Ubuntu notification
 jobs. The hint cannot publish or replace the three required App checks. Missing
 hints preserve hosted execution, so a control race can cause duplicate work,
 not missing coverage. A forged hint leaves the member's trusted checks pending.
-Only the scope job receives the extra Actions/checks/PR read permissions. The
-hint waits up to a 90-second polling budget for delayed control, bounded by a
+Only the separate `macos-routing` job receives the extra Actions/checks/PR read
+permissions. Linux package groups and vendored tests depend directly on scope
+and do not wait for this hint; the mixed Linux/macOS terminal matrix still waits
+for routing. The hint waits up to a 90-second polling budget for delayed
+control, bounded by a
 two-minute step timeout; a known ordinary route or permission denial returns
 immediately. Separate event queues can still outlast that budget. Such runs keep
 hosted execution and can duplicate work; this is not claimed eliminated. The
@@ -85,15 +98,35 @@ missing/skipped selected lanes fails explicitly, including scope disagreement,
 instead of staying pending forever. This retains the pre-existing PR-modifiable
 test-definition limitation for non-member hosted tests.
 
-The same metadata-only observer reconciles pending contexts every 15 minutes
-(and supports manual dispatch), recovering lost completion notifications.
-Authorization expires three hours after planning. At expiry, pending contexts
-are failed with a recovery instruction; expiry never means tests passed. Active
-API/Actions outages or delayed cron execution can delay reconciliation, so this
-is not a platform availability guarantee. Expired authorization is rejected by
-the runner hook and result publisher. After resolving approval/unavailability,
-start fresh trusted control and rerun the applicable tests as required. The
-reconciler never executes PR code, auto-approves forks or relaxes result checks.
+The same metadata-only observer reconciles every 15 minutes (and supports
+manual dispatch), recovering lost completion notifications and PRs with no App
+checks at all. Missing or retryable stale plans dispatch only
+`macos-trusted.yml` at `main`, with a numeric PR number; that workflow repeats
+all source and membership checks. Recovery dispatches intentionally use protected
+hosted routing for members; non-members still use ordinary `pull_request`
+approval and execution. The controller never executes PR code or auto-approves
+forks. Its App token alone requests Actions **write** for dispatch; plan,
+admission, publisher and runner-side credentials retain Actions read. See
+[GitHub's dispatch permission](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event).
+The observer is serialized and writes a non-authorizing recovery marker before
+dispatch. Same-source requests are throttled for 30 minutes, including lost
+responses or failed dispatches; later real control supersedes the marker.
+
+When base/head/merge or author trust changes during execution, publication
+immediately fails the old contexts with an explicit stale-source explanation.
+Reconciliation requests fresh control once a verified merge is available; old
+results cannot overwrite a newer run/attempt. Successful checks and actual test
+failures are not automatically retried. A missing merge remains an explicit
+retryable failure until it resolves.
+
+Authorization expires three hours after planning. At expiry, pending execution
+contexts are failed with a recovery instruction; expiry never means tests
+passed. Active API/Actions outages or delayed cron execution can delay recovery,
+so this is not a platform availability guarantee. Expired authorization is
+rejected by the runner hook and result publisher. After resolving fork approval
+or runner unavailability, start fresh trusted control and rerun applicable tests
+as required. The observer's five-minute job timeout also bounds an individual
+scan; prolonged API failures may require manual recovery.
 
 Both privileged-event workflows explicitly restrict remote cache tokens with
 `cache-mode: read` or `none`. Disabling a client upload is not the authorization
@@ -227,14 +260,20 @@ infrastructure fallback.
    root-owned hook/helper and platform described above. Validate direct-label
    bypass, fork/member/unknown routing, revoked-member reruns, tuple changes,
    cache write denial, pollution isolation and capacity on disposable fixtures.
+   Include an initially null/stale merge, zero App checks, stale completion,
+   lost/forbidden recovery dispatch, recovery throttling and all three parallel
+   hosted results. Recovery must never execute a non-member under the trusted
+   event or treat a marker/timeout as a pass.
 3. Create GitHub Environment `astra-macos-control`, allowing only branch `main`
    via its custom deployment branch policy, with no allowed tags or wildcards.
    After verifying that PR refs and feature dispatches cannot access it, store
    `ASTRA_MACOS_APP_PRIVATE_KEY` only as that environment's secret. Set repository
    variable `ASTRA_MACOS_APP_ID` and `ASTRA_MACOS_GROUP_ID` to the App/PR group IDs.
-   The App needs repository Actions/contents/PR read, administration read,
+   The App installation needs repository Actions write (only the metadata
+   observer requests a write token), contents/PR read, administration read,
    checks write and environments read; organization Members and self-hosted
-   runners/groups read.
+   runners/groups read. Other control jobs explicitly downscope Actions to read;
+   execution jobs receive no App token.
 4. Make the three contexts required with source pinned to the App, and enforce
    strict up-to-date branch checks. Preserve the existing protected checks. The migration control refuses dispatch until this
    binding is visible through the rules/protection APIs.

@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 cache-mode: none
+concurrency:
+  group: mac-ci-result-controller
+  cancel-in-progress: false
 jobs:
   observe:
     if: github.repository == 'matrixorigin/Astra' && vars.ASTRA_MACOS_MIGRATION_ENABLED == 'true'
@@ -30,7 +33,8 @@ jobs:
           permission-members: read
           permission-organization-self-hosted-runners: read
           permission-administration: read
-          permission-actions: read
+          # Only metadata control can dispatch the fixed main workflow.
+          permission-actions: write
           permission-contents: read
           permission-pull-requests: read
           permission-checks: write

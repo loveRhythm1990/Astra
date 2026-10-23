@@ -29,6 +29,8 @@ class FakeAPI(m.API):
         self.calls.append((path, method))
         if data is not None:
             self.writes.append(copy.deepcopy(data))
+            if path.endswith("/dispatches"):
+                return self.status.get(path, 204), None
             if method == "PATCH":
                 row = next(c for c in self.checks if c["id"] == int(path.rsplit("/", 1)[1]))
                 row.update(copy.deepcopy(data))
@@ -227,13 +229,25 @@ class PolicyTests(unittest.TestCase):
                     plan = json.loads(self.api.checks[-1]["output"]["text"])
                     self.assertEqual(plan["route"], expected)
 
+    def test_recovery_dispatch_revalidates_members_and_uses_hosted_without_auto_approval(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "GITHUB_REPOSITORY": m.REPO, "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_OUTPUT": str(Path(directory) / "outputs"), "ASTRA_MACOS_GROUP_ID": "9"}):
+            for membership, route in ((204, "hosted"), (404, "ordinary"), (403, "ordinary")):
+                with self.subTest(membership=membership):
+                    self.api.status["/orgs/matrixorigin/members/fixture-member"] = membership
+                    m.plan_command(self.api, {"inputs": {"pr_number": "42"}}, 5)
+                    self.assertEqual(json.loads(self.api.checks[-1]["output"]["text"])["route"], route)
+
     def test_real_test_failure_cannot_be_masked_by_a_successful_fallback(self):
         self.authorize()
         failed = {**self.active, "status": "completed", "conclusion": "failure",
                   "steps": [{"name": "Run all three macOS lanes", "conclusion": "failure"}]}
-        fallback = {**failed, "name": "Fallback macOS lanes", "conclusion": "success",
-                    "steps": [{"name": "Run all three macOS lanes", "conclusion": "success"}]}
-        self.api.data[self.run_path + "/jobs?filter=latest"] = {"jobs": [failed, fallback]}
+        fallbacks = [{**failed, "name": "Fallback macOS: " + lane, "conclusion": "success",
+                      "labels": ["macos-15"],
+                      "steps": [{"name": "Run macOS lane", "conclusion": "success"}]} for lane in m.HOSTED_LANES]
+        self.api.data[self.run_path + "/jobs?filter=latest"] = {"jobs": [failed, *fallbacks]}
         self.assertFalse(m.can_fallback(self.api, self.plan))
         m.finish(self.api, self.plan)
         self.assertTrue(all(c["conclusion"] == "failure" for c in self.api.checks))
@@ -254,9 +268,8 @@ class PolicyTests(unittest.TestCase):
     def test_untrusted_ordinary_success_does_not_satisfy_member_results(self):
         plan = {**self.plan, "route": "ordinary"}
         self.authorize()
-        with self.assertRaises(m.Unavailable):
-            m.finish(self.api, plan)
-        self.assertFalse(any(c.get("conclusion") == "success" for c in self.api.checks))
+        self.assertTrue(m.finish(self.api, plan))
+        self.assertTrue(all(c.get("conclusion") == "failure" for c in self.api.checks))
 
     def test_delayed_publication_cannot_overwrite_newer_attempt(self):
         self.authorize()
@@ -441,6 +454,136 @@ class PolicyTests(unittest.TestCase):
             m.save_checks(self.api, self.plan, "failure", only_pending=True)
         self.assertTrue(all(c["conclusion"] == "success" for c in self.api.checks))
 
+    def test_merge_source_retries_null_and_old_parents_without_changing_trigger_head(self):
+        for mode in ("null", "old-parents"):
+            with self.subTest(mode=mode):
+                original = copy.deepcopy(self.api.data)
+                if mode == "null":
+                    self.api.data[self.pr_path]["merge_commit_sha"] = None
+                else:
+                    self.api.data[f"/repos/{m.REPO}/git/commits/{M}"]["parents"][0]["sha"] = "d" * 40
+                with patch.object(m.time, "sleep", side_effect=lambda _: self.api.data.update(original)) as sleep:
+                    self.assertEqual(m.source(self.api, 42, attempts=3, expected_head=H)["merge"], M)
+                    self.assertEqual(sleep.call_count, 1)
+        self.api.data[self.pr_path]["head"]["sha"] = "e" * 40
+        with patch.object(m.time, "sleep") as sleep, self.assertRaises(m.StaleSource):
+            m.source(self.api, 42, attempts=3, expected_head=H)
+        sleep.assert_not_called()
+
+    def test_plan_exhaustion_publishes_retryable_failure_instead_of_missing_checks(self):
+        self.api.data[self.pr_path]["merge_commit_sha"] = None
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "GITHUB_REPOSITORY": m.REPO, "GITHUB_EVENT_NAME": "pull_request_target",
+            "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_OUTPUT": str(Path(directory) / "outputs")}), patch.object(m.time, "sleep"):
+            m.plan_command(self.api, {"number": 42, "pull_request": {"head": {"sha": H}}}, 5)
+        self.assertEqual(len(self.api.checks), 3)
+        self.assertTrue(all(c["conclusion"] == "failure" for c in self.api.checks))
+        self.api.data[self.pr_path]["merge_commit_sha"] = M
+        self.api.data[f"/repos/{m.REPO}/pulls?state=open&base=main"] = [{"number": 42, "head": {"sha": H}}]
+        m.reconcile(self.api, 5)
+        self.assertEqual(self.api.writes[-1], {"ref": "main", "inputs": {"pr_number": "42"}})
+
+    def test_zero_checks_recovery_is_bounded_and_never_authorizes_execution(self):
+        self.api.data[f"/repos/{m.REPO}/pulls?state=open&base=main"] = [{"number": 42, "head": {"sha": H}}]
+        m.reconcile(self.api, 5)
+        self.assertEqual(sum(path.endswith("/dispatches") for path, _ in self.api.calls), 1)
+        marker = json.loads(self.api.checks[-1]["output"]["text"])
+        self.assertEqual(marker["route"], "recovering")
+        with self.assertRaises(m.Unavailable):
+            m.admit(self.api, self.request, self.config)
+        m.reconcile(self.api, 5)
+        self.assertEqual(sum(path.endswith("/dispatches") for path, _ in self.api.calls), 1)
+        with patch.object(m.time, "time", return_value=marker["recovery_requested_at"] + m.RECOVERY_COOLDOWN_SECONDS):
+            m.reconcile(self.api, 5)
+        self.assertEqual(sum(path.endswith("/dispatches") for path, _ in self.api.calls), 2)
+        self.authorize()  # Real plan replaces the non-authorizing marker.
+        self.assertEqual(m.authorization(self.api, H, 100, 5), self.plan)
+
+    def test_recovery_does_not_dispatch_over_a_real_plan_or_retry_test_failures(self):
+        self.authorize()
+        m.recover(self.api, {"number": 42, "head": {"sha": H}}, 5)
+        self.assertFalse(any(path.endswith("/dispatches") for path, _ in self.api.calls))
+        m.save_checks(self.api, self.plan, "failure", "Actual test failure")
+        self.api.data[f"/repos/{m.REPO}/pulls?state=open&base=main"] = [{"number": 42, "head": {"sha": H}}]
+        m.reconcile(self.api, 5)
+        self.assertFalse(any(path.endswith("/dispatches") for path, _ in self.api.calls))
+
+    def test_dispatch_permission_failure_is_throttled_and_recovers_after_cooldown(self):
+        pr = {"number": 42, "head": {"sha": H}}
+        path = f"/repos/{m.REPO}/actions/workflows/macos-trusted.yml/dispatches"
+        self.api.status[path] = 403
+        with self.assertRaises(m.Unavailable):
+            m.recover(self.api, pr, 5)
+        marker = json.loads(self.api.checks[-1]["output"]["text"])
+        m.recover(self.api, pr, 5, marker)
+        self.assertEqual(sum(p == path for p, _ in self.api.calls), 1)
+        self.api.status[path] = 204
+        with patch.object(m.time, "time", return_value=marker["recovery_requested_at"] + m.RECOVERY_COOLDOWN_SECONDS):
+            m.recover(self.api, pr, 5, marker)
+        self.assertEqual(sum(p == path for p, _ in self.api.calls), 2)
+
+    def test_refresh_rejects_a_source_changed_during_its_second_api_read(self):
+        with patch.object(m, "source", return_value={**self.plan, "head": "e" * 40}):
+            with self.assertRaises(m.StaleSource):
+                m.refresh(self.api, self.plan)
+
+    def test_zero_checks_unresolved_merge_is_explicit_failure_and_does_not_dispatch(self):
+        self.api.data[self.pr_path]["merge_commit_sha"] = None
+        self.api.data[f"/repos/{m.REPO}/pulls?state=open&base=main"] = [{"number": 42, "head": {"sha": H}}]
+        m.reconcile(self.api, 5)
+        self.assertTrue(all(c["conclusion"] == "failure" for c in self.api.checks))
+        self.assertFalse(any(path.endswith("/dispatches") for path, _ in self.api.calls))
+
+    def test_stale_source_closes_immediately_and_reconciliation_requests_fresh_control(self):
+        self.authorize()
+        newer_base = "d" * 40
+        self.api.data[f"/repos/{m.REPO}/git/ref/heads/main"]["object"]["sha"] = newer_base
+        self.assertTrue(m.finish(self.api, self.plan))
+        self.assertTrue(all(c["conclusion"] == "failure" and "Stale" in c["output"]["summary"] for c in self.api.checks))
+        self.api.data[f"/repos/{m.REPO}/git/commits/{M}"]["parents"][0]["sha"] = newer_base
+        self.api.data[f"/repos/{m.REPO}/pulls?state=open&base=main"] = [{"number": 42, "head": {"sha": H}}]
+        m.reconcile(self.api, 5)
+        self.assertEqual(self.api.writes[-1], {"ref": "main", "inputs": {"pr_number": "42"}})
+
+    def test_stale_old_publisher_cannot_close_new_attempt(self):
+        self.authorize()
+        m.save_checks(self.api, {**self.plan, "attempt": 2})
+        self.api.data[f"/repos/{m.REPO}/git/ref/heads/main"]["object"]["sha"] = "d" * 40
+        writes = len(self.api.writes)
+        self.assertTrue(m.finish(self.api, self.plan))
+        self.assertEqual(len(self.api.writes), writes)
+
+    def test_parallel_hosted_requires_every_real_lane_and_retains_failures(self):
+        plan = {**self.plan, "route": "hosted"}
+        jobs = [{"name": "Fallback macOS: " + lane, "status": "completed", "conclusion": "success",
+                 "labels": ["macos-15"], "steps": [{"name": "Run macOS lane", "conclusion": "success"}]}
+                for lane in m.HOSTED_LANES]
+        self.api.data[self.run_path + "/jobs?filter=latest"] = {"jobs": jobs}
+        m.save_checks(self.api, plan)
+        for mutation in ("missing", "failed", "echo", "ubuntu", "success"):
+            with self.subTest(mutation=mutation):
+                before = copy.deepcopy(jobs)
+                if mutation == "missing":
+                    jobs.pop()
+                elif mutation == "failed":
+                    jobs[0]["conclusion"] = "failure"
+                elif mutation == "echo":
+                    jobs[0]["steps"] = []
+                elif mutation == "ubuntu":
+                    jobs[0]["labels"] = ["ubuntu-latest"]
+                result = m.finish(self.api, plan)
+                if mutation == "missing":
+                    self.assertFalse(result)
+                    self.api.data[self.run_path]["status"] = "completed"
+                    self.assertTrue(m.finish(self.api, plan))
+                    self.assertTrue(all(c["conclusion"] == "failure" for c in self.api.checks))
+                    self.api.data[self.run_path].pop("status")
+                else:
+                    self.assertTrue(result)
+                    self.assertTrue(all(c["conclusion"] == ("success" if mutation == "success" else "failure") for c in self.api.checks))
+                jobs[:] = before
+
 
 
 
@@ -491,13 +634,17 @@ sys.exit(17 if failed else 0)
         top = workflow.split("\non:", 1)[0]
         self.assertNotIn("actions: read", top)
         self.assertNotIn("checks: read", top)
-        scope = workflow.split("\n  scope:\n", 1)[1].split("\n  cli-test-build:\n", 1)[0]
+        scope = workflow.split("\n  macos-routing:\n", 1)[1].split("\n  cli-test-build:\n", 1)[0]
         for permission in ("actions: read", "checks: read", "pull-requests: read", "contents: read"):
             self.assertIn(permission, scope)
         observer = (ROOT / ".github/workflows/macos-results.yml").read_text()
         self.assertIn("cron: '*/15 * * * *'", observer)
         self.assertIn("macos_runner.py reconcile", observer)
-        self.assertNotIn("permission-actions: write", observer)
+        self.assertIn("permission-actions: write", observer)
+        self.assertIn("cancel-in-progress: false", observer)
+        classifier = workflow.split("\n  scope:\n", 1)[1].split("\n  macos-routing:\n", 1)[0]
+        self.assertNotIn("macos_runner.py hint", classifier)
+        self.assertNotIn("actions: read", classifier)
         self.assertNotIn("_mac_source", observer)
 
     def test_credential_owner_and_cache_boundary_are_outside_pr_execution(self):

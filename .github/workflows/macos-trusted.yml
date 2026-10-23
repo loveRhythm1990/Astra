@@ -149,13 +149,17 @@ jobs:
         run: python3 scripts/ci/macos_runner.py refresh --plan "$PLAN"
 
   hosted:
-    name: Fallback macOS lanes
+    name: "Fallback macOS: ${{ matrix.lane }}"
     needs: [plan, hosted-admission]
     if: >-
       !cancelled() && needs.hosted-admission.result == 'success' &&
       needs.hosted-admission.outputs.allowed == 'true'
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [default-reader, reflow, coordination]
     permissions:
       contents: read
     steps:
@@ -169,16 +173,38 @@ jobs:
           ref: ${{ needs.plan.outputs.merge }}
           path: _mac_source
           persist-credentials: false
+      - name: Select candidate Rust toolchain
+        working-directory: _mac_source
+        shell: bash
+        run: |
+          rustc --version
+          echo "RUSTUP_TOOLCHAIN=$(rustup show active-toolchain | cut -d ' ' -f 1)" >> "$GITHUB_ENV"
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        id: sccache
+        continue-on-error: true
+      - name: Configure read-only compiler cache
+        if: steps.sccache.outcome == 'success'
+        working-directory: _mac_source
+        shell: bash
+        run: bash ../_mac_control/scripts/ci/configure-sccache.sh
+      # Restore only. Candidate code cannot write the base branch cache.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        continue-on-error: true
+        with:
+          workspaces: _mac_source -> target
+          shared-key: ci-terminal-pty-main
+          save-if: "false"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        if: matrix.lane == 'reflow'
         with:
           node-version-file: _mac_source/.nvmrc
-      - name: Run all three macOS lanes
+      - name: Run macOS lane
         shell: bash
         working-directory: _mac_source
         env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/astra-macos-${{ github.run_id }}-${{ github.run_attempt }}/target
           npm_config_cache: ${{ runner.temp }}/astra-macos-${{ github.run_id }}-${{ github.run_attempt }}/npm
-        run: bash ../_mac_control/scripts/ci/run-macos-lanes.sh all
+          MACOS_LANE: ${{ matrix.lane }}
+        run: bash ../_mac_control/scripts/ci/run-macos-lanes.sh "$MACOS_LANE"
 
   publish:
     needs: [plan, mini, hosted-admission, hosted]

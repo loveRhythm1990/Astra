@@ -143,11 +143,12 @@ class ParallelGateTests(unittest.TestCase):
                     }, capture_output=True, text=True)
                     self.assertEqual(result.returncode == 0, status == moi_status == "success")
 
-    def test_parallel_jobs_depend_only_on_scope_and_gates_depend_on_shards(self):
+    def test_package_jobs_avoid_macos_routing_and_gates_depend_on_execution(self):
         workflow = (ROOT / ".github/workflows/test.yml").read_text()
         for job in ("terminal-pty-shards", "test-online"):
             header = workflow.split(f"\n  {job}:\n", 1)[1].split("    steps:\n", 1)[0]
-            self.assertIn("    needs: scope\n", header)
+            expected = "[scope, macos-routing]" if job == "terminal-pty-shards" else "scope"
+            self.assertIn(f"    needs: {expected}\n", header)
             self.assertIn("!cancelled()", header)
             self.assertIn("fail-fast: false", header)
         terminal = workflow.split("\n  terminal-pty:\n", 1)[1].split("\n  terminal-pty-shards:", 1)[0]
@@ -163,7 +164,7 @@ class ParallelGateTests(unittest.TestCase):
         self.assertIn("needs.scope.result != 'success'", coordination)
         self.assertIn("if: ${{ !cancelled() }}", coordination)
         contracts = workflow.split("\n  macos-workspace-coordination-tests:\n", 1)[1].split("    steps:\n", 1)[0]
-        self.assertIn("needs: scope", contracts)
+        self.assertIn("needs: [scope, macos-routing]", contracts)
         self.assertNotIn("terminal-pty-shards", contracts, "Tools contracts must not wait for the CLI build")
         online = workflow.split("\n  test-online:\n", 1)[1]
         self.assertIn("lane: [core-runtime, core-turn-core, core-services, integration]", online)

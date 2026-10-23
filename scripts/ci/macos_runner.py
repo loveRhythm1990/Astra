@@ -27,9 +27,20 @@ CONTEXTS = ("Mac CI: default reader", "Mac CI: reflow", "Mac CI: coordination")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 AUTHORIZATION_SECONDS = 3 * 60 * 60
 HINT_WAIT_SECONDS = 90
+SOURCE_ATTEMPTS = 12
+RECOVERY_COOLDOWN_SECONDS = 30 * 60
+HOSTED_LANES = ("default-reader", "reflow", "coordination")
 
 
 class Unavailable(Exception):
+    pass
+
+
+class MergePending(Unavailable):
+    pass
+
+
+class StaleSource(Unavailable):
     pass
 
 
@@ -94,21 +105,39 @@ def member(api, login):
         return False
 
 
-def source(api, number):
+def pr_identity(api, number, expected_head=None):
     pr = api.get(f"/repos/{REPO}/pulls/{int(number)}")
     if (pr["state"] != "open" or pr["base"]["repo"]["full_name"] != REPO
             or pr["base"]["ref"] != "main"):
         raise Unavailable("PR is not an open main pull request")
     base = api.get(f"/repos/{REPO}/git/ref/heads/main")["object"]["sha"]
-    head, merge = pr["head"]["sha"], pr.get("merge_commit_sha")
-    if not all(isinstance(s, str) and SHA.fullmatch(s) for s in (base, head, merge)):
-        raise Unavailable("merge revision unresolved")
-    commit = api.get(f"/repos/{REPO}/git/commits/{merge}")
-    if [p["sha"] for p in commit["parents"]] != [base, head]:
-        raise Unavailable("merge parents do not match current base/head")
+    head = pr["head"]["sha"]
+    if not all(isinstance(s, str) and SHA.fullmatch(s) for s in (base, head)):
+        raise Unavailable("invalid base/head revision")
+    if expected_head is not None and head != expected_head:
+        raise StaleSource("trigger head has been superseded")
     return {"kind": "pr", "pr": int(number), "base": base, "head": head,
-            "merge": merge, "head_repository_id": pr["head"]["repo"]["id"],
+            "merge": pr.get("merge_commit_sha"), "head_repository_id": pr["head"]["repo"]["id"],
             "author": pr["user"]["login"], "author_id": pr["user"]["id"]}
+
+
+def source(api, number, *, attempts=1, expected_head=None):
+    # GitHub computes the test merge asynchronously. Re-read the entire tuple on
+    # each retry, never substitute a head from a newer synchronize event.
+    for attempt in range(attempts):
+        plan = pr_identity(api, number, expected_head)
+        merge = plan["merge"]
+        if isinstance(merge, str) and SHA.fullmatch(merge):
+            status, commit = api.request(f"/repos/{REPO}/git/commits/{merge}")
+            if status in (401, 403):
+                raise PermissionDenied("merge API permission unavailable")
+            if status == 200 and [p["sha"] for p in commit["parents"]] == [plan["base"], plan["head"]]:
+                return plan
+            if status not in (200, 404):
+                raise Unavailable("merge API unavailable")
+        if attempt + 1 < attempts:
+            time.sleep(2)
+    raise MergePending("merge revision not ready for current base/head")
 
 
 def same_source(a, b):
@@ -256,13 +285,19 @@ def require_unexpired(plan):
 def refresh(api, plan):
     require_unexpired(plan)
     if plan["kind"] == "pr":
-        current = source(api, plan["pr"])
-        if not same_source(current, plan) or not member(api, current["author"]):
-            raise Unavailable("source changed or membership is not confirmed")
+        identity = pr_identity(api, plan["pr"])
+        if not same_source(identity, plan) or not member(api, identity["author"]):
+            raise StaleSource("source changed or membership is not confirmed")
+        try:
+            current = source(api, plan["pr"])
+        except MergePending:
+            raise StaleSource("merge no longer matches current base/head") from None
+        if not same_source(current, plan):
+            raise StaleSource("source advanced during refresh")
     else:
         head = api.get(f"/repos/{REPO}/git/ref/heads/main")["object"]["sha"]
         if plan["head"] != head:
-            raise Unavailable("main has advanced")
+            raise StaleSource("main has advanced")
 
 
 def admit(api, request, config):
@@ -291,12 +326,15 @@ def verified_job(api, plan, name):
     jobs = api.pages(f"/repos/{REPO}/actions/runs/{run['id']}/jobs?filter=latest", "jobs")
     matching = [j for j in jobs if j["name"] == name]
     if len(matching) != 1:
-        return None
+        return "failure" if run.get("status") == "completed" else None
     job = matching[0]
     if job["conclusion"] != "success":
         return job["conclusion"] if job["status"] == "completed" else None
     steps = {s["name"]: s["conclusion"] for s in job["steps"]}
-    if steps.get("Run all three macOS lanes") != "success":
+    expected_step = "Run all three macOS lanes" if name == "Migrated macOS lanes" else "Run macOS lane"
+    if steps.get(expected_step) != "success":
+        return "failure"
+    if name.startswith("Fallback macOS:") and "macos-15" not in job.get("labels", []):
         return "failure"
     if name == "Migrated macOS lanes" and job["runner_group_id"] != plan["group_id"]:
         return "failure"
@@ -345,9 +383,16 @@ def plan_command(api, event, app_id):
         raise Unavailable("wrong repository")
     require_check_sources(api, app_id)
     kind = "main" if os.environ["GITHUB_EVENT_NAME"] == "push" else "pr"
+    unresolved = False
     if kind == "pr":
         number = event.get("number") or event.get("inputs", {}).get("pr_number")
-        plan = source(api, number)
+        expected_head = event.get("pull_request", {}).get("head", {}).get("sha")
+        try:
+            plan = source(api, number, attempts=SOURCE_ATTEMPTS, expected_head=expected_head)
+        except MergePending:
+            plan = pr_identity(api, number, expected_head)
+            plan["merge"] = ""
+            unresolved = True
         trusted = member(api, plan["author"])
     else:
         head = event["after"]
@@ -358,7 +403,10 @@ def plan_command(api, event, app_id):
     plan.update(schema=1, run_id=int(os.environ["GITHUB_RUN_ID"]), app_id=app_id,
                 attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]), route="ordinary", group_id=0,
                 expires_at=int(time.time()) + AUTHORIZATION_SECONDS)
-    if not selected(api, plan):
+    if unresolved:
+        plan.update(route="unresolved", retryable=True)
+        save_checks(api, plan, "failure", "Merge revision not ready; trusted reconciliation will retry")
+    elif not selected(api, plan):
         plan["route"] = "unaffected"
         save_checks(api, plan, "success", "Canonical scope does not select these lanes")
     elif trusted:
@@ -400,12 +448,14 @@ def hint(api, event, app_id):
                 if plan["pr"] != number:
                     continue
                 require_unexpired(plan)
+                if plan["route"] in ("unresolved", "recovering"):
+                    return False
                 validate_run(api, plan)
                 if number and not same_source(plan, source(api, number)):
                     continue
                 # Once trusted control has chosen ordinary hosted execution,
                 # there is no reason to keep delaying a non-member's scope job.
-                if plan["route"] in ("ordinary", "unaffected", "disabled"):
+                if plan["route"] in ("ordinary", "unaffected", "disabled", "unresolved", "recovering"):
                     return False
                 if plan["route"] in ("self-hosted", "hosted"):
                     return True
@@ -423,20 +473,36 @@ def hint(api, event, app_id):
 
 
 def finish(api, plan):
-    if plan["route"] in ("disabled", "unaffected"):
+    if plan["route"] in ("disabled", "unaffected", "unresolved", "recovering"):
         return True
     require_unexpired(plan)
-    if plan["route"] == "ordinary":
-        if plan["kind"] != "pr" or not same_source(plan, source(api, plan["pr"])):
-            raise Unavailable("hosted result is stale")
-        if member(api, plan["author"]):
-            raise Unavailable("author now qualifies for protected execution; refresh routing")
-        result = hosted_result(api, plan)
-    else:
-        refresh(api, plan)
-        fallback = verified_job(api, plan, "Fallback macOS lanes")
-        primary = verified_job(api, plan, "Migrated macOS lanes") if plan["route"] == "self-hosted" else None
-        result = primary if primary == "success" or not can_fallback(api, plan) else fallback or primary
+    try:
+        if plan["route"] == "ordinary":
+            if plan["kind"] != "pr" or not same_source(plan, pr_identity(api, plan["pr"])):
+                raise StaleSource("hosted result is stale")
+            try:
+                current = source(api, plan["pr"])
+            except MergePending:
+                raise StaleSource("hosted merge is stale") from None
+            if not same_source(current, plan):
+                raise StaleSource("hosted source advanced during refresh")
+            if member(api, plan["author"]):
+                raise StaleSource("author now qualifies for protected execution")
+            result = hosted_result(api, plan)
+        else:
+            refresh(api, plan)
+            primary = verified_job(api, plan, "Migrated macOS lanes") if plan["route"] == "self-hosted" else None
+            if primary == "success" or not can_fallback(api, plan):
+                result = primary
+            else:
+                lanes = [verified_job(api, plan, "Fallback macOS: " + lane) for lane in HOSTED_LANES]
+                result = (None if any(r is None for r in lanes) else
+                          "success" if all(r == "success" for r in lanes) else "failure")
+    except StaleSource:
+        # Failure, rather than neutral/skipped, keeps required checks fail-closed.
+        save_checks(api, {**plan, "retryable": True}, "failure",
+                    "Stale macOS source or trust; trusted reconciliation will request fresh control")
+        return True
     if result is not None:
         observed = {**plan, "attempt": validate_run(api, plan)["run_attempt"]}
         save_checks(api, observed, "success" if result == "success" else "failure", "Verified macOS execution: " + result)
@@ -444,8 +510,48 @@ def finish(api, plan):
     return False
 
 
+def recover(api, pr, app_id, previous=None):
+    """Only the protected metadata controller may dispatch fixed main control.
+
+    A non-authorizing marker bounds duplicate dispatches (including lost API
+    responses). A later real plan supersedes it by run id. No execution evidence
+    or member authorization is manufactured here.
+    """
+    try:
+        current = source(api, pr["number"], expected_head=pr["head"]["sha"])
+    except MergePending:
+        current = pr_identity(api, pr["number"], pr["head"]["sha"])
+        marker = {**current, "schema": 1, "app_id": app_id, "run_id": 0,
+                  "attempt": 0, "route": "unresolved", "group_id": 0,
+                  "retryable": True, "expires_at": int(time.time()) + AUTHORIZATION_SECONDS}
+        save_checks(api, marker, "failure", "Merge revision not ready; trusted reconciliation will retry")
+        return
+    if (previous and same_source(previous, current) and
+            time.time() - previous.get("recovery_requested_at", 0) < RECOVERY_COOLDOWN_SECONDS):
+        return
+    marker = {**current, "schema": 1, "app_id": app_id,
+              "run_id": previous["run_id"] if previous else 0,
+              "attempt": previous["attempt"] if previous else 0,
+              "route": "recovering", "group_id": 0, "retryable": True,
+              "recovery_requested_at": int(time.time()),
+              "expires_at": int(time.time()) + AUTHORIZATION_SECONDS}
+    save_checks(api, marker, summary="Requesting fresh protected Mac CI control")
+    # A real plan may have appeared since the scan. Do not dispatch over it.
+    latest = {}
+    for row in checks(api, current["head"]):
+        if row["name"] in CONTEXTS and row.get("app", {}).get("id") == app_id:
+            if row["name"] not in latest or row["id"] > latest[row["name"]]["id"]:
+                latest[row["name"]] = row
+    if any(json.loads(row["output"]["text"]) != marker for row in latest.values()):
+        return
+    status, _ = api.request(f"/repos/{REPO}/actions/workflows/macos-trusted.yml/dispatches",
+                            {"ref": "main", "inputs": {"pr_number": str(pr["number"])}})
+    if status not in (200, 204):
+        raise Unavailable("could not request fresh trusted control")
+
+
 def reconcile(api, app_id):
-    """Repair lost completion notifications and fail expired pending checks."""
+    """Recover absent plans/stale sources; close expired or lost results."""
     require_check_sources(api, app_id)
     prs = api.pages(f"/repos/{REPO}/pulls?state=open&base=main")
     for pr in prs:
@@ -456,14 +562,18 @@ def reconcile(api, app_id):
                 if row["name"] in CONTEXTS and row.get("app", {}).get("id") == app_id:
                     if row["name"] not in latest or row["id"] > latest[row["name"]]["id"]:
                         latest[row["name"]] = row
-            if not latest or (len(latest) == len(CONTEXTS) and
-                              all(c["status"] == "completed" for c in latest.values())):
+            if not latest:
+                recover(api, pr, app_id)
                 continue
             plan = json.loads(max(latest.values(), key=lambda c: c["id"])["output"]["text"])
             if (plan["schema"] != 1 or plan["app_id"] != app_id or plan["kind"] != "pr"
                     or plan["head"] != pr["head"]["sha"] or plan["pr"] != pr["number"]):
                 continue
-            if expired(plan):
+            if plan.get("retryable"):
+                recover(api, pr, app_id, plan)
+            elif len(latest) == len(CONTEXTS) and all(c["status"] == "completed" for c in latest.values()):
+                continue
+            elif expired(plan):
                 save_checks(api, plan, "failure",
                     "Mac CI authorization expired; resolve approval/runner state and start fresh Mac CI control",
                     only_pending=True)
