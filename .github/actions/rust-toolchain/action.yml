@@ -14,7 +14,14 @@ runs:
             https://sh.rustup.rs | sh -s -- --default-toolchain none --no-modify-path -y
         fi
         echo "$ci_cargo_bin" >> "$GITHUB_PATH"
+        # Resolve the repository pin rather than a runner service override.
+        unset RUSTUP_TOOLCHAIN
         # Older rustup installs implicitly on show; newer versions require the
         # explicit install. Both read the repository file, including components.
         rustup show active-toolchain || rustup toolchain install
+        ci_rust_toolchain="$(rustup show active-toolchain)"
+        ci_rust_toolchain="${ci_rust_toolchain%% *}"
+        test -n "$ci_rust_toolchain"
+        export RUSTUP_TOOLCHAIN="$ci_rust_toolchain"
+        echo "RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN" >> "$GITHUB_ENV"
         rustc --version

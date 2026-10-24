@@ -35,9 +35,8 @@ MACOS_RUNNER_AUTHORS = {
 MACOS_SELF_HOSTED_LABELS = ["self-hosted", "macOS", "ARM64", "mac-arm64-mini"]
 
 
-def select_macos_runner(event_name: str, event: dict, ref: str) -> list[str]:
-    if event_name == "push" and ref in {"refs/heads/main", "refs/heads/develop"}:
-        return MACOS_SELF_HOSTED_LABELS.copy()
+def select_macos_runner(event_name: str, event: dict) -> list[str]:
+    # Trusted pushes must not consume persistent state left by unmerged PRs.
     if event_name == "pull_request" and isinstance(event, dict):
         pull_request = event.get("pull_request")
         author = pull_request.get("user") if isinstance(pull_request, dict) else None
@@ -289,7 +288,7 @@ def emit(scopes: dict[str, bool], paths: list[str], *, fallback: str | None = No
     try:
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
         labels = select_macos_runner(
-            os.environ.get("GITHUB_EVENT_NAME", ""), event, os.environ.get("GITHUB_REF", "")
+            os.environ.get("GITHUB_EVENT_NAME", ""), event
         )
     except (KeyError, OSError, ValueError, TypeError):
         labels = ["macos-15"]

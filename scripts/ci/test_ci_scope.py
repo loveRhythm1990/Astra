@@ -20,7 +20,7 @@ class CiScopeTests(unittest.TestCase):
             with self.subTest(author_id=author_id):
                 event = {"pull_request": {"user": {"id": author_id, "login": "renamed-login"}},
                          "sender": {"id": 999999999}}
-                self.assertEqual(select_macos_runner("pull_request", event, "refs/pull/1/merge"),
+                self.assertEqual(select_macos_runner("pull_request", event),
                                  ["self-hosted", "macOS", "ARM64", "mac-arm64-mini"])
 
     def test_macos_unknown_author_stays_hosted_even_when_actor_or_login_matches(self):
@@ -28,17 +28,16 @@ class CiScopeTests(unittest.TestCase):
                      {"id": "39627130"}, {"id": True}, None):
             with self.subTest(user=user):
                 event = {"pull_request": {"user": user}, "sender": {"id": 39627130}}
-                self.assertEqual(select_macos_runner("pull_request", event, "refs/pull/1/merge"),
+                self.assertEqual(select_macos_runner("pull_request", event),
                                  ["macos-15"])
         for event in ({}, {"pull_request": None}, []):
-            self.assertEqual(select_macos_runner("pull_request", event, ""), ["macos-15"])
+            self.assertEqual(select_macos_runner("pull_request", event), ["macos-15"])
 
-    def test_macos_only_main_and_develop_pushes_use_mini_without_a_pr_author(self):
-        for ref in ("refs/heads/main", "refs/heads/develop"):
-            self.assertEqual(select_macos_runner("push", {}, ref),
-                             ["self-hosted", "macOS", "ARM64", "mac-arm64-mini"])
-        self.assertEqual(select_macos_runner("push", {}, "refs/heads/feature"), ["macos-15"])
-        self.assertEqual(select_macos_runner("workflow_dispatch", {}, "refs/heads/main"), ["macos-15"])
+    def test_macos_trusted_pushes_and_manual_events_remain_hosted(self):
+        for event_name in ("push", "workflow_dispatch", "pull_request_target"):
+            self.assertEqual(select_macos_runner(event_name,
+                {"ref": "refs/heads/main", "sender": {"id": 39627130}}), ["macos-15"])
+        self.assertEqual(select_macos_runner("push", {"ref": "refs/heads/develop"}), ["macos-15"])
 
     def test_macos_missing_event_routes_to_hosted_without_omitting_scope_checks(self):
         with tempfile.TemporaryDirectory() as directory:

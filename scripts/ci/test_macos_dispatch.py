@@ -38,6 +38,7 @@ class ApiFixture:
             "display_title": f"Test Suite pr=1126 base={BASE} head={HEAD} merge={MERGE}",
             "head_sha": HEAD, "status": "in_progress", "pull_requests": [],
             "head_repository": {"id": 42}, "repository": {"id": 7}}
+        self.run["name"] = self.run["display_title"]
         self.pr = {"state": "open", "user": {"id": 52204121},
                    "head": {"sha": HEAD, "repo": {"id": 42}}}
         self.parents = [BASE, HEAD]
@@ -124,6 +125,15 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(dispatch.source(api, REPO, 1, 1), api.src)
         self.assertFalse(any("members" in call for call in api.calls))
 
+    def test_static_and_dynamic_run_names_use_the_workflow_path_as_identity(self):
+        for name in ("Test Suite", ApiFixture().run["display_title"]):
+            api = ApiFixture()
+            api.run["name"] = name
+            self.assertEqual(dispatch.source(api, REPO, 1, 1), api.src)
+        api.run["path"] = ".github/workflows/other.yml"
+        with self.assertRaises(dispatch.Unavailable):
+            dispatch.source(api, REPO, 1, 1)
+
     def test_wrong_parent_order_head_repository_author_and_attempt_are_rejected(self):
         mutations = (
             lambda a: setattr(a, "parents", [HEAD, BASE]),
@@ -139,16 +149,13 @@ class SourceTests(unittest.TestCase):
                 with self.assertRaises(dispatch.Unavailable):
                     dispatch.source(api, REPO, 1, 1)
 
-    def test_main_develop_pushes_need_no_pr_identity(self):
-        for branch in ("main", "develop", "feature"):
+    def test_main_develop_pushes_cannot_enter_the_pr_runner(self):
+        for branch in ("main", "develop"):
             api = ApiFixture()
             api.run.update(event="push", head_branch=branch, head_repository={"id": 7},
                 display_title=f"Test Suite pr=0 base={BASE} head={HEAD} merge={HEAD}")
-            if branch == "feature":
-                with self.assertRaises(dispatch.Unavailable):
-                    dispatch.source(api, REPO, 1, 1)
-            else:
-                self.assertEqual(dispatch.source(api, REPO, 1, 1).sha, HEAD)
+            with self.assertRaises(dispatch.Unavailable):
+                dispatch.source(api, REPO, 1, 1)
 
 
 class WaitTests(unittest.TestCase):

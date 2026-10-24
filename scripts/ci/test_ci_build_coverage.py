@@ -32,6 +32,9 @@ class BuildCoverageTests(unittest.TestCase):
                 (cargo_home / "bin").mkdir(parents=True)
                 calls = root / "calls"
                 github_path = root / "github-path"
+                github_env = root / "github-env"
+                outside = root / "outside-workspace"
+                outside.mkdir()
                 installer = root / "installer"
                 installer.write_text("""#!/bin/sh
 set -eu
@@ -41,8 +44,9 @@ cp "$MOCK_BIN/rustc-source" "$CARGO_HOME/bin/rustc"
 """)
                 programs = {
                     "curl": 'printf "curl\\n" >> "$MOCK_CALLS"; if [ "$MOCK_FAILURE" = 1 ]; then exit 22; fi; cat "$MOCK_INSTALLER"',
-                    "rustup-source": 'printf "rustup %s\\n" "$*" >> "$MOCK_CALLS"; if [ "$1" = show ]; then test -f "$CARGO_HOME/ready"; else touch "$CARGO_HOME/ready"; fi',
-                    "rustc-source": 'test -f "$CARGO_HOME/ready"; printf "rustc pinned-fixture\\n"',
+                    "rustup-source": 'printf "rustup %s\\n" "$*" >> "$MOCK_CALLS"; if [ "$1" = show ]; then test -f "$CARGO_HOME/ready"; printf "1.97.0-fixture (overridden by repository)\\n"; else touch "$CARGO_HOME/ready"; fi',
+                    "rustc-source": 'test -f "$CARGO_HOME/ready"; if [ "${RUSTUP_TOOLCHAIN:-}" != 1.97.0-fixture ] && [ "$PWD" != "$MOCK_WORKSPACE" ]; then exit 42; fi; printf "rustc pinned-fixture\\n"',
+                    "sccache": 'compiler="$1"; shift; cd "$MOCK_OUTSIDE"; "$compiler" "$@"',
                 }
                 for name, body in programs.items():
                     path = mock_bin / name
@@ -54,12 +58,15 @@ cp "$MOCK_BIN/rustc-source" "$CARGO_HOME/bin/rustc"
                         target.write_bytes((mock_bin / (name + "-source")).read_bytes())
                         target.chmod(0o755)
                     (cargo_home / "ready").touch()
+                environment = {**os.environ, "PATH": str(mock_bin) + ":/usr/bin:/bin",
+                         "CARGO_HOME": str(cargo_home), "GITHUB_PATH": str(github_path),
+                         "GITHUB_ENV": str(github_env), "MOCK_WORKSPACE": str(ROOT),
+                         "MOCK_OUTSIDE": str(outside), "SCCACHE_PATH": str(mock_bin / "sccache"),
+                         "MOCK_BIN": str(mock_bin), "MOCK_CALLS": str(calls),
+                         "MOCK_INSTALLER": str(installer), "MOCK_FAILURE": str(int(install_failure))}
                 result = subprocess.run(
                     ["/bin/bash", "-e", "-c", script], cwd=ROOT, capture_output=True, text=True,
-                    env={**os.environ, "PATH": str(mock_bin) + ":/usr/bin:/bin",
-                         "CARGO_HOME": str(cargo_home), "GITHUB_PATH": str(github_path),
-                         "MOCK_BIN": str(mock_bin), "MOCK_CALLS": str(calls),
-                         "MOCK_INSTALLER": str(installer), "MOCK_FAILURE": str(int(install_failure))},
+                    env=environment,
                 )
                 invocations = calls.read_text().splitlines()
                 if install_failure:
@@ -71,6 +78,25 @@ cp "$MOCK_BIN/rustc-source" "$CARGO_HOME/bin/rustc"
                 self.assertEqual(github_path.read_text().strip(), str(cargo_home / "bin"))
                 self.assertEqual("curl" in invocations, not installed)
                 self.assertEqual("rustup toolchain install" in invocations, not installed)
+                selected = dict(line.split("=", 1) for line in github_env.read_text().splitlines())
+                self.assertEqual(selected["RUSTUP_TOOLCHAIN"], "1.97.0-fixture")
+                next_environment = {**environment, **selected,
+                                    "PATH": str(cargo_home / "bin") + ":" + environment["PATH"]}
+                probe = subprocess.run(["bash", str(ROOT / "scripts/ci/configure-sccache.sh")],
+                    cwd=ROOT, env=next_environment, capture_output=True, text=True)
+                self.assertEqual(probe.returncode, 0, probe.stderr)
+                self.assertIn("RUSTC_WRAPPER=" + str(mock_bin / "sccache"), github_env.read_text())
+                # Without the exported selection, the same proxy fails only
+                # when sccache invokes it outside the repository. The compiler
+                # itself still works in ROOT, reproducing the old fail-open path.
+                negative_env = root / "negative-env"
+                next_environment.pop("RUSTUP_TOOLCHAIN")
+                next_environment["GITHUB_ENV"] = str(negative_env)
+                probe = subprocess.run(["bash", str(ROOT / "scripts/ci/configure-sccache.sh")],
+                    cwd=ROOT, env=next_environment, capture_output=True, text=True)
+                self.assertEqual(probe.returncode, 0, probe.stderr)
+                self.assertIn("Rust cache disabled", probe.stderr)
+                self.assertTrue(negative_env.read_text().endswith("RUSTC_WRAPPER=\n"))
         for path in (".github/actions/rust-setup/action.yml", ".github/workflows/test.yml"):
             self.assertIn("uses: ./.github/actions/rust-toolchain", (ROOT / path).read_text())
 

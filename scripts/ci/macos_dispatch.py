@@ -70,7 +70,9 @@ class Source:
 def source(api, repo, run_id, attempt):
     run = api.get(f"repos/{repo}/actions/runs/{run_id}")
     match = TITLE.fullmatch(run.get("display_title", ""))
-    if (run.get("id") != run_id or run.get("name") != "Test Suite" or run.get("path") != ".github/workflows/test.yml"
+    # GitHub may populate name with the dynamic run-name as well. The workflow
+    # path is the identity; the title carries the immutable event tuple.
+    if (run.get("id") != run_id or run.get("path") != ".github/workflows/test.yml"
             or run.get("run_attempt") != attempt or attempt != 1
             or run.get("status") == "completed" or not match):
         raise Unavailable("source run is not a current mini candidate")
@@ -87,11 +89,7 @@ def source(api, repo, run_id, attempt):
         parents = api.get(f"repos/{repo}/commits/{merge}")["parents"]
         if [parent["sha"] for parent in parents] != [base, head]:
             raise Unavailable("unverified merge tuple")
-        labels = select_macos_runner("pull_request", {"pull_request": {"user": pr["user"]}}, "")
-    elif run.get("event") == "push" and pr_number == "0" and merge == head:
-        if run["head_repository"]["id"] != run["repository"]["id"]:
-            raise Unavailable("push repository mismatch")
-        labels = select_macos_runner("push", {}, "refs/heads/" + run["head_branch"])
+        labels = select_macos_runner("pull_request", {"pull_request": {"user": pr["user"]}})
     else:
         raise Unavailable("unsupported source event")
     if labels != MACOS_SELF_HOSTED_LABELS:

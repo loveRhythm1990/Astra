@@ -124,8 +124,9 @@ and keeps external-fork behavior part of the repository's delivery contract.
 
 The static author-ID allowlist in `scripts/ci/ci_scope.py` makes the eleven
 selected contributors (including Dependabot) eligible for a mini attempt.
-Main/develop pushes are eligible too. Other or unknown PR authors run on hosted
-macOS immediately; GitHub's existing fork approval remains in effect. Every Mac
+Trusted main/develop pushes and release builds remain on hosted runners, so
+unmerged PR state in the mini's HOME/Cargo/rustup directories is not reused by
+trusted builds. Other or unknown PR authors run on hosted macOS immediately; GitHub's existing fork approval remains in effect. Every Mac
 job re-executed on attempts greater than one runs hosted, even when its planner's
 old output is reused. GitHub may retain successful Mac jobs on a failed-only
 rerun; those checks still refer to the original tested merge. Required-check names retain
@@ -166,8 +167,9 @@ branch Actions/sccache cache entries.
 
 The runner must match `[self-hosted, macOS, ARM64, mac-arm64-mini]`, be available
 to Astra (including public repository access), and support the pinned Actions,
-Rust and Node versions. Rustup is bootstrapped if absent and Cargo bin is added
-to PATH. At least 30 GiB workspace disk is required. On self-hosted runners the
+Rust and Node versions. Rustup is bootstrapped if absent, Cargo bin is added to PATH, and the selected
+repository toolchain is exported through GITHUB_ENV for later sccache compiler
+probes outside the checkout. At least 30 GiB workspace disk is required. On self-hosted runners the
 disk guard reports low/unreadable disk without privileged hosted-image cleanup;
 the hosted fallback proceeds while operators restore mini capacity.
 

@@ -115,8 +115,9 @@ invocation, with exact names and separate serial test processes. They use the
 strict profile without retries, preserving the complete inventory's CI JUnit
 file and avoiding three separate Cargo test builds.
 On macOS, the default terminal-reader lane runs the CLI Bash regression using
-its existing test executable. A static contributor ID allowlist and main/develop
-pushes can attempt one self-hosted ARM bundle containing all five Mac lanes.
+its existing test executable. PR authors in a static contributor ID allowlist
+can attempt one self-hosted ARM bundle containing all five Mac lanes. Trusted
+main/develop pushes and release builds use hosted runners.
 A bounded queue/setup failure falls back to hosted jobs in parallel; real test
 failures remain failures. Other authors and reruns use hosted macOS. Linux
 execution starts independently. The ordinary workflow retains required checks
