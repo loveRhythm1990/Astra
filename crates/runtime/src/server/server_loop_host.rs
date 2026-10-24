@@ -1602,10 +1602,11 @@ fn merge_output_cap_continuation(prefix: &str, continuation: &str) -> String {
     // Providers normally return a suffix, but a small overlap can occur when
     // they restate the final sentence after a continuation request.  Avoid
     // duplicating that overlap while keeping the merge deterministic and
-    // independent of task/domain text.
+    // independent of task/domain text. The byte budget and shorter candidates
+    // can fall inside a UTF-8 code point, so only compare character boundaries.
     let max_overlap = prefix.len().min(512).min(continuation.len());
     for overlap in (1..=max_overlap).rev() {
-        if prefix.ends_with(&continuation[..overlap]) {
+        if continuation.is_char_boundary(overlap) && prefix.ends_with(&continuation[..overlap]) {
             return format!("{}{}", prefix, &continuation[overlap..]);
         }
     }
@@ -36555,6 +36556,80 @@ mod tests {
             merge_output_cap_continuation("prefix: result", "result is verified"),
             "prefix: result is verified"
         );
+    }
+
+    #[test]
+    fn output_cap_continuation_preserves_unicode_without_overlap() {
+        let prefix = "p".repeat(169);
+        let continuation = format!("{}—suffix", "x".repeat(167));
+        assert_eq!(
+            merge_output_cap_continuation(&prefix, &continuation),
+            format!("{prefix}\n{continuation}")
+        );
+        assert_eq!(
+            merge_output_cap_continuation("前文", "后续内容"),
+            "前文\n后续内容"
+        );
+    }
+
+    #[test]
+    fn output_cap_continuation_deduplicates_unicode_overlap() {
+        for (prefix, continuation, expected) in [
+            (
+                "前文：实验完成",
+                "实验完成，结果可信",
+                "前文：实验完成，结果可信",
+            ),
+            ("done: 🧪", "🧪✅", "done: 🧪✅"),
+            ("partial—", "—suffix", "partial—suffix"),
+        ] {
+            assert_eq!(
+                merge_output_cap_continuation(prefix, continuation),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn output_cap_continuation_preserves_overlap_byte_limit() {
+        for (overlap, expected_deduplication) in [(511, true), (512, true), (513, false)] {
+            let shared = format!("a{}b", "x".repeat(overlap - 2));
+            let prefix = format!("prefix:{shared}");
+            let continuation = format!("{shared}—suffix");
+            let expected = if expected_deduplication {
+                format!("{prefix}—suffix")
+            } else {
+                format!("{prefix}\n{continuation}")
+            };
+            assert_eq!(
+                merge_output_cap_continuation(&prefix, &continuation),
+                expected
+            );
+        }
+
+        let prefix = "p".repeat(520);
+        let continuation = format!("{}—suffix", "x".repeat(511));
+        assert_eq!(
+            merge_output_cap_continuation(&prefix, &continuation),
+            format!("{prefix}\n{continuation}")
+        );
+    }
+
+    #[test]
+    fn output_cap_continuation_preserves_empty_and_replayed_text() {
+        for (prefix, continuation, expected) in [
+            ("", "", ""),
+            ("", "后续🧪", "后续🧪"),
+            ("前文🧪", "", "前文🧪"),
+            ("前文🧪", "前文🧪", "前文🧪"),
+            ("前文🧪", "前文🧪后续", "前文🧪后续"),
+            ("前文", " 后续", "前文 后续"),
+        ] {
+            assert_eq!(
+                merge_output_cap_continuation(prefix, continuation),
+                expected
+            );
+        }
     }
 
     #[test]

@@ -746,8 +746,8 @@ async fn append_only_metadata_drives_real_output_cap_continuation_and_wal() {
             reuse_scope: Some(CacheReuseScope::ConversationTurns),
         }),
     };
-    let ProviderResponse::OpenAi(mut partial) =
-        response(case, "Partial answer with more detail to follow.", None)
+    // Exercise UTF-8 merging after a real provider length terminal and retry.
+    let ProviderResponse::OpenAi(mut partial) = response(case, "论文实验结果尚未讲完。", None)
     else {
         unreachable!()
     };
@@ -757,7 +757,7 @@ async fn append_only_metadata_drives_real_output_cap_continuation_and_wal() {
         |request| request.path == "/v1/chat/completions" && request.body["model"] == "append-alias",
         vec![
             ProviderResponse::OpenAi(partial),
-            response(case, "The complete explanation is now available.", None),
+            response(case, "—实验结果与结论已补全。", None),
         ],
     )])
     .await;
@@ -787,7 +787,7 @@ async fn append_only_metadata_drives_real_output_cap_continuation_and_wal() {
         .unwrap();
     assert_eq!(
         state.final_text,
-        "Partial answer with more detail to follow.\nThe complete explanation is now available."
+        "论文实验结果尚未讲完。\n—实验结果与结论已补全。"
     );
     assert_eq!(
         state.llm_rounds_completed, 1,
@@ -811,7 +811,7 @@ async fn append_only_metadata_drives_real_output_cap_continuation_and_wal() {
             .messages
             .iter()
             .any(|message| message["role"] == "assistant"
-                && message["content"] == "Partial answer with more detail to follow.")
+                && message["content"] == "论文实验结果尚未讲完。")
     );
     assert!(
         state

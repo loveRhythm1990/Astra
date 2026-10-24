@@ -173,13 +173,11 @@ const LLM_NONSTREAM_TIMEOUT_S: u64 = 120;
 /// Total budget across all safe retries for a single LLM call (seconds).
 /// Override: `ASTRA_LLM_TOTAL_BUDGET_S`.
 const LLM_TOTAL_BUDGET_S: u64 = 300;
-/// Maximum time a streaming inference may go without yielding or advancing a
-/// deliverable answer/tool call. Reasoning is transport activity, but it does
-/// not postpone the initial actionable yield. Once delivery starts, visible
-/// text and authorized tool JSON fragments roll this deadline so a legitimate
-/// streamed tool payload is not cut off mid-object. Independent physical-idle,
-/// accumulation, and total-call budgets remain additional safety bounds.
-const LLM_SEMANTIC_PROGRESS_TIMEOUT_S: u64 = 120;
+/// Maximum time a streaming inference may go without meaningful text,
+/// reasoning, or authorized tool-call progress. Heartbeats do not refresh it.
+/// The five-minute default tolerates providers buffering long tool payloads;
+/// independent idle, accumulation, and total-call budgets still bound the call.
+const LLM_SEMANTIC_PROGRESS_TIMEOUT_S: u64 = 300;
 /// Maximum slice reserved from a logical inference budget for durable attempt
 /// terminalization. The reserve scales down for very small test/operator
 /// budgets and is never available to HTTP work or retry backoff.
@@ -8844,6 +8842,133 @@ mod tests {
     fn total_budget_default_is_300s() {
         let dur = llm_total_budget();
         assert_eq!(dur, std::time::Duration::from_secs(LLM_TOTAL_BUDGET_S));
+    }
+
+    #[test]
+    fn default_semantic_progress_timeout_is_300s() {
+        assert_eq!(
+            llm_semantic_progress_timeout(),
+            std::time::Duration::from_secs(300)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_semantic_progress_timeout_accepts_buffered_tool_delivery() {
+        for anthropic in [false, true] {
+            let arguments = json!({"command": "x".repeat(24 * 1024)}).to_string();
+            let terminal = if anthropic {
+                [
+                    json!({"type": "content_block_start", "index": 0, "content_block": {
+                        "type": "tool_use", "id": "call-1", "name": "bash", "input": {}
+                    }}),
+                    json!({"type": "content_block_delta", "index": 0, "delta": {
+                        "type": "input_json_delta", "partial_json": arguments
+                    }}),
+                    json!({"type": "content_block_stop", "index": 0}),
+                    json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+                    json!({"type": "message_stop"}),
+                ]
+                .into_iter()
+                .map(|chunk| format!("data: {chunk}\n\n"))
+                .collect::<String>()
+            } else {
+                let chunk = json!({"choices": [{"delta": {"tool_calls": [{
+                    "index": 0, "id": "call-1", "type": "function",
+                    "function": {"name": "bash", "arguments": arguments}
+                }]}, "finish_reason": "tool_calls"}]});
+                format!("data: {chunk}\n\ndata: [DONE]\n\n")
+            };
+            let source = Box::pin(async_stream::stream! {
+                for _ in 0..12 {
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(b": PING\n\n"));
+                }
+                yield Ok::<Bytes, reqwest::Error>(Bytes::from(terminal));
+            });
+            let started = TokioInstant::now();
+            let result = if anthropic {
+                collect_anthropic_llm_stream(
+                    source,
+                    "test-model",
+                    started.into_std(),
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    None,
+                )
+                .await
+            } else {
+                collect_llm_stream(
+                    source,
+                    "test-model",
+                    started.into_std(),
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    None,
+                )
+                .await
+            }
+            .expect(
+                "the default must allow buffered tool delivery after 180 seconds of heartbeats",
+            );
+            assert_eq!(started.elapsed(), std::time::Duration::from_secs(180));
+            assert!(result.full_text.is_empty());
+            assert_eq!(result.tool_calls.len(), 1);
+            assert_eq!(result.tool_calls[0]["function"]["name"], "bash");
+            assert_eq!(result.tool_calls[0]["function"]["arguments"], arguments);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_semantic_progress_timeout_preserves_provider_work_budget() {
+        for anthropic in [false, true] {
+            let source = Box::pin(async_stream::stream! {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(b": PING\n\n"));
+                }
+            });
+            let started = TokioInstant::now();
+            let total = llm_total_budget();
+            let work = total - llm_mandatory_settlement_reserve(total);
+            let result = if anthropic {
+                collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surface(
+                    source,
+                    "test-model",
+                    started.into_std(),
+                    work,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    llm_semantic_progress_timeout(),
+                    None,
+                    None,
+                )
+                .await
+            } else {
+                collect_llm_stream_with_semantic_progress_deadline_and_surface(
+                    source,
+                    "test-model",
+                    started.into_std(),
+                    work,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    llm_semantic_progress_timeout(),
+                    None,
+                    None,
+                )
+                .await
+            };
+            match result.expect_err("heartbeats must not extend the provider work budget") {
+                StreamCollectError::ProviderWorkDeadline {
+                    elapsed_ms: 290000, ..
+                } => {}
+                other => panic!("expected provider-work deadline, got {other:?}"),
+            }
+            assert_eq!(started.elapsed(), work);
+        }
     }
 
     #[tokio::test]
