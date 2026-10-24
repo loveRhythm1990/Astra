@@ -116,6 +116,30 @@ sys.exit(17 if sys.argv[1] == os.environ["FAIL_COMMAND"] else 0)
         self.assertIn("cancel-in-progress: true", self.workflow)
 
 
+class MacRunnerTests(unittest.TestCase):
+    def test_all_macos_execution_uses_the_same_self_hosted_labels_for_every_author(self):
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        labels = ["self-hosted", "macOS", "ARM64", "mac-arm64-mini"]
+        for job in ("vendored-terminal", "terminal-pty-shards"):
+            header = workflow.split(f"\n  {job}:\n", 1)[1].split("    steps:\n", 1)[0]
+            selection = re.search(r"runs-on: \$\{\{ matrix\.os == 'macos-15' && fromJSON\('([^']+)'\) \|\| matrix\.os \}\}", header)
+            self.assertIsNotNone(selection, job)
+            self.assertEqual(json.loads(selection[1]), labels)
+            self.assertIn("os: [ubuntu-latest, macos-15]", header)
+            self.assertIn("needs: scope", header)
+        coordination = workflow.split("\n  macos-workspace-coordination-tests:\n", 1)[1].split("    steps:\n", 1)[0]
+        self.assertIn("runs-on: [self-hosted, macOS, ARM64, mac-arm64-mini]", coordination)
+        for job in ("scope", "cli-test-build", "shard-b", "shard-c", "shard-d", "test-online"):
+            header = workflow.split(f"\n  {job}:\n", 1)[1].split("    steps:\n", 1)[0]
+            self.assertIn("runs-on: ubuntu-latest", header)
+        self.assertIn("pull_request:", workflow)
+        self.assertIn("branches: [main, develop]", workflow)
+        self.assertNotIn("pull_request_target:", workflow)
+        self.assertNotIn("github.event.pull_request.user", workflow)
+        self.assertNotIn("ASTRA_MACOS_", workflow)
+        self.assertNotIn("macos-routing:", workflow)
+
+
 class ParallelGateTests(unittest.TestCase):
     def test_shard_gates_reject_failure_cancellation_and_unexpected_skip(self):
         for step, variables in (
@@ -143,12 +167,11 @@ class ParallelGateTests(unittest.TestCase):
                     }, capture_output=True, text=True)
                     self.assertEqual(result.returncode == 0, status == moi_status == "success")
 
-    def test_package_jobs_avoid_macos_routing_and_gates_depend_on_execution(self):
+    def test_parallel_jobs_depend_only_on_scope_and_gates_depend_on_shards(self):
         workflow = (ROOT / ".github/workflows/test.yml").read_text()
         for job in ("terminal-pty-shards", "test-online"):
             header = workflow.split(f"\n  {job}:\n", 1)[1].split("    steps:\n", 1)[0]
-            expected = "[scope, macos-routing]" if job == "terminal-pty-shards" else "scope"
-            self.assertIn(f"    needs: {expected}\n", header)
+            self.assertIn("    needs: scope\n", header)
             self.assertIn("!cancelled()", header)
             self.assertIn("fail-fast: false", header)
         terminal = workflow.split("\n  terminal-pty:\n", 1)[1].split("\n  terminal-pty-shards:", 1)[0]
@@ -164,7 +187,7 @@ class ParallelGateTests(unittest.TestCase):
         self.assertIn("needs.scope.result != 'success'", coordination)
         self.assertIn("if: ${{ !cancelled() }}", coordination)
         contracts = workflow.split("\n  macos-workspace-coordination-tests:\n", 1)[1].split("    steps:\n", 1)[0]
-        self.assertIn("needs: [scope, macos-routing]", contracts)
+        self.assertIn("needs: scope", contracts)
         self.assertNotIn("terminal-pty-shards", contracts, "Tools contracts must not wait for the CLI build")
         online = workflow.split("\n  test-online:\n", 1)[1]
         self.assertIn("lane: [core-runtime, core-turn-core, core-services, integration]", online)

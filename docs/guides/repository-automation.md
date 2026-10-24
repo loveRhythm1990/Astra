@@ -120,10 +120,36 @@ before rerunning CI:
 This separation prevents permission failures from being treated as flaky CI
 and keeps external-fork behavior part of the repository's delivery contract.
 
-## Self-hosted macOS migration
+## Self-hosted macOS tests
 
-The three-lane member/main migration, dedicated result source, runner-side
-admission, isolation requirements and explicit activation/rollback steps are
-documented in [Self-hosted macOS CI](macos-ci-runner.md). Migration is opt-in;
-ordinary hosted execution remains the default until administration and host
-acceptance are complete.
+Test Suite sends all macOS execution to runners matching
+`[self-hosted, macOS, ARM64, mac-arm64-mini]`: default reader/Bash, dev-tty reader,
+reflow, workspace coordination and vendored terminal units. The same routing
+applies to every PR author and to pushes on main/develop. Existing required-check
+names retain their `macos-15` label for compatibility; inspect each job's actual
+runner for execution provenance. Linux execution and release workflows retain
+their existing platforms.
+
+This uses the ordinary `pull_request`/`push` workflow, GitHub's existing fork
+approval and read-only workflow token. No App, organization membership query,
+custom result contexts, routing flag, hook or hosted fallback is required by this
+implementation. The selected runner must be available to Astra, including public
+repository access when applicable, and have the exact labels above. Confirm its
+OS/toolchain support for the pinned Actions/Rust/Node versions and at least
+30 GiB workspace disk before assigning work. The shared Rust setup reports low
+or unreadable disk as a failure on self-hosted runners, without running the
+hosted-image sudo cleanup. All approved PR code executes on that
+runner; operators must accept that persistent-host access and resource exposure.
+
+One registration executes one job at a time. The five macOS jobs queue on a
+single Mac; adding registrations on the same machine changes resource contention
+and does not create extra capacity. Reader feature builds remain separate jobs.
+If the runner is offline, jobs stay queued rather than consuming a hosted Mac.
+Measure queue delay and actual job duration before claiming an elapsed-time gain.
+
+If the earlier controller design was staged, remove its unused custom App
+required contexts and retire its installed admission hook through the reviewed
+operations process; this workflow no longer emits those contexts or App
+admissions. Preserve the existing GitHub Actions required checks and fork
+approval settings. Roll back execution by reverting the runner selectors in Test
+Suite to the hosted matrix OS and `macos-15` coordination runner through a PR.

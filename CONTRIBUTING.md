@@ -116,13 +116,13 @@ strict profile without retries, preserving the complete inventory's CI JUnit
 file and avoiding three separate Cargo test builds.
 On macOS, the default terminal-reader lane also runs the CLI Bash regression
 using its existing default-feature test executable. Tools lint and serial
-workspace-coordination tests remain parallel; the protected coordination check
-requires both paths to succeed. Feature-specific terminal tests remain separate.
-The opt-in [self-hosted macOS migration](docs/guides/macos-ci-runner.md) runs
-three lanes together for verified organization-member PRs. Its required results
-come from a dedicated App; ordinary hosted delegation hints cannot satisfy them.
-Non-members and unknown identities retain ordinary hosted PR approval. Main stays
-hosted until an independently isolated main runner is accepted.
+workspace-coordination tests retain independent jobs; the protected coordination
+check requires both paths to succeed. Feature-specific terminal tests remain separate.
+All macOS execution jobs in Test Suite use the organization's self-hosted ARM
+runner labels for both pull requests and main/develop pushes, without author
+classification. Existing fork approval and required-check names remain in place.
+See [runner operations](docs/guides/repository-automation.md#self-hosted-macos-tests)
+for registration, queueing and rollback.
 The lint gate retains restored artifacts; age-based cleanup is not a lint prerequisite.
 
 For fork pull requests, an update may require maintainer approval before the

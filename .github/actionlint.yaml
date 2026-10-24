@@ -1,11 +1,2 @@
 self-hosted-runner:
-  labels: [mac-arm64-mini, astra-macos-admitted]
-paths:
-  .github/workflows/macos-trusted.yml:
-    ignore:
-      # GitHub supports cache-mode since 2026-09-10; actionlint 1.7.12 does not.
-      # Remove only this narrow compatibility filter when its parser catches up.
-      - '^unexpected key "cache-mode" for "workflow" section\.'
-  .github/workflows/macos-results.yml:
-    ignore:
-      - '^unexpected key "cache-mode" for "workflow" section\.'
+  labels: [mac-arm64-mini]

@@ -2,6 +2,7 @@
 """Guard workspace shard coverage and Docker's vendored path dependency inputs."""
 
 from pathlib import Path
+from itertools import product
 import os
 import re
 import shlex
@@ -33,14 +34,14 @@ class BuildCoverageTests(unittest.TestCase):
             "docker image prune -af",
         ]
 
-        for mode, available_kib, should_skip in (
+        for (mode, available_kib, should_skip), runner_environment in product((
             ("above", threshold_kib + 1, True),
             ("equal", threshold_kib, True),
             ("below", threshold_kib - 1, False),
             ("invalid", "not-a-number", False),
             ("failure", None, False),
-        ):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+        ), ("github-hosted", "self-hosted")):
+            with self.subTest(mode=mode, runner=runner_environment), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 mock_bin = root / "mock-bin"
                 mock_bin.mkdir()
@@ -80,6 +81,7 @@ printf '%s\\n' "$*" >> "${MOCK_SUDO_LOG}"
                 environment = {
                     **os.environ,
                     "GITHUB_WORKSPACE": str(workspace),
+                    "ASTRA_CI_RUNNER_ENVIRONMENT": runner_environment,
                     "MOCK_DF_MODE": mode,
                     "MOCK_DF_AVAILABLE_KIB": str(available_kib or ""),
                     "MOCK_SUDO_LOG": str(sudo_log),
@@ -91,9 +93,11 @@ printf '%s\\n' "$*" >> "${MOCK_SUDO_LOG}"
                     capture_output=True,
                     text=True,
                 )
-                self.assertEqual(result.returncode, 0, result.stderr)
+                self_hosted_failure = runner_environment == "self-hosted" and not should_skip
+                self.assertEqual(result.returncode, 1 if self_hosted_failure else 0, result.stderr)
                 output = result.stdout + result.stderr
-                decision = "skip cleanup" if should_skip else "run cleanup"
+                decision = ("skip cleanup" if should_skip else
+                            "fail self-hosted" if self_hosted_failure else "run cleanup")
                 self.assertIn(f"Disk guard decision: {decision}", output)
                 self.assertIn(
                     f"threshold={threshold_kib} KiB (30 GiB)",
@@ -101,7 +105,7 @@ printf '%s\\n' "$*" >> "${MOCK_SUDO_LOG}"
                 )
 
                 invocations = sudo_log.read_text().splitlines() if sudo_log.exists() else []
-                self.assertEqual(invocations, [] if should_skip else cleanup)
+                self.assertEqual(invocations, [] if should_skip or self_hosted_failure else cleanup)
 
     def test_make_lint_preserves_restored_artifacts_and_checks_all_targets(self):
         result = subprocess.run(
@@ -169,28 +173,39 @@ printf '%s\\n' "$*" >> "${MOCK_SUDO_LOG}"
         pty = workflow.split("\n  terminal-pty:\n", 1)[1].split("\n  macos-workspace-coordination:", 1)[0]
         self.assertIn("os: [ubuntu-latest, macos-15]", pty)
         self.assertIn("segment: [default-reader, dev-tty-reader, reflow]", pty)
-        self.assertIn("--features crossterm/use-dev-tty tui::terminal_startup -- --test-threads=2", pty)
-        self.assertIn("bash scripts/ci/run-macos-lanes.sh default-reader", pty)
+        for segment, step, features in (
+            ("default-reader", "Test default terminal reader through PTYs", ""),
+            ("dev-tty-reader", "Test dev-tty terminal reader through PTYs", "--features crossterm/use-dev-tty "),
+        ):
+            with self.subTest(segment=segment):
+                commands = workflow_run_script(".github/workflows/test.yml", step).strip()
+                self.assertEqual(commands,
+                    f"cargo test --locked -p astra-cli --lib {features}tui::terminal_startup -- --test-threads=2")
+                block = pty.split(f"      - name: {step}\n", 1)[1].split("      - ", 1)[0]
+                self.assertIn(f"if: matrix.segment == '{segment}'", block)
 
     def test_terminal_reflow_uses_real_binary_and_locked_emulator(self):
-        commands = (ROOT / "scripts/ci/run-macos-lanes.sh").read_text()
+        commands = workflow_run_script(".github/workflows/test.yml", "Test inline terminal resize with xterm reflow")
         self.assertIn("cargo build --locked -p astra-cli --bin astra", commands)
         self.assertIn("npm ci --ignore-scripts --prefix scripts/tui-reflow", commands)
-        self.assertIn('ASTRA_TEST_BINARY="${CARGO_TARGET_DIR:-$PWD/target}/debug/astra" npm test --prefix scripts/tui-reflow', commands)
+        self.assertIn('ASTRA_TEST_BINARY="$PWD/target/debug/astra" npm test --prefix scripts/tui-reflow', commands)
 
     def test_macos_cli_bash_reuses_default_reader_without_losing_coordination_contracts(self):
-        commands = (ROOT / "scripts/ci/run-macos-lanes.sh").read_text()
-        reader = commands.split("  default-reader)\n", 1)[1].split("    ;;", 1)[0]
-        self.assertLess(reader.index("tui::terminal_startup"), reader.index("observe_git"))
-        self.assertLess(reader.index("observe_git"), reader.index("bash_echo_returns_output"))
-        self.assertIn("--lib edge_tools::shell::tests::bash_echo_returns_output -- --exact", reader)
-        self.assertNotIn("--features", reader)
-        self.assertNotIn("cargo build", reader, "Reuse the default CLI library test executable")
-        contracts = commands.split("  coordination)\n", 1)[1].split("    ;;", 1)[0]
-        for protected in ("-p astra-tools", "--all-targets -- -D warnings",
-                          "workspace_observation::tests:: -- --test-threads=1", "observe_git"):
-            self.assertIn(protected, contracts)
-        self.assertNotIn("-p astra-cli", contracts)
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        terminal = workflow.split("\n  terminal-pty-shards:\n", 1)[1].split("\n  macos-workspace-coordination:\n", 1)[0]
+        self.assertEqual(workflow.count("- name: Test macOS CLI Bash execution"), 1)
+        bash = terminal.split("      - name: Test macOS CLI Bash execution\n", 1)[1].split("      - ", 1)[0]
+        self.assertIn("if: matrix.os == 'macos-15' && matrix.segment == 'default-reader'", bash)
+        self.assertIn("--lib edge_tools::shell::tests::bash_echo_returns_output -- --exact", bash)
+        self.assertLess(terminal.index("Test default terminal reader through PTYs"), terminal.index("Initialize system Git for macOS CLI observation"))
+        self.assertLess(terminal.index("Initialize system Git for macOS CLI observation"), terminal.index("Test macOS CLI Bash execution"))
+        contracts = workflow.split("\n  macos-workspace-coordination-tests:\n", 1)[1].split("\n  test-online-core:", 1)[0]
+        self.assertIn('install-nextest: "false"', contracts)
+        self.assertIn("-p astra-tools", contracts)
+        self.assertIn("--all-targets -- -D warnings", contracts)
+        self.assertIn("workspace_observation::tests:: -- --test-threads=1", contracts)
+        self.assertIn("/usr/bin/git", contracts)
+        self.assertNotIn("-p astra-cli", contracts, "Do not compile the same CLI test executable twice on macOS")
 
     def test_ci_resolves_the_actual_builder_base_not_only_the_planner(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
