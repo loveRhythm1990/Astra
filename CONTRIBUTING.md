@@ -114,16 +114,15 @@ The three ignored production-supervisor smokes use one additional nextest
 invocation, with exact names and separate serial test processes. They use the
 strict profile without retries, preserving the complete inventory's CI JUnit
 file and avoiding three separate Cargo test builds.
-On macOS, the default terminal-reader lane also runs the CLI Bash regression
-using its existing default-feature test executable. Tools lint and serial
-workspace-coordination tests retain independent jobs; the protected coordination
-check requires both paths to succeed. Feature-specific terminal tests remain separate.
-All macOS execution jobs in Test Suite use the organization's self-hosted ARM
-runner for allowlisted PR author IDs and main/develop pushes. Other or unknown
-PR authors use hosted macOS. The allowlist lives in `scripts/ci/ci_scope.py`;
-existing fork approval and required-check names remain in place.
+On macOS, the default terminal-reader lane runs the CLI Bash regression using
+its existing test executable. A static contributor ID allowlist and main/develop
+pushes can attempt one self-hosted ARM bundle containing all five Mac lanes.
+A bounded queue/setup failure falls back to hosted jobs in parallel; real test
+failures remain failures. Other authors and reruns use hosted macOS. Linux
+execution starts independently. The ordinary workflow retains required checks
+and fork approval; no App or custom check source is needed.
 See [runner operations](docs/guides/repository-automation.md#self-hosted-macos-tests)
-for registration, queueing and rollback.
+for dispatch bootstrap, budgets, queueing and rollback.
 The lint gate retains restored artifacts; age-based cleanup is not a lint prerequisite.
 
 For fork pull requests, an update may require maintainer approval before the

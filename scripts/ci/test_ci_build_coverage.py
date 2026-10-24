@@ -217,49 +217,36 @@ printf '%s\\n' "$*" >> "${MOCK_SUDO_LOG}"
 
     def test_vendored_terminal_units_are_locked_and_pty_tests_run_both_readers(self):
         workflow = (ROOT / ".github/workflows/test.yml").read_text()
-        section = workflow.split("\n  vendored-terminal:\n", 1)[1].split("\n  terminal-pty:", 1)[0]
-        self.assertIn("os: [ubuntu-latest, macos-15]", section)
+        lanes = (ROOT / "scripts/ci/run-macos-lanes.sh").read_text()
+        self.assertIn("run-macos-lanes.sh vendored", workflow)
         for features in ("event-stream", "event-stream,use-dev-tty"):
-            self.assertIn(f"cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib --features {features}\n", section)
+            self.assertIn(f"cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib --features {features}\n", lanes)
         lock = tomllib.loads((ROOT / "vendor/crossterm/Cargo.lock").read_text())
         self.assertTrue(any(p["name"] == "crossterm" for p in lock["package"]))
         self.assertNotIn("/Cargo.lock", (ROOT / "vendor/crossterm/.gitignore").read_text().splitlines())
-        pty = workflow.split("\n  terminal-pty:\n", 1)[1].split("\n  macos-workspace-coordination:", 1)[0]
-        self.assertIn("os: [ubuntu-latest, macos-15]", pty)
-        self.assertIn("segment: [default-reader, dev-tty-reader, reflow]", pty)
-        for segment, step, features in (
-            ("default-reader", "Test default terminal reader through PTYs", ""),
-            ("dev-tty-reader", "Test dev-tty terminal reader through PTYs", "--features crossterm/use-dev-tty "),
-        ):
-            with self.subTest(segment=segment):
-                commands = workflow_run_script(".github/workflows/test.yml", step).strip()
-                self.assertEqual(commands,
-                    f"cargo test --locked -p astra-cli --lib {features}tui::terminal_startup -- --test-threads=2")
-                block = pty.split(f"      - name: {step}\n", 1)[1].split("      - ", 1)[0]
-                self.assertIn(f"if: matrix.segment == '{segment}'", block)
+        self.assertEqual(workflow.count("segment: [default-reader, dev-tty-reader, reflow]"), 2)
+        for features in ("", "--features crossterm/use-dev-tty "):
+            self.assertIn(f"cargo test --locked -p astra-cli --lib {features}tui::terminal_startup -- --test-threads=2", lanes)
 
     def test_terminal_reflow_uses_real_binary_and_locked_emulator(self):
-        commands = workflow_run_script(".github/workflows/test.yml", "Test inline terminal resize with xterm reflow")
+        commands = (ROOT / "scripts/ci/run-macos-lanes.sh").read_text()
         self.assertIn("cargo build --locked -p astra-cli --bin astra", commands)
         self.assertIn("npm ci --ignore-scripts --prefix scripts/tui-reflow", commands)
-        self.assertIn('ASTRA_TEST_BINARY="$PWD/target/debug/astra" npm test --prefix scripts/tui-reflow', commands)
+        self.assertIn('ASTRA_TEST_BINARY="${CARGO_TARGET_DIR:-$PWD/target}/debug/astra" npm test', commands)
 
     def test_macos_cli_bash_reuses_default_reader_without_losing_coordination_contracts(self):
-        workflow = (ROOT / ".github/workflows/test.yml").read_text()
-        terminal = workflow.split("\n  terminal-pty-shards:\n", 1)[1].split("\n  macos-workspace-coordination:\n", 1)[0]
-        self.assertEqual(workflow.count("- name: Test macOS CLI Bash execution"), 1)
-        bash = terminal.split("      - name: Test macOS CLI Bash execution\n", 1)[1].split("      - ", 1)[0]
-        self.assertIn("if: matrix.os == 'macos-15' && matrix.segment == 'default-reader'", bash)
-        self.assertIn("--lib edge_tools::shell::tests::bash_echo_returns_output -- --exact", bash)
-        self.assertLess(terminal.index("Test default terminal reader through PTYs"), terminal.index("Initialize system Git for macOS CLI observation"))
-        self.assertLess(terminal.index("Initialize system Git for macOS CLI observation"), terminal.index("Test macOS CLI Bash execution"))
-        contracts = workflow.split("\n  macos-workspace-coordination-tests:\n", 1)[1].split("\n  test-online-core:", 1)[0]
-        self.assertIn('install-nextest: "false"', contracts)
-        self.assertIn("-p astra-tools", contracts)
-        self.assertIn("--all-targets -- -D warnings", contracts)
+        commands = (ROOT / "scripts/ci/run-macos-lanes.sh").read_text()
+        reader = commands.split("  default-reader)\n", 1)[1].split("    ;;", 1)[0]
+        self.assertLess(reader.index("tui::terminal_startup"), reader.index("observe_git"))
+        self.assertLess(reader.index("observe_git"), reader.index("bash_echo_returns_output"))
+        self.assertEqual(reader.count("cargo test"), 2)
+        contracts = commands.split("  coordination)\n", 1)[1].split("    ;;", 1)[0]
+        self.assertIn("cargo clippy --locked --manifest-path Cargo.toml -p astra-tools --all-targets -- -D warnings", contracts)
         self.assertIn("workspace_observation::tests:: -- --test-threads=1", contracts)
-        self.assertIn("/usr/bin/git", contracts)
-        self.assertNotIn("-p astra-cli", contracts, "Do not compile the same CLI test executable twice on macOS")
+        self.assertIn("observe_git", contracts)
+        self.assertNotIn("-p astra-cli", contracts)
+        self.assertIn('"/usr/bin/git"', commands)
+        self.assertIn("timeout=60", commands)
 
     def test_ci_resolves_the_actual_builder_base_not_only_the_planner(self):
         dockerfile = (ROOT / "Dockerfile").read_text()

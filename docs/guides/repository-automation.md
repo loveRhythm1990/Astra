@@ -122,41 +122,66 @@ and keeps external-fork behavior part of the repository's delivery contract.
 
 ## Self-hosted macOS tests
 
-Test Suite routes default reader/Bash, dev-tty reader, reflow, workspace
-coordination and vendored terminal units by PR author ID. IDs in
-`MACOS_RUNNER_AUTHORS` in `scripts/ci/ci_scope.py` use runners matching
-`[self-hosted, macOS, ARM64, mac-arm64-mini]`; other or unknown authors use hosted
-`macos-15`. The list includes Dependabot. Numeric IDs remain stable across login
-renames; login strings in the list are review annotations. The author is
-`pull_request.user.id`, not the sender or re-run actor. Pushes on main/develop
-also use the self-hosted labels. Existing required-check
-names retain their `macos-15` label for compatibility; inspect each job's actual
-runner for execution provenance. Linux execution and release workflows retain
-their existing platforms.
+The static author-ID allowlist in `scripts/ci/ci_scope.py` makes the eleven
+selected contributors (including Dependabot) eligible for a mini attempt.
+Main/develop pushes are eligible too. Other or unknown PR authors run on hosted
+macOS immediately; GitHub's existing fork approval remains in effect. Every Mac
+job re-executed on attempts greater than one runs hosted, even when its planner's
+old output is reused. GitHub may retain successful Mac jobs on a failed-only
+rerun; those checks still refer to the original tested merge. Required-check names retain
+`macos-15` for compatibility; job summaries link the actual worker execution.
 
-This uses the ordinary `pull_request`/`push` workflow, GitHub's existing fork
-approval and read-only workflow token. No App, organization membership query,
-custom result contexts, routing flag or hook is required by this implementation.
-If scope output is missing, Mac jobs use hosted `macos-15` and still run tests. The selected runner must be available to Astra, including public
-repository access when applicable, and have the exact labels above. Confirm its
-OS/toolchain support for the pinned Actions/Rust/Node versions and at least
-30 GiB workspace disk before assigning work. CI bootstraps rustup when missing,
-adds Cargo binaries to PATH and installs the repository-pinned Rust toolchain.
-The shared Rust setup reports low or unreadable disk as a failure on self-hosted runners, without running the
-hosted-image sudo cleanup. Approved PR code executes on that
-runner when the author is allowlisted; operators accept that persistent-host
-access and resource exposure.
+The ordinary Test Suite owns all required checks. Linux jobs depend only on
+scope and start without waiting for the mini. `Resolve macOS execution` has
+Actions/Pull requests read access and waits for a worker bound to its exact run
+ID, attempt and recorded merge SHA. Missing controller, API errors or missing
+routing output select real hosted tests, never a successful skip.
 
-One registration executes one job at a time. The five macOS jobs queue on a
-single Mac; adding registrations on the same machine changes resource contention
-and does not create extra capacity. Reader feature builds remain separate jobs.
-For allowlisted PRs and pushes, a busy/offline runner leaves jobs queued; there
-is no automatic availability-based hosted fallback.
-Measure queue delay and actual job duration before claiming an elapsed-time gain.
+`macos-scheduler.yml` runs on the default branch on Test Suite's `workflow_run`
+start/completion events. It uses the built-in token's Actions write permission
+to dispatch/cancel `macos-mini.yml`; it never checks out PR code. No App,
+organization membership query, additional secret, custom required context or
+admission hook is needed. These workflows must exist on main before dispatch
+works. Before that, Test Suite falls back to hosted execution.
 
-If the earlier controller design was staged, remove its unused custom App
-required contexts and retire its installed admission hook through the reviewed
-operations process; this workflow no longer emits those contexts or App
-admissions. Preserve the existing GitHub Actions required checks and fork
-approval settings. Roll back execution by reverting the runner selectors in Test
-Suite to the hosted matrix OS and `macos-15` coordination runner through a PR.
+A mini attempt gets a 180-second queue/discovery budget, with bounded API
+requests, then falls back to the original hosted jobs in parallel. The
+reader/controller enforce a 60-minute execution budget even if the runner
+disappears; the worker has a separate 65-minute hard backstop. Thus single-machine
+unavailability does not hold a
+required check for GitHub's 24-hour queue limit. API/control outages can prevent
+immediate child cancellation; the completion observer retries cleanup, and a
+late worker rejects an ended parent gate before candidate checkout.
+
+The worker performs one candidate checkout, toolchain setup and cache restore,
+then runs default reader/Bash, reflow, coordination, vendored units and dev-tty
+through the same `scripts/ci/run-macos-lanes.sh` used by hosted/Linux jobs. Cargo
+invocations remain separate and dev-tty is last. A real compile/test failure is
+reported as failure, without hosted retry. Failed runs with incomplete test
+metadata also stay failed rather than hiding a possible test failure. Checkout,
+low-disk/toolchain setup,
+agent cancellation/loss or the execution budget select hosted fallback. The
+worker gets a read-only token and cache-mode read; PR work cannot save default
+branch Actions/sccache cache entries.
+
+The runner must match `[self-hosted, macOS, ARM64, mac-arm64-mini]`, be available
+to Astra (including public repository access), and support the pinned Actions,
+Rust and Node versions. Rustup is bootstrapped if absent and Cargo bin is added
+to PATH. At least 30 GiB workspace disk is required. On self-hosted runners the
+disk guard reports low/unreadable disk without privileged hosted-image cleanup;
+the hosted fallback proceeds while operators restore mini capacity.
+
+One registration runs one bundle at a time. Other eligible runs use hosted Macs
+when their queue budget expires. Measure mini execution time, fallback rate,
+queue delay, API usage and hosted minutes; running attempts poll once per minute
+and filter worker history by source creation time. Bundling reduces repeated
+preparation, but
+neither creates physical capacity nor guarantees the previous hosted elapsed
+time. The initial 60-minute budget needs qualification against actual load.
+
+If the old App/controller design was staged, retire its unused App required
+contexts and admission hook, and permit the new `macos-mini.yml@main` worker in
+the runner group. Preserve existing GitHub Actions checks and fork approval.
+Rollback through a PR by routing all authors to hosted macOS; existing reruns
+already take that recovery path. No remote runner/group or protection settings
+are changed by the implementation PR.
