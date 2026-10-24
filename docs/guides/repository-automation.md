@@ -122,30 +122,36 @@ and keeps external-fork behavior part of the repository's delivery contract.
 
 ## Self-hosted macOS tests
 
-Test Suite sends all macOS execution to runners matching
-`[self-hosted, macOS, ARM64, mac-arm64-mini]`: default reader/Bash, dev-tty reader,
-reflow, workspace coordination and vendored terminal units. The same routing
-applies to every PR author and to pushes on main/develop. Existing required-check
+Test Suite routes default reader/Bash, dev-tty reader, reflow, workspace
+coordination and vendored terminal units by PR author ID. IDs in
+`MACOS_RUNNER_AUTHORS` in `scripts/ci/ci_scope.py` use runners matching
+`[self-hosted, macOS, ARM64, mac-arm64-mini]`; other or unknown authors use hosted
+`macos-15`. The list includes Dependabot. Numeric IDs remain stable across login
+renames; login strings in the list are review annotations. The author is
+`pull_request.user.id`, not the sender or re-run actor. Pushes on main/develop
+also use the self-hosted labels. Existing required-check
 names retain their `macos-15` label for compatibility; inspect each job's actual
 runner for execution provenance. Linux execution and release workflows retain
 their existing platforms.
 
 This uses the ordinary `pull_request`/`push` workflow, GitHub's existing fork
 approval and read-only workflow token. No App, organization membership query,
-custom result contexts, routing flag, hook or hosted fallback is required by this
-implementation. The selected runner must be available to Astra, including public
+custom result contexts, routing flag or hook is required by this implementation.
+If scope output is missing, Mac jobs use hosted `macos-15` and still run tests. The selected runner must be available to Astra, including public
 repository access when applicable, and have the exact labels above. Confirm its
 OS/toolchain support for the pinned Actions/Rust/Node versions and at least
 30 GiB workspace disk before assigning work. CI bootstraps rustup when missing,
 adds Cargo binaries to PATH and installs the repository-pinned Rust toolchain.
 The shared Rust setup reports low or unreadable disk as a failure on self-hosted runners, without running the
-hosted-image sudo cleanup. All approved PR code executes on that
-runner; operators must accept that persistent-host access and resource exposure.
+hosted-image sudo cleanup. Approved PR code executes on that
+runner when the author is allowlisted; operators accept that persistent-host
+access and resource exposure.
 
 One registration executes one job at a time. The five macOS jobs queue on a
 single Mac; adding registrations on the same machine changes resource contention
 and does not create extra capacity. Reader feature builds remain separate jobs.
-If the runner is offline, jobs stay queued rather than consuming a hosted Mac.
+For allowlisted PRs and pushes, a busy/offline runner leaves jobs queued; there
+is no automatic availability-based hosted fallback.
 Measure queue delay and actual job duration before claiming an elapsed-time gain.
 
 If the earlier controller design was staged, remove its unused custom App

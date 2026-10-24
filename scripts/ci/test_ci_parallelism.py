@@ -117,25 +117,22 @@ sys.exit(17 if sys.argv[1] == os.environ["FAIL_COMMAND"] else 0)
 
 
 class MacRunnerTests(unittest.TestCase):
-    def test_all_macos_execution_uses_the_same_self_hosted_labels_for_every_author(self):
+    def test_macos_execution_uses_scope_routing_and_keeps_a_hosted_fallback(self):
         workflow = (ROOT / ".github/workflows/test.yml").read_text()
-        labels = ["self-hosted", "macOS", "ARM64", "mac-arm64-mini"]
+        selector = "fromJSON(needs.scope.outputs.macos_runner || '[\"macos-15\"]')"
         for job in ("vendored-terminal", "terminal-pty-shards"):
             header = workflow.split(f"\n  {job}:\n", 1)[1].split("    steps:\n", 1)[0]
-            selection = re.search(r"runs-on: \$\{\{ matrix\.os == 'macos-15' && fromJSON\('([^']+)'\) \|\| matrix\.os \}\}", header)
-            self.assertIsNotNone(selection, job)
-            self.assertEqual(json.loads(selection[1]), labels)
+            self.assertIn("runs-on: ${{ matrix.os == 'macos-15' && " + selector + " || matrix.os }}", header)
             self.assertIn("os: [ubuntu-latest, macos-15]", header)
             self.assertIn("needs: scope", header)
         coordination = workflow.split("\n  macos-workspace-coordination-tests:\n", 1)[1].split("    steps:\n", 1)[0]
-        self.assertIn("runs-on: [self-hosted, macOS, ARM64, mac-arm64-mini]", coordination)
+        self.assertIn("runs-on: ${{ " + selector + " }}", coordination)
+        self.assertIn("macos_runner: ${{ steps.scope.outputs.macos_runner }}", workflow)
         for job in ("scope", "cli-test-build", "shard-b", "shard-c", "shard-d", "test-online"):
             header = workflow.split(f"\n  {job}:\n", 1)[1].split("    steps:\n", 1)[0]
             self.assertIn("runs-on: ubuntu-latest", header)
         self.assertIn("pull_request:", workflow)
-        self.assertIn("branches: [main, develop]", workflow)
         self.assertNotIn("pull_request_target:", workflow)
-        self.assertNotIn("github.event.pull_request.user", workflow)
         self.assertNotIn("ASTRA_MACOS_", workflow)
         self.assertNotIn("macos-routing:", workflow)
 

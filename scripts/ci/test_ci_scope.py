@@ -11,10 +11,47 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from unittest.mock import patch
 
-from ci_scope import classify, main
+from ci_scope import classify, main, select_macos_runner
 
 
 class CiScopeTests(unittest.TestCase):
+    def test_macos_allowlist_uses_author_id_including_bots_and_login_renames(self):
+        for author_id in (39627130, 52204121, 49699333):
+            with self.subTest(author_id=author_id):
+                event = {"pull_request": {"user": {"id": author_id, "login": "renamed-login"}},
+                         "sender": {"id": 999999999}}
+                self.assertEqual(select_macos_runner("pull_request", event, "refs/pull/1/merge"),
+                                 ["self-hosted", "macOS", "ARM64", "mac-arm64-mini"])
+
+    def test_macos_unknown_author_stays_hosted_even_when_actor_or_login_matches(self):
+        for user in ({}, {"login": "XuPeng-SH"}, {"id": 999999999, "login": "XuPeng-SH"},
+                     {"id": "39627130"}, {"id": True}, None):
+            with self.subTest(user=user):
+                event = {"pull_request": {"user": user}, "sender": {"id": 39627130}}
+                self.assertEqual(select_macos_runner("pull_request", event, "refs/pull/1/merge"),
+                                 ["macos-15"])
+        for event in ({}, {"pull_request": None}, []):
+            self.assertEqual(select_macos_runner("pull_request", event, ""), ["macos-15"])
+
+    def test_macos_only_main_and_develop_pushes_use_mini_without_a_pr_author(self):
+        for ref in ("refs/heads/main", "refs/heads/develop"):
+            self.assertEqual(select_macos_runner("push", {}, ref),
+                             ["self-hosted", "macOS", "ARM64", "mac-arm64-mini"])
+        self.assertEqual(select_macos_runner("push", {}, "refs/heads/feature"), ["macos-15"])
+        self.assertEqual(select_macos_runner("workflow_dispatch", {}, "refs/heads/main"), ["macos-15"])
+
+    def test_macos_missing_event_routes_to_hosted_without_omitting_scope_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            with patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(Path(directory) / "missing"),
+                                          "GITHUB_OUTPUT": str(output)}, clear=True), \
+                 patch.object(sys, "argv", ["ci_scope.py", "crates/core/src/lib.rs"]), \
+                 redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                self.assertEqual(main(), 0)
+            values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            self.assertEqual(json.loads(values["macos_runner"]), ["macos-15"])
+            self.assertEqual(values["test_core"], "true")
+
     def assert_rename_selects_expected_scopes(
         self,
         source: str,

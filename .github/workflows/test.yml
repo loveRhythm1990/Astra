@@ -27,6 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
+      macos_runner: ${{ steps.scope.outputs.macos_runner }}
       test_cli: ${{ steps.scope.outputs.test_cli }}
       test_runtime: ${{ steps.scope.outputs.test_runtime }}
       test_services: ${{ steps.scope.outputs.test_services }}
@@ -195,7 +196,7 @@ jobs:
     name: "Test: vendored terminal (${{ matrix.os }})"
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
-    runs-on: ${{ matrix.os == 'macos-15' && fromJSON('["self-hosted","macOS","ARM64","mac-arm64-mini"]') || matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-15' && fromJSON(needs.scope.outputs.macos_runner || '["macos-15"]') || matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -244,7 +245,7 @@ jobs:
     name: "Terminal: ${{ matrix.segment }} (${{ matrix.os }})"
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
-    runs-on: ${{ matrix.os == 'macos-15' && fromJSON('["self-hosted","macOS","ARM64","mac-arm64-mini"]') || matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-15' && fromJSON(needs.scope.outputs.macos_runner || '["macos-15"]') || matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -262,7 +263,7 @@ jobs:
           save-cache: ${{ github.event_name == 'push' && matrix.segment == 'default-reader' }}
           install-nextest: false
       # Separate Cargo invocations keep dev-tty feature unification out of
-      # the default reader; one self-hosted registration queues these jobs.
+      # the default reader; one self-hosted registration queues allowlisted jobs.
       - name: Test default terminal reader through PTYs
         if: matrix.segment == 'default-reader'
         run: |
@@ -324,7 +325,7 @@ jobs:
     name: "macOS workspace coordination contracts"
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_core == 'true' || needs.scope.outputs.test_cli == 'true') }}
-    runs-on: [self-hosted, macOS, ARM64, mac-arm64-mini]
+    runs-on: ${{ fromJSON(needs.scope.outputs.macos_runner || '["macos-15"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

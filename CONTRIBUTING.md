@@ -119,8 +119,9 @@ using its existing default-feature test executable. Tools lint and serial
 workspace-coordination tests retain independent jobs; the protected coordination
 check requires both paths to succeed. Feature-specific terminal tests remain separate.
 All macOS execution jobs in Test Suite use the organization's self-hosted ARM
-runner labels for both pull requests and main/develop pushes, without author
-classification. Existing fork approval and required-check names remain in place.
+runner for allowlisted PR author IDs and main/develop pushes. Other or unknown
+PR authors use hosted macOS. The allowlist lives in `scripts/ci/ci_scope.py`;
+existing fork approval and required-check names remain in place.
 See [runner operations](docs/guides/repository-automation.md#self-hosted-macos-tests)
 for registration, queueing and rollback.
 The lint gate retains restored artifacts; age-based cleanup is not a lint prerequisite.
