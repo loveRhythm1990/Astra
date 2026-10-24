@@ -136,8 +136,9 @@ custom result contexts, routing flag, hook or hosted fallback is required by thi
 implementation. The selected runner must be available to Astra, including public
 repository access when applicable, and have the exact labels above. Confirm its
 OS/toolchain support for the pinned Actions/Rust/Node versions and at least
-30 GiB workspace disk before assigning work. The shared Rust setup reports low
-or unreadable disk as a failure on self-hosted runners, without running the
+30 GiB workspace disk before assigning work. CI bootstraps rustup when missing,
+adds Cargo binaries to PATH and installs the repository-pinned Rust toolchain.
+The shared Rust setup reports low or unreadable disk as a failure on self-hosted runners, without running the
 hosted-image sudo cleanup. All approved PR code executes on that
 runner; operators must accept that persistent-host access and resource exposure.
 

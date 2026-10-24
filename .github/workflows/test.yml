@@ -206,7 +206,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pinned Rust toolchain
-        run: rustc --version
+        uses: ./.github/actions/rust-toolchain
       # The patched crate is deliberately outside the application workspace.
       # These are parser/unit tests, not the real-reader PTY regression suite.
       - name: Test vendored terminal units

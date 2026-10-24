@@ -20,6 +20,60 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class BuildCoverageTests(unittest.TestCase):
+    def test_rust_toolchain_bootstraps_missing_rust_and_reuses_cargo_bin(self):
+        action = (ROOT / ".github/actions/rust-toolchain/action.yml").read_text()
+        script = textwrap.dedent(action.split("      run: |\n", 1)[1])
+        for installed, install_failure in ((False, False), (True, False), (False, True)):
+            with self.subTest(installed=installed, failure=install_failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                mock_bin = root / "mock-bin"
+                cargo_home = root / "cargo home"
+                mock_bin.mkdir()
+                (cargo_home / "bin").mkdir(parents=True)
+                calls = root / "calls"
+                github_path = root / "github-path"
+                installer = root / "installer"
+                installer.write_text("""#!/bin/sh
+set -eu
+printf 'installer %s\\n' "$*" >> "$MOCK_CALLS"
+cp "$MOCK_BIN/rustup-source" "$CARGO_HOME/bin/rustup"
+cp "$MOCK_BIN/rustc-source" "$CARGO_HOME/bin/rustc"
+""")
+                programs = {
+                    "curl": 'printf "curl\\n" >> "$MOCK_CALLS"; if [ "$MOCK_FAILURE" = 1 ]; then exit 22; fi; cat "$MOCK_INSTALLER"',
+                    "rustup-source": 'printf "rustup %s\\n" "$*" >> "$MOCK_CALLS"; if [ "$1" = show ]; then test -f "$CARGO_HOME/ready"; else touch "$CARGO_HOME/ready"; fi',
+                    "rustc-source": 'test -f "$CARGO_HOME/ready"; printf "rustc pinned-fixture\\n"',
+                }
+                for name, body in programs.items():
+                    path = mock_bin / name
+                    path.write_text("#!/bin/sh\nset -eu\n" + body + "\n")
+                    path.chmod(0o755)
+                if installed:
+                    for name in ("rustup", "rustc"):
+                        target = cargo_home / "bin" / name
+                        target.write_bytes((mock_bin / (name + "-source")).read_bytes())
+                        target.chmod(0o755)
+                    (cargo_home / "ready").touch()
+                result = subprocess.run(
+                    ["/bin/bash", "-e", "-c", script], cwd=ROOT, capture_output=True, text=True,
+                    env={**os.environ, "PATH": str(mock_bin) + ":/usr/bin:/bin",
+                         "CARGO_HOME": str(cargo_home), "GITHUB_PATH": str(github_path),
+                         "MOCK_BIN": str(mock_bin), "MOCK_CALLS": str(calls),
+                         "MOCK_INSTALLER": str(installer), "MOCK_FAILURE": str(int(install_failure))},
+                )
+                invocations = calls.read_text().splitlines()
+                if install_failure:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("rustc pinned-fixture", result.stdout)
+                    continue
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("rustc pinned-fixture", result.stdout)
+                self.assertEqual(github_path.read_text().strip(), str(cargo_home / "bin"))
+                self.assertEqual("curl" in invocations, not installed)
+                self.assertEqual("rustup toolchain install" in invocations, not installed)
+        for path in (".github/actions/rust-setup/action.yml", ".github/workflows/test.yml"):
+            self.assertIn("uses: ./.github/actions/rust-toolchain", (ROOT / path).read_text())
+
     def test_rust_setup_disk_guard_uses_workspace_free_space_without_real_cleanup(self):
         action = (ROOT / ".github/actions/rust-setup/action.yml").read_text()
         section = action.split("\n    - name: Guard workspace disk space\n", 1)[1]
