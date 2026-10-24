@@ -12,9 +12,18 @@ import unittest
 from unittest.mock import patch
 
 import macos_runner as m
+from test_release_build_shells import workflow_run_script
 
 ROOT = Path(__file__).resolve().parents[2]
 B, H, M = "b" * 40, "a" * 40, "c" * 40
+
+
+def ordinary_run():
+    return {"id": 200, "status": "completed", "event": "pull_request",
+            "path": ".github/workflows/test.yml", "repository": {"full_name": m.REPO},
+            "head_sha": H, "head_repository": {"id": 2}, "run_attempt": 1,
+            "display_title": f"Test Suite PR 42 base={B} head={H} merge={M}",
+            "pull_requests": [{"number": 42, "head": {"sha": H}, "base": {"sha": B}}]}
 
 
 class FakeAPI(m.API):
@@ -246,7 +255,8 @@ class PolicyTests(unittest.TestCase):
                   "steps": [{"name": "Run all three macOS lanes", "conclusion": "failure"}]}
         fallbacks = [{**failed, "name": "Fallback macOS: " + lane, "conclusion": "success",
                       "labels": ["macos-15"],
-                      "steps": [{"name": "Run macOS lane", "conclusion": "success"}]} for lane in m.HOSTED_LANES]
+                      "steps": [{"name": "Enforce current hosted authorization", "conclusion": "success"},
+                                {"name": "Run macOS lane", "conclusion": "success"}]} for lane in m.HOSTED_LANES]
         self.api.data[self.run_path + "/jobs?filter=latest"] = {"jobs": [failed, *fallbacks]}
         self.assertFalse(m.can_fallback(self.api, self.plan))
         m.finish(self.api, self.plan)
@@ -289,8 +299,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_ordinary_hosted_results_require_matching_source_all_three_jobs_and_real_macos(self):
         runs_path = f"/repos/{m.REPO}/actions/workflows/test.yml/runs?event=pull_request&head_sha={H}"
-        self.api.data[runs_path] = {"workflow_runs": [{"id": 200, "status": "completed", "head_repository": {"id": 2},
-            "pull_requests": [{"number": 42, "head": {"sha": H}, "base": {"sha": B}}]}]}
+        self.api.data[runs_path] = {"workflow_runs": [ordinary_run()]}
         names = ("Terminal: default-reader (macos-15)", "Terminal: reflow (macos-15)",
                  "macOS workspace coordination contracts")
         jobs = [{"name": name, "status": "completed", "conclusion": "success", "labels": ["macos-15"]} for name in names]
@@ -307,6 +316,20 @@ class PolicyTests(unittest.TestCase):
         self.assertIsNone(m.hosted_result(self.api, self.plan))
         self.api.data[runs_path]["workflow_runs"][0]["pull_requests"][0]["base"]["sha"] = "d" * 40
         self.assertIsNone(m.hosted_result(self.api, self.plan))
+
+    def test_hosted_result_cannot_accept_a_rerun_with_successful_cached_steps(self):
+        plan = {**self.plan, "route": "hosted"}
+        job = {"name": "Fallback macOS: default-reader", "status": "completed", "conclusion": "success",
+               "labels": ["macos-15"], "steps": [
+                   {"name": "Enforce current hosted authorization", "conclusion": "success"},
+                   {"name": "Run macOS lane", "conclusion": "success"}]}
+        self.api.data[self.run_path + "/jobs?filter=latest"] = {"jobs": [job]}
+        self.assertEqual(m.verified_job(self.api, plan, job["name"]), "success")
+        self.api.data[self.run_path]["run_attempt"] = 2
+        self.assertEqual(m.verified_job(self.api, plan, job["name"]), "failure")
+        self.api.data[self.run_path]["run_attempt"] = 1
+        job["steps"].pop(0)
+        self.assertEqual(m.verified_job(self.api, plan, job["name"]), "failure")
 
     def test_main_stays_hosted_without_explicit_isolation_acceptance(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
@@ -386,13 +409,78 @@ class PolicyTests(unittest.TestCase):
         self.api.data[f"/repos/{m.REPO}/pulls?state=open&base=main"] = [
             {"number": 42, "head": {"sha": H}}]
         self.api.data[f"/repos/{m.REPO}/actions/workflows/test.yml/runs?event=pull_request&head_sha={H}"] = {
-            "workflow_runs": [{"id": 200, "status": "completed", "head_repository": {"id": 2},
-                "pull_requests": [{"number": 42, "head": {"sha": H}, "base": {"sha": B}}]}]}
+            "workflow_runs": [ordinary_run()]}
         self.jobs200 = f"/repos/{m.REPO}/actions/runs/200/jobs?filter=latest"
         self.api.data[self.jobs200] = {"jobs": [
             {"name": name, "status": "completed", "conclusion": "success", "labels": ["macos-15"]}
             for name in ("Terminal: default-reader (macos-15)", "Terminal: reflow (macos-15)",
                          "macOS workspace coordination contracts")]}
+
+    def test_empty_fork_associations_complete_ordinary_checks(self):
+        self.prepare_ordinary_reconciliation()
+        run = self.api.data[f"/repos/{m.REPO}/actions/workflows/test.yml/runs?event=pull_request&head_sha={H}"]["workflow_runs"][0]
+        run["pull_requests"] = []
+        self.assertEqual(m.hosted_result(self.api, self.plan), "success")
+        self.assertTrue(m.finish(self.api, self.plan))
+        self.assertTrue(all(c["conclusion"] == "success" for c in self.api.checks))
+
+    def test_empty_fork_associations_work_through_observer_and_scheduled_reconciliation(self):
+        for entrypoint in ("observe", "reconcile"):
+            with self.subTest(entrypoint=entrypoint):
+                self.api.checks.clear()
+                self.prepare_ordinary_reconciliation()
+                run = self.api.data[f"/repos/{m.REPO}/actions/workflows/test.yml/runs?event=pull_request&head_sha={H}"]["workflow_runs"][0]
+                run["pull_requests"] = []
+                self.api.data[f"/repos/{m.REPO}/actions/runs/200"] = run
+                # This endpoint is also empty for the real reviewed fork run.
+                self.api.data[f"/repos/{m.REPO}/commits/{H}/pulls"] = []
+                with tempfile.TemporaryDirectory() as directory:
+                    event = Path(directory) / "event.json"
+                    event.write_text(json.dumps({"workflow_run": {"id": 200}}))
+                    with (
+                        patch.dict(os.environ, {"GH_TOKEN": "fixture", "ASTRA_MACOS_APP_ID": "5",
+                                                "GITHUB_EVENT_PATH": str(event)}),
+                        patch.object(m, "API", return_value=self.api),
+                        patch.object(sys, "argv", ["macos_runner.py", entrypoint]),
+                    ):
+                        self.assertEqual(m.main(), 0)
+                self.assertTrue(all(c["conclusion"] == "success" for c in self.api.checks))
+                self.assertFalse(any(path.endswith(f"/commits/{H}/pulls") for path, _ in self.api.calls))
+
+    def test_ordinary_empty_links_retain_repository_event_workflow_and_merge_identity(self):
+        self.prepare_ordinary_reconciliation()
+        original = ordinary_run()
+        original["pull_requests"] = []
+        mutations = (
+            lambda r: r.update(event="push"),
+            lambda r: r.update(path=m.WORKFLOW),
+            lambda r: r["repository"].update(full_name="fixture/other"),
+            lambda r: r["head_repository"].update(id=99),
+            lambda r: r.update(head_sha="d" * 40),
+            lambda r: r.update(display_title=r["display_title"].replace(B, "d" * 40)),
+            lambda r: r.update(display_title=r["display_title"].replace(H, "d" * 40)),
+            lambda r: r.update(display_title=r["display_title"].replace(M, "d" * 40)),
+            lambda r: r.update(display_title=r["display_title"].replace("PR 42", "PR 43")),
+            lambda r: r.update(display_title="Historical title without source metadata"),
+            lambda r: r.update(pull_requests=[{"number": 99, "head": {"sha": H}, "base": {"sha": B}}]))
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                run = copy.deepcopy(original)
+                mutate(run)
+                with self.assertRaises(m.Unavailable):
+                    m.ordinary_source(self.api, run)
+        # A plausible run title cannot replace validation of the immutable merge.
+        self.api.data[f"/repos/{m.REPO}/git/commits/{M}"]["parents"] = [{"sha": H}, {"sha": B}]
+        with self.assertRaises(m.Unavailable):
+            m.ordinary_source(self.api, original)
+
+    def test_completed_ordinary_run_without_source_tuple_fails_instead_of_pending(self):
+        self.prepare_ordinary_reconciliation()
+        run = self.api.data[f"/repos/{m.REPO}/actions/workflows/test.yml/runs?event=pull_request&head_sha={H}"]["workflow_runs"][0]
+        run["pull_requests"] = []
+        del run["display_title"]
+        self.assertTrue(m.finish(self.api, self.plan))
+        self.assertTrue(all(c["conclusion"] == "failure" for c in self.api.checks))
 
     def test_reconciliation_recovers_a_lost_completion_notification(self):
         self.prepare_ordinary_reconciliation()
@@ -557,7 +645,8 @@ class PolicyTests(unittest.TestCase):
     def test_parallel_hosted_requires_every_real_lane_and_retains_failures(self):
         plan = {**self.plan, "route": "hosted"}
         jobs = [{"name": "Fallback macOS: " + lane, "status": "completed", "conclusion": "success",
-                 "labels": ["macos-15"], "steps": [{"name": "Run macOS lane", "conclusion": "success"}]}
+                 "labels": ["macos-15"], "steps": [{"name": "Enforce current hosted authorization", "conclusion": "success"},
+                                {"name": "Run macOS lane", "conclusion": "success"}]}
                 for lane in m.HOSTED_LANES]
         self.api.data[self.run_path + "/jobs?filter=latest"] = {"jobs": jobs}
         m.save_checks(self.api, plan)
@@ -628,6 +717,46 @@ sys.exit(17 if failed else 0)
                             self.assertIn("--test-threads=1", commands[-1])
                         if not fail and lane == "reflow":
                             self.assertEqual([c[:2] for c in commands], [["cargo", "build"], ["npm", "ci"], ["npm", "test"]])
+
+    def test_hosted_execution_rejects_reused_outputs_before_any_candidate_command(self):
+        workflow = (ROOT / ".github/workflows/macos-trusted.yml").read_text()
+        hosted = workflow.split("\n  hosted:\n", 1)[1].split("\n  publish:\n", 1)[0]
+        guard_name = "Enforce current hosted authorization"
+        self.assertIn(f"- name: {guard_name}", hosted)
+        self.assertLess(hosted.index(guard_name), hosted.index("path: _mac_source"))
+        guard = workflow_run_script(".github/workflows/macos-trusted.yml", guard_name)
+        execution = hosted.split("      - name: Run macOS lane\n", 1)[1].split("        run: ", 1)[1].splitlines()[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control = root / "_mac_control/scripts/ci"
+            control.mkdir(parents=True)
+            for name in ("macos_runner.py", "ci_scope.py", "run-macos-lanes.sh"):
+                (control / name).write_text((ROOT / "scripts/ci" / name).read_text())
+            source = root / "_mac_source"
+            source.mkdir()
+            subprocess.run(["git", "init", str(source)], check=True, capture_output=True)
+            cargo = root / "cargo"
+            cargo.write_text('#!/bin/sh\ntouch "$CALLS"\n')
+            cargo.chmod(0o755)
+            for name, attempt, expiry, run_id, allowed, succeeds in (
+                ("cached-successful-admission", "2", int(time.time()) + 3600, "100", "true", False),
+                ("expired-before-start", "1", 1, "100", "true", False),
+                ("another-run", "1", int(time.time()) + 3600, "101", "true", False),
+                ("not-admitted", "1", int(time.time()) + 3600, "100", "false", False),
+                ("fresh-full-rerun", "2", int(time.time()) + 3600, "100", "true", True)):
+                with self.subTest(name=name):
+                    plan = {"schema": 1, "kind": "pr", "route": "hosted", "head": H, "merge": M,
+                            "run_id": 100, "attempt": 2 if succeeds else 1, "expires_at": expiry}
+                    calls = root / "calls"
+                    calls.unlink(missing_ok=True)
+                    result = subprocess.run(["bash", "-euo", "pipefail", "-c", guard + '\ncd _mac_source\n' + execution],
+                        cwd=root, env={**os.environ, "PLAN": json.dumps(plan), "PATH": f"{root}:{os.environ['PATH']}",
+                            "CALLS": str(calls), "MACOS_LANE": "coordination", "GITHUB_REPOSITORY": m.REPO,
+                            "GITHUB_EVENT_NAME": "pull_request_target", "GITHUB_RUN_ID": run_id,
+                            "GITHUB_RUN_ATTEMPT": attempt, "ASTRA_MACOS_HOSTED_ADMITTED": allowed,
+                            "GH_TOKEN": "", "ASTRA_MACOS_APP_ID": ""}, capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                    self.assertEqual(calls.exists(), succeeds, "candidate Cargo ran before rejection")
 
     def test_hint_permissions_are_scoped_and_reconciliation_stays_metadata_only(self):
         workflow = (ROOT / ".github/workflows/test.yml").read_text()

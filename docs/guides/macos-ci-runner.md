@@ -98,6 +98,24 @@ missing/skipped selected lanes fails explicitly, including scope disagreement,
 instead of staying pending forever. This retains the pre-existing PR-modifiable
 test-definition limitation for non-member hosted tests.
 
+Fork runs can have empty `pull_requests` arrays, and the commit-to-PR API can
+also return no associations. Test Suite therefore sets `run-name` from GitHub's
+PR number, event base/head and `github.sha` (the tested merge SHA), before any
+checkout. Both observation and reconciliation read this tuple from authenticated
+Actions metadata, fetch that PR directly, and verify repository/head identity,
+current base and the immutable merge's exact ordered parents. Non-empty PR
+associations must agree as well; an empty association alone never rejects a run.
+No downloaded artifact, test stdout or current merge ref substitutes for the
+recorded tested SHA. Completed historical runs without this tuple fail closed;
+rerun the normal approved Test Suite after rollout. See GitHub's
+[PR merge context](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request)
+and [run-name expressions](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#run-name).
+
+This records the ordinary workflow's event context, not a signed attestation:
+PR authors can modify that workflow and its tests, as before. It cannot grant
+membership or authorize privileged execution. Member results still require the
+protected path and fresh member/source checks.
+
 The same metadata-only observer reconciles every 15 minutes (and supports
 manual dispatch), recovering lost completion notifications and PRs with no App
 checks at all. Missing or retryable stale plans dispatch only
@@ -247,10 +265,17 @@ An online/idle API observation is not a reservation. A runner can disappear
 between dispatch and start; queued self-hosted work remains pending. An operator
 can cancel the stale run and use `workflow_dispatch` with its PR number for a
 fresh protected hosted run. That dispatch always selects hosted execution.
-Failed-only hosted retries are refused when they reuse an older successful
-admission job; rerun all jobs for new hosted authorization. Membership revocation
-or a stale tuple blocks privileged-event execution; a fresh plan can choose the
-ordinary approved hosted path. Genuine test failures are never hidden by the
+Every hosted matrix job checks run ID, attempt, deadline and the protected
+admission output using main-owned code **before** candidate checkout, toolchain,
+cache setup or tests. It receives no App credential. Individual/failed-only
+reruns that reuse successful dependencies fail this local fence even when cached
+`allowed=true` remains present; rerun all jobs for new plan/admission. Queue delay
+beyond authorization expiry also rejects execution. Publication additionally
+requires the fence step to succeed and the actual run attempt to match the plan.
+Membership/source are checked at protected admission; the local fence does not
+claim a new membership API check on the execution host. Revocation or a stale
+tuple found at admission blocks execution; a fresh plan can choose the ordinary
+approved hosted path. Genuine test failures are never hidden by the
 infrastructure fallback.
 
 ## Enable, verify and roll back
@@ -262,7 +287,10 @@ infrastructure fallback.
    cache write denial, pollution isolation and capacity on disposable fixtures.
    Include an initially null/stale merge, zero App checks, stale completion,
    lost/forbidden recovery dispatch, recovery throttling and all three parallel
-   hosted results. Recovery must never execute a non-member under the trusted
+   hosted results. Include individual hosted reruns with reused successful
+   admission outputs and expired authorization, and a fork run with empty PR and
+   commit associations that completes all three ordinary checks. Recovery must
+   never execute a non-member under the trusted
    event or treat a marker/timeout as a pass.
 3. Create GitHub Environment `astra-macos-control`, allowing only branch `main`
    via its custom deployment branch policy, with no allowed tags or wildcards.

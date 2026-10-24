@@ -168,6 +168,13 @@ jobs:
           ref: main
           path: _mac_control
           persist-credentials: false
+      - name: Enforce current hosted authorization
+        shell: bash
+        env:
+          PLAN: ${{ needs.plan.outputs.plan }}
+          ASTRA_MACOS_HOSTED_ADMITTED: ${{ needs.hosted-admission.outputs.allowed }}
+        run: |
+          python3 _mac_control/scripts/ci/macos_runner.py guard-hosted --plan "$PLAN"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.plan.outputs.merge }}

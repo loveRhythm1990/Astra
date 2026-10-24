@@ -1,4 +1,11 @@
 name: Test Suite
+# API pull_requests and commit->PR links can both be empty for fork runs.
+# Record the event tuple before checkout; the observer validates it against GitHub.
+run-name: >-
+  ${{ github.event_name == 'pull_request' &&
+      format('Test Suite PR {0} base={1} head={2} merge={3}', github.event.number,
+             github.event.pull_request.base.sha, github.event.pull_request.head.sha, github.sha) ||
+      format('Test Suite {0}', github.sha) }}
 
 permissions:
   contents: read

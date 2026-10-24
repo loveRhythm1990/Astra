@@ -30,6 +30,9 @@ HINT_WAIT_SECONDS = 90
 SOURCE_ATTEMPTS = 12
 RECOVERY_COOLDOWN_SECONDS = 30 * 60
 HOSTED_LANES = ("default-reader", "reflow", "coordination")
+ORDINARY_RUN_TITLE = re.compile(
+    r"Test Suite PR (?P<pr>[1-9][0-9]*) base=(?P<base>[0-9a-f]{40}) "
+    r"head=(?P<head>[0-9a-f]{40}) merge=(?P<merge>[0-9a-f]{40})")
 
 
 class Unavailable(Exception):
@@ -321,6 +324,23 @@ def admit(api, request, config):
     return plan
 
 
+def guard_hosted(plan):
+    """Local execution fence for reused successful dependency outputs.
+
+    This needs no App token or candidate code. A new attempt must rerun trusted
+    plan + admission; queue delay must not outlive the admitted authorization.
+    """
+    require_unexpired(plan)
+    events = ("pull_request_target", "workflow_dispatch") if plan["kind"] == "pr" else ("push",)
+    if (plan.get("schema") != 1 or plan["route"] not in ("hosted", "self-hosted")
+            or os.environ.get("GITHUB_REPOSITORY") != REPO
+            or os.environ.get("GITHUB_EVENT_NAME") not in events
+            or os.environ.get("ASTRA_MACOS_HOSTED_ADMITTED") != "true"
+            or int(os.environ["GITHUB_RUN_ID"]) != plan["run_id"]
+            or int(os.environ["GITHUB_RUN_ATTEMPT"]) != plan["attempt"]):
+        raise Unavailable("hosted execution requires fresh plan and admission for this attempt")
+
+
 def verified_job(api, plan, name):
     run = validate_run(api, plan)
     jobs = api.pages(f"/repos/{REPO}/actions/runs/{run['id']}/jobs?filter=latest", "jobs")
@@ -334,7 +354,10 @@ def verified_job(api, plan, name):
     expected_step = "Run all three macOS lanes" if name == "Migrated macOS lanes" else "Run macOS lane"
     if steps.get(expected_step) != "success":
         return "failure"
-    if name.startswith("Fallback macOS:") and "macos-15" not in job.get("labels", []):
+    if name.startswith("Fallback macOS:") and (
+            "macos-15" not in job.get("labels", [])
+            or steps.get("Enforce current hosted authorization") != "success"
+            or run["run_attempt"] != plan["attempt"]):
         return "failure"
     if name == "Migrated macOS lanes" and job["runner_group_id"] != plan["group_id"]:
         return "failure"
@@ -351,14 +374,42 @@ def can_fallback(api, plan):
         for s in primary[0]["steps"]))
 
 
+def ordinary_source(api, run):
+    """Bind ordinary execution to its event tuple, even for empty fork links.
+
+    GitHub records run-name's github-context expressions in run metadata, before
+    checkout. Recheck that tuple against the canonical PR and immutable merge.
+    Ordinary PR workflow definitions remain PR-modifiable, as do their tests;
+    this metadata does not grant member trust or privileged execution.
+    """
+    if (run["event"] != "pull_request" or run["path"] != ".github/workflows/test.yml"
+            or run["repository"]["full_name"] != REPO):
+        raise Unavailable("not an ordinary Astra Test Suite run")
+    match = ORDINARY_RUN_TITLE.fullmatch(run.get("display_title", ""))
+    if not match:
+        raise Unavailable("ordinary run lacks source tuple; rerun approved Test Suite")
+    current = source(api, int(match["pr"]))
+    if (any(match[key] != current[key] for key in ("base", "head", "merge"))
+            or run["head_sha"] != current["head"]
+            or run["head_repository"]["id"] != current["head_repository_id"]):
+        raise Unavailable("ordinary run source differs from current PR/merge")
+    refs = run.get("pull_requests", [])
+    if refs and not any(p["number"] == current["pr"] and p["head"]["sha"] == current["head"]
+                        and p["base"]["sha"] == current["base"] for p in refs):
+        raise Unavailable("ordinary run has a conflicting PR association")
+    return current
+
+
 def hosted_result(api, plan):
     runs = api.pages(f"/repos/{REPO}/actions/workflows/test.yml/runs?event=pull_request&head_sha={plan['head']}", "workflow_runs")
     for run in sorted(runs, key=lambda r: r["id"], reverse=True):
-        if run["head_repository"]["id"] != plan["head_repository_id"]:
+        if run["head_repository"]["id"] != plan["head_repository_id"] or run["head_sha"] != plan["head"]:
             continue
-        refs = run.get("pull_requests", [])
-        if not any(p["number"] == plan["pr"] and p["head"]["sha"] == plan["head"]
-                   and p["base"]["sha"] == plan["base"] for p in refs):
+        try:
+            current = ordinary_source(api, run)
+        except Unavailable:
+            return "failure" if run["status"] == "completed" else None
+        if not same_source(current, plan):
             continue
         jobs = api.pages(f"/repos/{REPO}/actions/runs/{run['id']}/jobs?filter=latest", "jobs")
         wanted = {"Terminal: default-reader (macos-15)", "Terminal: reflow (macos-15)",
@@ -586,11 +637,14 @@ def reconcile(api, app_id):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("plan", "hint", "finish", "refresh", "admit", "observe", "reconcile"))
+    parser.add_argument("command", choices=("plan", "hint", "finish", "refresh", "admit", "observe", "reconcile", "guard-hosted"))
     parser.add_argument("--plan")
     parser.add_argument("--config")
     args = parser.parse_args()
     try:
+        if args.command == "guard-hosted":
+            guard_hosted(json.loads(args.plan))
+            return 0
         if args.command == "admit":
             signal.alarm(90)  # Hooks themselves have no GitHub timeout.
             config = json.loads(Path(args.config).read_text())
@@ -614,22 +668,19 @@ def main():
             run = api.get(f"/repos/{REPO}/actions/runs/{int(event['workflow_run']['id'])}")
             if run["event"] != "pull_request" or run["path"] != ".github/workflows/test.yml":
                 return 0
-            for pr in api.get(f"/repos/{REPO}/commits/{run['head_sha']}/pulls"):
-                if pr["head"]["sha"] != run["head_sha"]:
-                    continue
-                current = source(api, pr["number"])
-                rows = checks(api, current["head"])
-                plans = []
-                for row in rows:
-                    if row.get("app", {}).get("id") == app_id and row["name"] == CONTEXTS[0]:
-                        try:
-                            p = json.loads(row["output"]["text"])
-                            if p["route"] == "ordinary" and same_source(p, current):
-                                plans.append((row["id"], p))
-                        except (KeyError, TypeError, ValueError):
-                            pass
-                if plans:
-                    finish(api, max(plans, key=lambda p: p[0])[1])
+            current = ordinary_source(api, run)
+            rows = checks(api, current["head"])
+            plans = []
+            for row in rows:
+                if row.get("app", {}).get("id") == app_id and row["name"] == CONTEXTS[0]:
+                    try:
+                        p = json.loads(row["output"]["text"])
+                        if p["route"] == "ordinary" and same_source(p, current):
+                            plans.append((row["id"], p))
+                    except (KeyError, TypeError, ValueError):
+                        pass
+            if plans:
+                finish(api, max(plans, key=lambda p: p[0])[1])
         else:
             plan = json.loads(args.plan)
             if args.command == "finish":
