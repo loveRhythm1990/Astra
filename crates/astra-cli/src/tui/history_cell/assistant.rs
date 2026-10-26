@@ -309,13 +309,13 @@ impl AssistantCell {
         self.markdown_layout_window(source, width, 0, usize::MAX).0
     }
 
-    fn scrollback_body_lines(
+    fn scrollback_body_rows(
         &self,
         source: &str,
         width: u16,
         start: usize,
         maximum: usize,
-    ) -> (Vec<Line<'static>>, usize) {
+    ) -> (Vec<MarkdownRow>, usize) {
         if source.is_empty() || maximum == 0 {
             return (Vec::new(), 0);
         }
@@ -499,12 +499,12 @@ impl AssistantCell {
     /// Materialize only a bounded portion of a final reply for native
     /// scrollback. Long final messages are inserted over several frames so
     /// the event loop can continue accepting composer input between chunks.
-    pub(crate) fn scrollback_lines_chunk(
+    pub(crate) fn scrollback_rows_chunk(
         &self,
         width: u16,
         start: usize,
         maximum: usize,
-    ) -> (Vec<Line<'static>>, usize, bool) {
+    ) -> (Vec<MarkdownRow>, usize, bool) {
         debug_assert!(!self.live, "live assistant cells stay in the viewport");
         if maximum == 0 {
             return (Vec::new(), start, false);
@@ -529,11 +529,12 @@ impl AssistantCell {
             .skip(start)
             .take(maximum)
             .cloned()
+            .map(MarkdownRow::from)
             .collect::<Vec<_>>();
         let body_start = start.saturating_sub(headers.len());
         let remaining = maximum.saturating_sub(lines.len());
         let (body_lines, body_total) =
-            self.scrollback_body_lines(body_source, width, body_start, remaining);
+            self.scrollback_body_rows(body_source, width, body_start, remaining);
         lines.extend(body_lines);
         let next = start.saturating_add(lines.len());
         let total = headers.len().saturating_add(body_total);
@@ -566,7 +567,7 @@ impl AssistantCell {
             .into_iter()
             .map(|row| {
                 if prepend_gutter {
-                    prefix_settled_row(row)
+                    prefix_settled_row(row).line
                 } else {
                     row.line
                 }
@@ -575,23 +576,14 @@ impl AssistantCell {
     }
 }
 
-/// Prefix a settled response body row for native scrollback.
-///
-/// Terminal selection copies every written cell, so any glyph prefix leaks
-/// into text users copy from a reply, even a one-row marker on a reply that
-/// is a single command. Code-block rows are therefore written verbatim at
-/// column 0: a copied block (a heredoc, indentation-sensitive code) matches
-/// its source exactly. Prose rows get a 2-col plain-space indent, which
-/// shells ignore. Live responses keep the distinct focus gutter supplied by
-/// `LiveFramedCell`.
-fn prefix_settled_row(row: MarkdownRow) -> Line<'static> {
-    if row.verbatim {
-        return row.line;
+/// Decorate prose while retaining code-row semantics for the final writer.
+/// Settled code starts at column zero and uses terminal soft wrapping; live
+/// responses keep their distinct focus gutter supplied by `LiveFramedCell`.
+fn prefix_settled_row(mut row: MarkdownRow) -> MarkdownRow {
+    if !row.verbatim {
+        row.line.spans.insert(0, Span::raw("  "));
     }
-    let mut spans = Vec::with_capacity(row.line.spans.len() + 1);
-    spans.push(Span::raw("  "));
-    spans.extend(row.line.spans);
-    Line::from(spans)
+    row
 }
 
 impl HistoryCell for AssistantCell {
@@ -1062,9 +1054,9 @@ mod tests {
         let mut actual = Vec::new();
         let mut start = 0;
         loop {
-            let (chunk, next, complete) = c.scrollback_lines_chunk(80, start, 8);
+            let (chunk, next, complete) = c.scrollback_rows_chunk(80, start, 8);
             assert!(chunk.len() <= 8);
-            actual.extend(chunk);
+            actual.extend(chunk.into_iter().map(|row| row.line));
             if complete {
                 break;
             }
@@ -1091,9 +1083,12 @@ mod tests {
     fn settled_single_line_command_reply_copies_without_glyphs() {
         for source in ["`git status`", "git status"] {
             let c = AssistantCell::from_markdown(source);
-            let (scrollback, _, complete) = c.scrollback_lines_chunk(80, 0, usize::MAX);
+            let (scrollback, _, complete) = c.scrollback_rows_chunk(80, 0, usize::MAX);
             assert!(complete);
-            for lines in [c.display_lines(80), scrollback] {
+            for lines in [
+                c.display_lines(80),
+                scrollback.into_iter().map(|row| row.line).collect(),
+            ] {
                 assert_eq!(line_text(&lines), "  git status", "{source:?}");
             }
         }
@@ -1110,9 +1105,12 @@ mod tests {
             format!("```\n{block}\n```"),
         ] {
             let c = AssistantCell::from_markdown(source.clone());
-            let (scrollback, _, complete) = c.scrollback_lines_chunk(80, 0, usize::MAX);
+            let (scrollback, _, complete) = c.scrollback_rows_chunk(80, 0, usize::MAX);
             assert!(complete);
-            for lines in [c.display_lines(80), scrollback] {
+            for lines in [
+                c.display_lines(80),
+                scrollback.into_iter().map(|row| row.line).collect(),
+            ] {
                 let text = line_text(&lines);
                 assert!(
                     text.contains(&format!("\n{block}\n")) || text.ends_with(&format!("\n{block}")),
@@ -1161,12 +1159,12 @@ mod tests {
                 .join("\n\n"),
         );
 
-        let (first, next, complete) = c.scrollback_lines_chunk(80, 0, 3);
+        let (first, next, complete) = c.scrollback_rows_chunk(80, 0, 3);
         assert_eq!(first.len(), 3);
         assert_eq!(next, 3);
         assert!(!complete);
 
-        let (second, next, complete) = c.scrollback_lines_chunk(80, next, 3);
+        let (second, next, complete) = c.scrollback_rows_chunk(80, next, 3);
         assert_eq!(second.len(), 3);
         assert_eq!(next, 6);
         assert!(!complete);
@@ -1174,7 +1172,7 @@ mod tests {
             first
                 .iter()
                 .chain(&second)
-                .all(|line| line.spans[0].content.as_ref() == "  "),
+                .all(|row| row.line.spans[0].content.as_ref() == "  "),
             "every chunk indents prose rows with plain spaces"
         );
     }
@@ -1187,10 +1185,11 @@ mod tests {
         c.prepare_scrollback_layout(80);
 
         assert!(c.has_scrollback_layout(80));
-        let (lines, _, complete) = c.scrollback_lines_chunk(80, 0, 8);
+        let (lines, _, complete) = c.scrollback_rows_chunk(80, 0, 8);
         assert!(complete);
-        assert!(lines.iter().any(|line| {
-            line.spans
+        assert!(lines.iter().any(|row| {
+            row.line
+                .spans
                 .iter()
                 .any(|span| span.content.contains("Result"))
         }));

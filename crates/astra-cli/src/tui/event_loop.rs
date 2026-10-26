@@ -15515,9 +15515,9 @@ mod tests {
         let mut emitted = Vec::new();
         let mut start = 0;
         loop {
-            let (chunk, next, complete) = assistant.scrollback_lines_chunk(80, start, 8);
+            let (chunk, next, complete) = assistant.scrollback_rows_chunk(80, start, 8);
             assert!(chunk.len() <= 8);
-            emitted.extend(chunk);
+            emitted.extend(chunk.into_iter().map(|row| row.line));
             if complete {
                 break;
             }

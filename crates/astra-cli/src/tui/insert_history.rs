@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 
+use super::markdown_render::MarkdownRow;
 use crossterm::{
     cursor::MoveTo,
     queue,
@@ -10,6 +11,7 @@ use ratatui::backend::Backend;
 use ratatui::layout::Size;
 use ratatui::style::{Color as RColor, Modifier, Style};
 use ratatui::text::Line;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::custom_terminal;
@@ -18,58 +20,49 @@ use super::custom_terminal;
 /// Matches Codex insert_history.rs Standard/Zellij paths.
 pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
     terminal: &mut custom_terminal::Terminal<B>,
-    lines: &[Line<'_>],
+    rows: &[MarkdownRow],
     trusted_links: bool,
     is_zellij: bool,
 ) -> io::Result<()> {
-    if lines.is_empty() {
+    if rows.is_empty() {
         return Ok(());
     }
 
     let screen_size = terminal.backend().size().unwrap_or(Size::new(0, 0));
     let area = terminal.viewport_area;
     let last_cursor_pos = terminal.last_known_cursor_pos;
-    let wrap_width = area.width.max(1) as usize;
+    let wrap_width = screen_size.width.max(1) as usize;
     let mut should_update_area = false;
 
-    // Pre-wrap lines using adaptive wrapping (URL-aware, span-preserving)
+    // Sanitization is independent of copy semantics. Code and pure URLs use
+    // terminal soft wrapping so only logical source rows emit CRLFs.
     let mut wrapped: Vec<Line<'static>> = Vec::new();
     let mut wrapped_rows: u16 = 0;
-    for line in lines {
-        let line_w: usize = line.spans.iter().map(|s| s.content.width()).sum();
-        if line_w == 0 {
-            wrapped.push(if trusted_links {
-                super::render::line_utils::sanitize_line_for_terminal_with_links(line)
-            } else {
-                super::render::line_utils::line_to_static(line)
-            });
-            wrapped_rows += 1;
-        } else if super::wrapping::line_contains_url_like(line)
-            && !super::wrapping::line_has_mixed_url_and_non_url_tokens(line)
-        {
-            // Pure URL line — don't wrap, let terminal handle it (keeps URL clickable)
-            let physical = line_w.max(1).div_ceil(wrap_width) as u16;
-            wrapped_rows += physical;
-            wrapped.push(if trusted_links {
-                super::render::line_utils::sanitize_line_for_terminal_with_links(line)
-            } else {
-                super::render::line_utils::line_to_static(line)
-            });
+    for row in rows {
+        let line = if trusted_links {
+            super::render::line_utils::sanitize_line_for_terminal_with_links(&row.line)
         } else {
-            let line_wrapped = super::wrapping::adaptive_wrap_line(
-                line,
-                super::wrapping::RtOptions::new(wrap_width),
-            );
-            for wl in &line_wrapped {
-                wrapped_rows += wl.width().max(1).div_ceil(wrap_width) as u16;
-            }
-            wrapped.extend(line_wrapped.into_iter().map(|l| {
-                if trusted_links {
-                    crate::tui::render::line_utils::sanitize_line_for_terminal_with_links(&l)
-                } else {
-                    crate::tui::render::line_utils::line_to_static(&l)
-                }
-            }));
+            super::render::line_utils::line_to_static(&row.line)
+        };
+        let soft_wrap = row.verbatim
+            || (super::wrapping::line_contains_url_like(&line)
+                && !super::wrapping::line_has_mixed_url_and_non_url_tokens(&line));
+        if soft_wrap {
+            let physical = soft_wrapped_rows(&line, wrap_width);
+            wrapped_rows = wrapped_rows.saturating_add(u16::try_from(physical).unwrap_or(u16::MAX));
+            wrapped.push(line);
+            continue;
+        }
+        for line in
+            super::wrapping::adaptive_wrap_line(&line, super::wrapping::RtOptions::new(wrap_width))
+        {
+            let physical = soft_wrapped_rows(&line, wrap_width);
+            wrapped_rows = wrapped_rows.saturating_add(u16::try_from(physical).unwrap_or(u16::MAX));
+            wrapped.push(if trusted_links {
+                super::render::line_utils::sanitize_line_for_terminal_with_links(&line)
+            } else {
+                super::render::line_utils::line_to_static(&line)
+            });
         }
     }
 
@@ -178,6 +171,35 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
     }
 
     Ok(())
+}
+
+/// Count terminal rows without materializing physical fragments. Carry the
+/// column across styled spans and account for a wide glyph wrapping early.
+fn soft_wrapped_rows(line: &Line<'_>, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 1usize;
+    let mut column = 0usize;
+    for span in &line.spans {
+        let visible = crate::cli::terminal_hyperlinks::strip_link_markers(&span.content);
+        for grapheme in visible.graphemes(true) {
+            if grapheme == "\t" {
+                // Default terminal tab stops advance without wrapping and
+                // clamp to the last column. No application changes tab stops.
+                column = ((column / 8 + 1) * 8).min(width - 1);
+                continue;
+            }
+            let cells = grapheme.width().min(width);
+            if cells == 0 {
+                continue;
+            }
+            if column > 0 && column + cells > width {
+                rows = rows.saturating_add(1);
+                column = 0;
+            }
+            column += cells;
+        }
+    }
+    rows
 }
 
 fn write_history_line(

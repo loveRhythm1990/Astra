@@ -50,13 +50,21 @@ pub(crate) fn render_markdown_text_with_width_and_cwd(
     write_markdown(input, width, cwd).into_text()
 }
 
-/// One rendered Markdown row. `verbatim` marks rows that reproduce
-/// code-block source as written; callers that decorate rows must leave
-/// these untouched so terminal selection copies the source exactly.
+/// One rendered Markdown row. `verbatim` prevents presentation wrapping
+/// from inserting hard breaks into code. It grants no terminal-control trust.
 #[derive(Debug, Clone)]
 pub(crate) struct MarkdownRow {
     pub line: Line<'static>,
     pub verbatim: bool,
+}
+
+impl From<Line<'static>> for MarkdownRow {
+    fn from(line: Line<'static>) -> Self {
+        Self {
+            line,
+            verbatim: false,
+        }
+    }
 }
 
 pub(crate) fn render_markdown_rows_with_width(
