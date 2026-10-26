@@ -12,6 +12,70 @@ use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::prelude::*;
 
+/// The run drain does not own the detached observer. Its completion counter is
+/// published only after the production worker has finished all of its SQL.
+async fn drain_chat_work(state: &astra_runtime::AppState, expected_observers: u64) {
+    assert!(
+        state
+            .drain_background_runs(std::time::Duration::from_secs(5))
+            .await
+    );
+    let registry = state.metrics_registry();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let metrics = registry.render_prometheus();
+            let mut completed = 0;
+            for line in metrics.lines().filter(|line| {
+                line.starts_with("astra_turn_observer_runs_total{")
+                    || line.starts_with("astra_turn_observer_dispatches_total{")
+            }) {
+                let (series, value) = line.rsplit_once(' ').unwrap();
+                let value: u64 = value.parse().unwrap();
+                if value == 0 {
+                    continue;
+                }
+                assert!(
+                    !series.contains("outcome=\"error\"")
+                        && !series.contains("outcome=\"dropped_full\""),
+                    "observer must finish without errors or dropped work: {line}"
+                );
+                if series.starts_with("astra_turn_observer_runs_total{") {
+                    completed += value;
+                }
+            }
+            assert!(completed <= expected_observers, "unexpected extra observer");
+            if completed == expected_observers {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("each chat must finish its detached observer before ending SQL capture");
+}
+
+/// Measure request SQL on an initialized pool, not timing-dependent SQLx
+/// connection setup. Every statement after this boundary still counts.
+async fn prime_chat_pool(ctx: &MatrixE2eCtx) {
+    let pool = ctx.shared_pool.get();
+    // This serial probe needs only a small warm reserve, not the deployment's
+    // full connection limit. Additional connections opened during a request
+    // remain visible to the raw SQL budget.
+    let reserve = pool.options().get_max_connections().min(4);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut connections = Vec::new();
+        for _ in 0..reserve {
+            connections.push(pool.acquire().await.unwrap());
+        }
+        drop(connections);
+        while pool.num_idle() < reserve as usize {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("initialize and return the chat-pool reserve before SQL capture");
+}
+
 #[derive(Default)]
 struct Statement(String, f64);
 
@@ -422,7 +486,9 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                 "{body}"
             );
             assert!(body.contains("Warm context ready."), "{body}");
+            drain_chat_work(&b.ctx.app_state, 1).await;
         }
+        prime_chat_pool(&b.ctx).await;
         let message = if executes_agent {
             "List agent status."
         } else if readonly_rounds == 0 {
@@ -509,12 +575,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             !events.iter().any(|event| event["type"] == "error"),
             "{body}"
         );
-        assert!(
-            b.ctx
-                .app_state
-                .drain_background_runs(std::time::Duration::from_secs(5))
-                .await
-        );
+        drain_chat_work(&b.ctx.app_state, 1 + u64::from(warm_context)).await;
         let samples = capture.0.lock().unwrap().take().unwrap();
         let execution_ms = execution_started.elapsed().as_secs_f64() * 1000.0;
         // Explicit cold-replay verification follows the ordinary request's
