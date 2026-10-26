@@ -91,7 +91,9 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
             should_update_area = true;
         }
 
-        let cursor_top = area.top().saturating_sub(scroll_up + shift_down);
+        // Only emitted bottom newlines scroll existing content upward.
+        // Reserving unused space below the viewport does not move history.
+        let cursor_top = area.top().saturating_sub(scroll_up);
         queue!(writer, MoveTo(0, cursor_top))?;
 
         for (i, line) in wrapped.iter().enumerate() {

@@ -867,6 +867,52 @@ mod tests {
     }
 
     #[test]
+    fn appended_batches_preserve_existing_history_and_row_positions() {
+        for zellij in [false, true] {
+            let mut terminal = recording_terminal(40, 12);
+            let mut parser = vt100::Parser::new(40, 40, 0);
+            parser.process(b"\x1b[11;1Hexisting-code");
+            let mut pending = queued_assistant("```\nfirst-A\nfirst-B\nfirst-C\n```", 40);
+            super::TerminalGuard::flush_pending_history(&mut terminal, &mut pending, zellij)
+                .unwrap();
+            parser.process(&std::mem::take(&mut terminal.backend_mut().bytes));
+            assert_eq!(
+                parser.screen().rows(0, 40).nth(10).unwrap(),
+                "existing-code",
+                "earlier history overwritten zellij={zellij}"
+            );
+            assert_eq!(parser.screen().rows(0, 40).nth(13).unwrap(), "first-A");
+            assert_eq!(parser.screen().rows(0, 40).nth(15).unwrap(), "first-C");
+            assert_eq!(terminal.viewport_area.y, 16);
+
+            let second = format!("second-batch-{}", "x".repeat(40));
+            pending.extend(queued_assistant(&format!("```\n{second}\n```"), 40));
+            super::TerminalGuard::flush_pending_history(&mut terminal, &mut pending, zellij)
+                .unwrap();
+            parser.process(&std::mem::take(&mut terminal.backend_mut().bytes));
+            assert_eq!(
+                parser.screen().rows(0, 40).nth(10).unwrap(),
+                "existing-code"
+            );
+            assert_eq!(
+                parser.screen().rows(0, 40).nth(13).unwrap(),
+                "first-A",
+                "later batch overwrote previous reply zellij={zellij}"
+            );
+            assert!(
+                parser
+                    .screen()
+                    .rows(0, 40)
+                    .nth(17)
+                    .unwrap()
+                    .starts_with("second-batch-")
+            );
+            assert!(parser.screen().contents().contains(&second));
+            assert_eq!(terminal.viewport_area.y, 19);
+        }
+    }
+
+    #[test]
     fn code_softwrap_counts_wide_glyphs_at_current_width() {
         for width in [40_u16, 80, 120] {
             let code = format!(
