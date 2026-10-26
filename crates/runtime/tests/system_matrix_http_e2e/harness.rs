@@ -309,10 +309,12 @@ async fn mock_memoria_accepts_production_observer_without_blanket_success() {
     use astra_runtime::{DatabaseTurnObserverWorker, TurnObserverRequest, TurnObserverWorker};
 
     let base_url = start_mock_memoria().await;
-    let observer = DatabaseTurnObserverWorker::new(
-        base_url.clone(),
-        Some("system-e2e-mock-master-key".to_string()),
-    );
+    let observer = DatabaseTurnObserverWorker::new(Some(Arc::new(
+        astra_runtime::turn::cloud::memoria_compact::HttpMemoriaPort::self_hosted(
+            base_url.clone(),
+            "system-e2e-mock-master-key".to_string(),
+        ),
+    )));
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
         observer.run(TurnObserverRequest {

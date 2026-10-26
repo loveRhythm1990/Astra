@@ -34,8 +34,8 @@ use astra_services::{
     WorkspaceRecordStoreError, WorkspaceStateStore,
 };
 use astra_turn_core::contracts::{
-    TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
-    TurnSkillSelectionRecord,
+    TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverOutcome, TurnObserverRequest,
+    TurnObserverWorker, TurnSkillSelectionRecord,
 };
 use astra_turn_core::observer::filter_memory_operation_turns;
 use astra_turn_core::trace_event::TraceContext;
@@ -2374,15 +2374,19 @@ async fn run_server_loop_observer_request(
     mode: &'static str,
     metrics_registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
 ) {
-    if let Err(e) = observer_worker.run(request).await {
-        record_turn_observer_run_metrics(metrics_registry, mode, "error");
-        astra_core::agent_error!(
-            "server-loop",
-            "failed to run observer for session {session_id}: {e}"
-        );
-    } else {
-        record_turn_observer_run_metrics(metrics_registry, mode, "success");
-    }
+    let outcome = match observer_worker.run(request).await {
+        Ok(TurnObserverOutcome::Observed) => "success",
+        Ok(TurnObserverOutcome::AccessDisabled) => "access_disabled",
+        Ok(TurnObserverOutcome::Empty) => "empty",
+        Err(e) => {
+            astra_core::agent_error!(
+                "server-loop",
+                "failed to run observer for session {session_id}: {e}"
+            );
+            "error"
+        }
+    };
+    record_turn_observer_run_metrics(metrics_registry, mode, outcome);
 }
 
 /// Truncate text for audit records, preserving UTF-8 boundaries.
@@ -3496,14 +3500,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TurnObserverWorker for CaptureObserverWorker {
-        async fn run(&self, request: TurnObserverRequest) -> Result<(), String> {
+        async fn run(&self, request: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.requests.lock().expect("capture lock").push(request);
             self.started.notify_waiters();
             if self.block_until_released {
                 self.release.notified().await;
             }
-            Ok(())
+            Ok(TurnObserverOutcome::Observed)
         }
     }
 
@@ -3663,6 +3667,22 @@ mod tests {
                 && !rendered.contains("run_id="),
             "observer metrics must stay low-cardinality: {rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn server_loop_observer_disabled_is_not_reported_as_success() {
+        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+        let worker = crate::DatabaseTurnObserverWorker::new(None);
+        let request =
+            build_server_loop_observer_request("user-1", "session-1", &observer_test_state())
+                .unwrap();
+        run_server_loop_observer_request(&worker, "session-1", request, "async", Some(&registry))
+            .await;
+        let rendered = registry.render_prometheus();
+        assert!(rendered.contains(
+            "astra_turn_observer_runs_total{mode=\"async\",outcome=\"access_disabled\"} 1"
+        ));
+        assert!(!rendered.contains("outcome=\"success\""));
     }
 
     #[test]

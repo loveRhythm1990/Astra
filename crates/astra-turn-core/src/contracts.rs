@@ -34,9 +34,17 @@ pub trait TurnHookDbWriter: Send + Sync {
     async fn persist(&self, plan: TurnHookDbPersistPlan) -> Result<(), String>;
 }
 
+/// Only `Observed` confirms that the memory backend accepted an observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnObserverOutcome {
+    Observed,
+    AccessDisabled,
+    Empty,
+}
+
 #[async_trait]
 pub trait TurnObserverWorker: Send + Sync {
-    async fn run(&self, request: TurnObserverRequest) -> Result<(), String>;
+    async fn run(&self, request: TurnObserverRequest) -> Result<TurnObserverOutcome, String>;
 }
 
 #[async_trait]

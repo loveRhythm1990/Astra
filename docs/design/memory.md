@@ -76,6 +76,19 @@ Consent denials in explicit tools and HTTP routes point to Memoria Settings → 
 
 Trusted self-hosted deployments may explicitly enable `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1` with `MEMORIA_MASTER_KEY` and no `MEMORIA_WEB_URL`. A persisted scoped binding always wins, preserving its owner namespace and consent. Only an active local password account with no scoped binding and no retained Memoria identity may select the owner-bound master port. Disconnect, account deactivation/deletion and lookup errors fail closed, including for runtime ports created before the lifecycle change. These data requests authenticate with Memoria's owner-scoped master scheme, which validates the deployment secret but removes administrator authority before routing to memory handlers. Every request projects the authenticated Astra user as the Memoria owner; an unbound or incompatible backend fails closed. Memoria must contain the `Memoria-Owner` support introduced by `matrixorigin/Memoria#250` (not present in v0.5.1).
 
+Turn observation uses the same composition-owned `MemoriaPort` template as
+prompt recall and session memory. Each queued observation binds the authenticated
+Astra owner, checks write admission, and resolves fresh write transport before
+sending `/v1/observe`. The transport supplies the Memoria owner and authentication
+scheme; the worker must not derive them from the request user ID or fall back to
+a deployment master key. Denied/read-only access skips observation; authority
+lookup failures and grants revoked after admission fail closed. Observer run
+metrics distinguish `success` (backend accepted the request), `access_disabled`,
+`empty`, and `error`; success alone does not prove recall or prompt injection.
+Provider request authentication does not itself grant memory access. A provider
+without a canonical memory binding remains disabled until an explicit identity
+and memory-authority integration is established.
+
 The background coordinator may launch a lightweight admission task, but it checks consent before loading snapshots, resolving an LLM, generating memory, or scheduling persistence. See [authentication](authentication.md) for issuer, credential replacement and retention.
 
 MOI native UC uses the same resolver and consumers with an explicitly enabled

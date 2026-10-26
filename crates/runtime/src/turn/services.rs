@@ -11,10 +11,9 @@ use sqlx::Acquire;
 #[derive(Clone, Debug)]
 pub(crate) struct NoopTurnObserverWorker;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DatabaseTurnObserverWorker {
-    pub(crate) base_url: String,
-    pub(crate) master_key: Option<String>,
+    memoria_port: Option<Arc<dyn astra_memoria::MemoriaPort>>,
 }
 
 #[derive(Clone, Debug)]
@@ -171,11 +170,8 @@ async fn apply_touched_session_deltas_in_tx(
 }
 
 impl DatabaseTurnObserverWorker {
-    pub fn new(base_url: String, master_key: Option<String>) -> Self {
-        Self {
-            base_url,
-            master_key,
-        }
+    pub fn new(memoria_port: Option<Arc<dyn astra_memoria::MemoriaPort>>) -> Self {
+        Self { memoria_port }
     }
 }
 
@@ -380,24 +376,29 @@ impl TurnHookDbWriter for DatabaseTurnHookDbWriter {
 
 #[async_trait]
 impl TurnObserverWorker for NoopTurnObserverWorker {
-    async fn run(&self, _request: TurnObserverRequest) -> Result<(), String> {
-        Ok(())
+    async fn run(&self, _request: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {
+        Ok(TurnObserverOutcome::AccessDisabled)
     }
 }
 
 #[async_trait]
 impl TurnObserverWorker for DatabaseTurnObserverWorker {
-    async fn run(&self, request: TurnObserverRequest) -> Result<(), String> {
-        let Some(master_key) = self.master_key.as_ref() else {
-            return Ok(());
-        };
+    async fn run(&self, request: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {
         if request.messages.is_empty() {
-            return Ok(());
+            return Ok(TurnObserverOutcome::Empty);
+        }
+        let Some(template) = self.memoria_port.as_ref() else {
+            return Ok(TurnObserverOutcome::AccessDisabled);
+        };
+        let port = template.bind_owner(&request.user_id)?;
+        if !port.admits_operation(true).await? {
+            return Ok(TurnObserverOutcome::AccessDisabled);
         }
         let client = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| error.to_string())?;
         // Serialize exactly once, then retain and send that same byte buffer.
@@ -405,21 +406,33 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
         // weight behind a second serializer-owned allocation.
         let payload = encode_memory_extraction_observe_payload(&request)?;
         let queue_reservation = reserve_memory_extraction_payload(&payload);
+        // Resolve fresh write authority after preparation, just as memory tools
+        // do. A denied/revoked grant never falls back to deployment credentials.
+        let transport = port
+            .resolve_tool_transport(true)
+            .await?
+            .ok_or("Memoria observer requires an authorized HTTP transport")?;
         let response = client
             .post(format!(
                 "{}/v1/observe",
-                self.base_url.trim_end_matches('/')
+                transport.base_url.trim_end_matches('/')
             ))
-            .header("Authorization", format!("Bearer {master_key}"))
-            .header("X-Impersonate-User", request.user_id)
+            .header("Authorization", transport.authorization_header())
+            .header("X-Impersonate-User", transport.owner_user_id)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(payload)
             .send()
             .await;
         drop(queue_reservation);
-        let response = response.map_err(|error| error.to_string())?;
+        let response = response.map_err(|error| {
+            if error.is_timeout() {
+                "memoria observer request timed out".to_string()
+            } else {
+                "memoria observer request failed".to_string()
+            }
+        })?;
         if response.status().is_success() {
-            Ok(())
+            Ok(TurnObserverOutcome::Observed)
         } else {
             Err(format!(
                 "memoria observer run failed: status={}",

@@ -224,7 +224,7 @@ pub use orchestration::AgentHistoryRecord;
 
 pub use astra_turn_core::contracts::{
     TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnHookDbPersistPlan, TurnHookDbWriter,
-    TurnObserverRequest, TurnObserverWorker, TurnSkillSelectionRecord,
+    TurnObserverOutcome, TurnObserverRequest, TurnObserverWorker, TurnSkillSelectionRecord,
 };
 
 pub use turn::services::{
