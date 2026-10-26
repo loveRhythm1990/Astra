@@ -12,8 +12,9 @@
 //! `docs/design/tui-refactor.md` §3.3.
 //!
 //! Settled reply bodies start with a `● ` marker and indent continuation
-//! rows with plain spaces, so text selected from native scrollback copies
-//! as written. Live cells still use the active-slot wrapper for structure.
+//! prose rows with plain spaces; code-block rows stay verbatim at column 0,
+//! so a block selected from native scrollback copies exactly as written.
+//! Live cells still use the active-slot wrapper for structure.
 //! An active response is kept visually distinct by the surrounding status line;
 //! its content itself stays free of transient transport counters.
 //!
@@ -44,7 +45,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::HistoryCell;
-use crate::tui::markdown_render::render_markdown_text_with_width;
+use crate::tui::markdown_render::{
+    MarkdownRow, render_markdown_rows_with_width, render_markdown_text_with_width,
+};
 use crate::tui::render::line_utils::line_to_static;
 use crate::tui::turn_event::TurnEvent;
 
@@ -61,7 +64,7 @@ struct MarkdownLayoutCache {
     /// without retaining a second full copy merely for cache matching.
     source_ptr: usize,
     source_len: usize,
-    lines: Vec<Line<'static>>,
+    rows: Vec<MarkdownRow>,
 }
 
 /// Bounded live Markdown projection. It intentionally lags a burst by a
@@ -268,17 +271,13 @@ impl AssistantCell {
             return;
         }
 
-        let lines = render_markdown_text_with_width(source, Some(width))
-            .lines
-            .iter()
-            .map(line_to_static)
-            .collect::<Vec<_>>();
+        let rows = render_markdown_rows_with_width(source, Some(width));
         *cache = Some(MarkdownLayoutCache {
             revision: self.render_revision,
             width,
             source_ptr: source.as_ptr() as usize,
             source_len: source.len(),
-            lines,
+            rows,
         });
     }
 
@@ -288,7 +287,7 @@ impl AssistantCell {
         width: usize,
         start: usize,
         maximum: usize,
-    ) -> (Vec<Line<'static>>, usize) {
+    ) -> (Vec<MarkdownRow>, usize) {
         self.ensure_markdown_layout(source, width);
         let cache = astra_core::sync_poison::recover_mutex_lock(&self.render_cache);
         let cache = cache
@@ -300,13 +299,13 @@ impl AssistantCell {
             width,
             self.render_revision
         ));
-        let total = cache.lines.len();
+        let total = cache.rows.len();
         let start = start.min(total);
         let end = start.saturating_add(maximum).min(total);
-        (cache.lines[start..end].to_vec(), total)
+        (cache.rows[start..end].to_vec(), total)
     }
 
-    fn markdown_layout(&self, source: &str, width: usize) -> Vec<Line<'static>> {
+    fn markdown_layout(&self, source: &str, width: usize) -> Vec<MarkdownRow> {
         self.markdown_layout_window(source, width, 0, usize::MAX).0
     }
 
@@ -325,12 +324,7 @@ impl AssistantCell {
         let lines = rendered
             .into_iter()
             .enumerate()
-            .map(|(offset, line)| {
-                let mut spans = Vec::with_capacity(line.spans.len() + 1);
-                spans.push(settled_body_prefix(start.saturating_add(offset)));
-                spans.extend(line.spans);
-                Line::from(spans)
-            })
+            .map(|(offset, row)| prefix_settled_row(start.saturating_add(offset), row))
             .collect();
         (lines, total)
     }
@@ -575,34 +569,42 @@ impl AssistantCell {
         rendered
             .into_iter()
             .enumerate()
-            .map(|(index, line)| {
-                let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 1);
+            .map(|(index, row)| {
                 if prepend_gutter {
-                    spans.push(settled_body_prefix(index));
+                    prefix_settled_row(index, row)
+                } else {
+                    row.line
                 }
-                spans.extend(line.spans.iter().cloned());
-                Line::from(spans)
             })
             .collect()
     }
 }
 
-/// Two-column prefix for a settled response body line in native scrollback.
+/// Prefix a settled response body row for native scrollback.
 ///
-/// Terminal selection copies every written cell, so a full-height glyph
-/// gutter leaks into commands users copy from a reply. Only the first body
-/// line carries the `● ` terminal marker, in the same success colour as tool
-/// markers; continuation lines use plain spaces that shells ignore. Live
-/// responses keep the distinct focus gutter supplied by `LiveFramedCell`.
-fn settled_body_prefix(body_line: usize) -> Span<'static> {
-    if body_line == 0 {
+/// Terminal selection copies every written cell, so any prefix leaks into
+/// text users copy from a reply. Code-block rows are therefore written
+/// verbatim at column 0: a copied block (a heredoc, indentation-sensitive
+/// code) matches its source exactly. Other rows get a 2-col prefix: the first
+/// body row carries the `● ` terminal marker, in the same success colour as
+/// tool markers, and the rest are indented with plain spaces. Live responses
+/// keep the distinct focus gutter supplied by `LiveFramedCell`.
+fn prefix_settled_row(body_row: usize, row: MarkdownRow) -> Line<'static> {
+    if row.verbatim {
+        return row.line;
+    }
+    let prefix = if body_row == 0 {
         Span::styled(
             "● ",
             Style::default().fg(crate::tui::theme::current().success),
         )
     } else {
         Span::raw("  ")
-    }
+    };
+    let mut spans = Vec::with_capacity(row.line.spans.len() + 1);
+    spans.push(prefix);
+    spans.extend(row.line.spans);
+    Line::from(spans)
 }
 
 impl HistoryCell for AssistantCell {
@@ -1111,26 +1113,26 @@ mod tests {
     }
 
     #[test]
-    fn settled_assistant_command_lines_copy_without_gutter_glyphs() {
-        let c = AssistantCell::from_markdown(
-            "Run these:\n\n```sh\ngit status\ncargo test -p astra\n```\n\nThen `make lint`.",
-        );
-        let (scrollback, _, complete) = c.scrollback_lines_chunk(80, 0, usize::MAX);
-        assert!(complete);
-        for lines in [c.display_lines(80), scrollback] {
-            let text = line_text(&lines);
-            assert_eq!(text.matches('●').count(), 1, "{text}");
-            assert!(!text.contains('█'), "{text}");
-            for command in ["git status", "cargo test -p astra"] {
-                let line = text
-                    .lines()
-                    .find(|line| line.contains(command))
-                    .expect("command line rendered");
-                assert_eq!(
-                    line.trim(),
-                    command,
-                    "selection copies only whitespace: {line:?}"
+    fn settled_code_blocks_copy_verbatim_from_scrollback() {
+        // A heredoc terminator and indentation only survive a copy when the
+        // selected rows match the source exactly, so compare the whole block
+        // rather than trimmed rows.
+        let block = "cat <<'EOF'\n  indented\nEOF\ngit status";
+        for source in [
+            format!("Run these:\n\n```\n{block}\n```\n\nThen `make lint`."),
+            format!("```\n{block}\n```"),
+        ] {
+            let c = AssistantCell::from_markdown(source.clone());
+            let (scrollback, _, complete) = c.scrollback_lines_chunk(80, 0, usize::MAX);
+            assert!(complete);
+            for lines in [c.display_lines(80), scrollback] {
+                let text = line_text(&lines);
+                assert!(
+                    text.contains(&format!("\n{block}\n")) || text.ends_with(&format!("\n{block}")),
+                    "{source:?} rendered {text:?}"
                 );
+                assert_eq!(text.matches('●').count(), 1, "{text}");
+                assert!(!text.contains('█'), "{text}");
             }
         }
     }
