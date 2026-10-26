@@ -11,12 +11,10 @@
 //! thinking window). One source of truth, one render path. See
 //! `docs/design/tui-refactor.md` §3.3.
 //!
-//! Reply body keeps a stable left accent gutter once settled in
-//! scrollback, so long numbered answers still scan like one unified
-//! assistant block. Live cells still use the active-slot wrapper for
-//! structure, but committed replies retain the visual anchor the old
-//! TUI had. A
-//! active response is kept visually distinct by the surrounding status line;
+//! Settled reply bodies start with a `● ` marker and indent continuation
+//! rows with plain spaces, so text selected from native scrollback copies
+//! as written. Live cells still use the active-slot wrapper for structure.
+//! An active response is kept visually distinct by the surrounding status line;
 //! its content itself stays free of transient transport counters.
 //!
 //! ## Inline thinking handling
@@ -324,16 +322,12 @@ impl AssistantCell {
         }
         let inner_width = (width as usize).saturating_sub(2).max(20);
         let (rendered, total) = self.markdown_layout_window(source, inner_width, start, maximum);
-        let theme = crate::tui::theme::current();
-        // A settled assistant response is a completed unit, so its guide uses
-        // the exact success colour of terminal `●` markers. Live responses
-        // use the distinct focus gutter supplied by `LiveFramedCell`.
-        let gutter_style = Style::default().fg(theme.success);
         let lines = rendered
             .into_iter()
-            .map(|line| {
+            .enumerate()
+            .map(|(offset, line)| {
                 let mut spans = Vec::with_capacity(line.spans.len() + 1);
-                spans.push(Span::styled("█ ", gutter_style));
+                spans.push(settled_body_prefix(start.saturating_add(offset)));
                 spans.extend(line.spans);
                 Line::from(spans)
             })
@@ -560,7 +554,7 @@ impl AssistantCell {
         if source.trim().is_empty() {
             return Vec::new();
         }
-        // Settled cells prepend `█ ` (2 cols) to every line, so wrap text
+        // Settled cells prepend a 2-col prefix to every line, so wrap text
         // at `width - 2` to avoid terminal hard-wrap overflow. Live cells
         // already receive `width - 2` from `active_viewport` (the
         // `LiveFramedCell` wrapper paints its own gutter column). This means
@@ -578,19 +572,36 @@ impl AssistantCell {
             return Vec::new();
         }
 
-        let theme = crate::tui::theme::current();
-        let gutter_style = Style::default().fg(theme.success);
         rendered
             .into_iter()
-            .map(|line| {
+            .enumerate()
+            .map(|(index, line)| {
                 let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 1);
                 if prepend_gutter {
-                    spans.push(Span::styled("█ ", gutter_style));
+                    spans.push(settled_body_prefix(index));
                 }
                 spans.extend(line.spans.iter().cloned());
                 Line::from(spans)
             })
             .collect()
+    }
+}
+
+/// Two-column prefix for a settled response body line in native scrollback.
+///
+/// Terminal selection copies every written cell, so a full-height glyph
+/// gutter leaks into commands users copy from a reply. Only the first body
+/// line carries the `● ` terminal marker, in the same success colour as tool
+/// markers; continuation lines use plain spaces that shells ignore. Live
+/// responses keep the distinct focus gutter supplied by `LiveFramedCell`.
+fn settled_body_prefix(body_line: usize) -> Span<'static> {
+    if body_line == 0 {
+        Span::styled(
+            "● ",
+            Style::default().fg(crate::tui::theme::current().success),
+        )
+    } else {
+        Span::raw("  ")
     }
 }
 
@@ -1088,15 +1099,40 @@ mod tests {
     }
 
     #[test]
-    fn settled_assistant_guide_matches_terminal_success_marker() {
+    fn settled_assistant_marker_matches_terminal_success_marker() {
         let c = AssistantCell::from_markdown("done");
         let lines = c.display_lines(40);
-        let guide = lines
+        let marker = lines
             .first()
             .and_then(|line| line.spans.first())
-            .expect("settled assistant has a guide");
-        assert_eq!(guide.content.as_ref(), "█ ");
-        assert_eq!(guide.style.fg, Some(crate::tui::theme::current().success));
+            .expect("settled assistant has a marker");
+        assert_eq!(marker.content.as_ref(), "● ");
+        assert_eq!(marker.style.fg, Some(crate::tui::theme::current().success));
+    }
+
+    #[test]
+    fn settled_assistant_command_lines_copy_without_gutter_glyphs() {
+        let c = AssistantCell::from_markdown(
+            "Run these:\n\n```sh\ngit status\ncargo test -p astra\n```\n\nThen `make lint`.",
+        );
+        let (scrollback, _, complete) = c.scrollback_lines_chunk(80, 0, usize::MAX);
+        assert!(complete);
+        for lines in [c.display_lines(80), scrollback] {
+            let text = line_text(&lines);
+            assert_eq!(text.matches('●').count(), 1, "{text}");
+            assert!(!text.contains('█'), "{text}");
+            for command in ["git status", "cargo test -p astra"] {
+                let line = text
+                    .lines()
+                    .find(|line| line.contains(command))
+                    .expect("command line rendered");
+                assert_eq!(
+                    line.trim(),
+                    command,
+                    "selection copies only whitespace: {line:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1145,8 +1181,13 @@ mod tests {
         assert_eq!(second.len(), 3);
         assert_eq!(next, 6);
         assert!(!complete);
-        assert!(first[0].spans[0].content.starts_with("█ "));
-        assert!(second[0].spans[0].content.starts_with("█ "));
+        assert_eq!(first[0].spans[0].content.as_ref(), "● ");
+        assert_eq!(first[1].spans[0].content.as_ref(), "  ");
+        assert_eq!(
+            second[0].spans[0].content.as_ref(),
+            "  ",
+            "a later chunk continues the body instead of restarting the marker"
+        );
     }
 
     #[test]

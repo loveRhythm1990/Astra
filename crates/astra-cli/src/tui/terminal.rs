@@ -827,7 +827,8 @@ mod tests {
         let (first, _) = take_pending_history_batch(&mut pending);
         assert_eq!(first.len(), MAX_HISTORY_LINES_PER_DRAW);
         assert!(!pending.is_empty(), "long reply tail remains queued");
-        assert!(first.iter().all(|line| line.spans[0].content == "█ "));
+        assert_eq!(first[0].spans[0].content, "● ");
+        assert!(first[1..].iter().all(|line| line.spans[0].content == "  "));
 
         let mut emitted = first;
         while !pending.is_empty() {
