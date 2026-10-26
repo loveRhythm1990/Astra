@@ -14,12 +14,7 @@ use tracing_subscriber::prelude::*;
 
 /// The run drain does not own the detached observer. Its completion counter is
 /// published only after the production worker has finished all of its SQL.
-async fn drain_chat_work(state: &astra_runtime::AppState, expected_observers: u64) {
-    assert!(
-        state
-            .drain_background_runs(std::time::Duration::from_secs(5))
-            .await
-    );
+async fn wait_for_chat_observers(state: &astra_runtime::AppState, expected_observers: u64) {
     let registry = state.metrics_registry();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -486,7 +481,9 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                 "{body}"
             );
             assert!(body.contains("Warm context ready."), "{body}");
-            drain_chat_work(&b.ctx.app_state, 1).await;
+            // Shutdown drain would reject the measured turn. The complete SSE
+            // response settles the warm-up turn; separately await its observer.
+            wait_for_chat_observers(&b.ctx.app_state, 1).await;
         }
         prime_chat_pool(&b.ctx).await;
         let message = if executes_agent {
@@ -575,7 +572,13 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             !events.iter().any(|event| event["type"] == "error"),
             "{body}"
         );
-        drain_chat_work(&b.ctx.app_state, 1 + u64::from(warm_context)).await;
+        assert!(
+            b.ctx
+                .app_state
+                .drain_background_runs(std::time::Duration::from_secs(5))
+                .await
+        );
+        wait_for_chat_observers(&b.ctx.app_state, 1 + u64::from(warm_context)).await;
         let samples = capture.0.lock().unwrap().take().unwrap();
         let execution_ms = execution_started.elapsed().as_secs_f64() * 1000.0;
         // Explicit cold-replay verification follows the ordinary request's

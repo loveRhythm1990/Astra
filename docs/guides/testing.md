@@ -508,8 +508,10 @@ cargo test -p astra-runtime --features e2e-hooks --test chat_sql_budget \
 The 20-statement limit measures each request on an initialized server pool,
 including transactions, periodic control reads and the real observer's SQL.
 Pool initialization happens before capture; no statements are filtered out
-inside the measured interval. Warm-context setup drains its run and waits for
-observer completion before the next request starts. Capture ends only after
+inside the measured interval. Warm-context setup consumes its complete SSE
+response and waits for observer completion before the next request starts;
+it must not use shutdown drain, which closes admission for that next request.
+Capture ends only after
 both the measured run and its observer finish: the detached observer is not
 owned by `drain_background_runs`. Observer errors, dropped work or a missing
 completion fail the probe instead of silently undercounting SQL.
