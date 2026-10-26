@@ -38,6 +38,7 @@ pub trait TurnHookDbWriter: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TurnObserverOutcome {
     Observed,
+    NotConfigured,
     AccessDisabled,
     Empty,
 }

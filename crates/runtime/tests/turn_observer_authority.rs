@@ -1,3 +1,6 @@
+#[path = "support/memoria_observer_auth.rs"]
+mod memoria_observer_auth;
+
 use astra_memoria::{MemoriaMemory, MemoriaOperationError, MemoriaPort, MemoriaToolTransport};
 use astra_runtime::{
     DatabaseTurnObserverWorker, TurnObserverOutcome, TurnObserverRequest, TurnObserverWorker,
@@ -54,7 +57,12 @@ impl MemoriaPort for AuthorityPort {
         }
         Ok(Some(MemoriaToolTransport {
             base_url: self.base_url.clone(),
-            credential: "synthetic-credential".into(),
+            credential: if self.master {
+                "synthetic-master-key"
+            } else {
+                "synthetic-scoped-key"
+            }
+            .into(),
             owner_user_id: format!("memory-{}", self.bound_owner.as_ref().unwrap()),
             owner_scoped_master: self.master,
         }))
@@ -93,8 +101,13 @@ async fn backend(status: StatusCode) -> (String, Requests, tokio::task::JoinHand
                 move |State(requests): State<Requests>,
                       headers: HeaderMap,
                       Json(body): Json<Value>| async move {
+                    let authorized = memoria_observer_auth::validate_observer_auth(
+                        &headers,
+                        "synthetic-master-key",
+                        Some("synthetic-scoped-key"),
+                    );
                     requests.lock().unwrap().push((headers, body));
-                    status
+                    authorized.err().unwrap_or(status)
                 },
             ),
         )
@@ -153,9 +166,18 @@ async fn observer_uses_fresh_write_authority_and_memoria_owner_for_each_user() {
             let scheme = if master { "Memoria-Owner" } else { "Bearer" };
             assert_eq!(
                 headers["authorization"],
-                format!("{scheme} synthetic-credential")
+                format!(
+                    "{scheme} {}",
+                    if master {
+                        "synthetic-master-key"
+                    } else {
+                        "synthetic-scoped-key"
+                    }
+                )
             );
-            assert_eq!(headers["x-impersonate-user"], format!("memory-{user}"));
+            assert_eq!(headers["x-user-id"], format!("memory-{user}"));
+            assert_eq!(headers.get_all("x-user-id").iter().count(), 1);
+            assert!(!headers.contains_key("x-impersonate-user"));
             assert_eq!(
                 body,
                 &json!({"messages": request(user).messages, "session_id": format!("session-{user}")})
@@ -225,7 +247,7 @@ async fn observer_missing_port_and_empty_input_are_not_success() {
     let worker = DatabaseTurnObserverWorker::new(None);
     assert_eq!(
         worker.run(request("astra-a")).await.unwrap(),
-        TurnObserverOutcome::AccessDisabled
+        TurnObserverOutcome::NotConfigured
     );
     let mut empty = request("astra-a");
     empty.messages.clear();
@@ -273,4 +295,42 @@ async fn observer_does_not_follow_redirects_with_owner_authority() {
     assert!(received.lock().unwrap().is_empty());
     source_task.abort();
     destination_task.abort();
+}
+
+#[tokio::test]
+async fn owner_auth_rejects_legacy_missing_duplicate_and_invalid_owner_headers() {
+    let (url, _, server) = backend(StatusCode::NO_CONTENT).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let url = format!("{url}/v1/observe");
+    let oversized_owner = "a".repeat(65);
+    for owners in [
+        vec![],
+        vec!["owner-a", "owner-b"],
+        vec![""],
+        vec!["grp_owner"],
+        vec![oversized_owner.as_str()],
+    ] {
+        let mut call = client
+            .post(&url)
+            .header("Authorization", "Memoria-Owner synthetic-master-key")
+            .header("X-Impersonate-User", "legacy-owner")
+            .json(&json!({"messages": [], "session_id": "synthetic-session"}));
+        for owner in owners {
+            call = call.header("X-User-Id", owner);
+        }
+        assert_eq!(call.send().await.unwrap().status(), StatusCode::BAD_REQUEST);
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn observer_connection_error_is_classified_without_url_or_credential() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let worker = DatabaseTurnObserverWorker::new(Some(Arc::new(port(endpoint))));
+    assert_eq!(
+        worker.run(request("astra-a")).await.unwrap_err(),
+        "memoria observer connection failed"
+    );
 }

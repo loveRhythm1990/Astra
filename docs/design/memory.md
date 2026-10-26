@@ -80,11 +80,22 @@ Turn observation uses the same composition-owned `MemoriaPort` template as
 prompt recall and session memory. Each queued observation binds the authenticated
 Astra owner, checks write admission, and resolves fresh write transport before
 sending `/v1/observe`. The transport supplies the Memoria owner and authentication
-scheme; the worker must not derive them from the request user ID or fall back to
-a deployment master key. Denied/read-only access skips observation; authority
+scheme, with exactly one `X-User-Id` header; the worker must not derive them from
+the request user ID or fall back to a deployment master key. Denied/read-only access skips observation; authority
 lookup failures and grants revoked after admission fail closed. Observer run
-metrics distinguish `success` (backend accepted the request), `access_disabled`,
-`empty`, and `error`; success alone does not prove recall or prompt injection.
+metrics distinguish `success` (backend accepted the request), `not_configured`
+(no authority template), `access_disabled` (write admission denied), `empty`, and
+`error`; success alone does not prove recall or prompt injection. Existing
+success-rate dashboards must exclude skipped outcomes from attempted-request
+denominators: use `success / (success + error)` and display skipped outcomes
+separately. The bundled dashboard already displays each outcome as a separate
+rate series and has no success-ratio alert.
+
+Setting a deployment master key alone no longer enables the observer. Self-hosted
+local-account fallback additionally requires `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`
+and the existing eligible-account checks. If `memoria_credentials()` supplies no
+authority template, observation reports `not_configured`; it does not use the
+master key directly.
 Provider request authentication does not itself grant memory access. A provider
 without a canonical memory binding remains disabled until an explicit identity
 and memory-authority integration is established.

@@ -7,6 +7,9 @@
 //! `tests/system_matrix_http_e2e.rs` setup; journey logic lives in `journey_*.rs`. See
 //! `docs/testing/system-e2e-matrix.md` for the capability ↔ route ↔ test mapping.
 
+#[path = "../support/memoria_observer_auth.rs"]
+mod memoria_observer_auth;
+
 use std::sync::Arc;
 
 use astra_core::SharedPool;
@@ -253,7 +256,18 @@ impl MemoriaForwarder for E2eMemoriaStub {
 
 async fn start_mock_memoria() -> String {
     let app = Router::new()
-        .route("/v1/observe", post(|| async { StatusCode::NO_CONTENT }))
+        .route(
+            "/v1/observe",
+            post(|headers: axum::http::HeaderMap| async move {
+                memoria_observer_auth::validate_observer_auth(
+                    &headers,
+                    "system-e2e-mock-master-key",
+                    None,
+                )
+                .err()
+                .unwrap_or(StatusCode::NO_CONTENT)
+            }),
+        )
         .route(
             "/v1/health/storage",
             get(|| async move {
@@ -333,6 +347,18 @@ async fn mock_memoria_accepts_production_observer_without_blanket_success() {
     .await
     .expect("local observer deadline")
     .expect("production observer reaches fixture");
+
+    let rejected = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("{base_url}/v1/observe"))
+        .header("Authorization", "Memoria-Owner system-e2e-mock-master-key")
+        .header("X-Impersonate-User", "fixture-user")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 
     let response = reqwest::Client::builder()
         .no_proxy()

@@ -2376,6 +2376,7 @@ async fn run_server_loop_observer_request(
 ) {
     let outcome = match observer_worker.run(request).await {
         Ok(TurnObserverOutcome::Observed) => "success",
+        Ok(TurnObserverOutcome::NotConfigured) => "not_configured",
         Ok(TurnObserverOutcome::AccessDisabled) => "access_disabled",
         Ok(TurnObserverOutcome::Empty) => "empty",
         Err(e) => {
@@ -3670,7 +3671,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_loop_observer_disabled_is_not_reported_as_success() {
+    async fn server_loop_observer_unconfigured_is_not_reported_as_success_or_denial() {
         let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
         let worker = crate::DatabaseTurnObserverWorker::new(None);
         let request =
@@ -3680,9 +3681,10 @@ mod tests {
             .await;
         let rendered = registry.render_prometheus();
         assert!(rendered.contains(
-            "astra_turn_observer_runs_total{mode=\"async\",outcome=\"access_disabled\"} 1"
+            "astra_turn_observer_runs_total{mode=\"async\",outcome=\"not_configured\"} 1"
         ));
         assert!(!rendered.contains("outcome=\"success\""));
+        assert!(!rendered.contains("outcome=\"access_disabled\""));
     }
 
     #[test]

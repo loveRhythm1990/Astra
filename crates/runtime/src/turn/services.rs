@@ -377,7 +377,7 @@ impl TurnHookDbWriter for DatabaseTurnHookDbWriter {
 #[async_trait]
 impl TurnObserverWorker for NoopTurnObserverWorker {
     async fn run(&self, _request: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {
-        Ok(TurnObserverOutcome::AccessDisabled)
+        Ok(TurnObserverOutcome::NotConfigured)
     }
 }
 
@@ -388,7 +388,7 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
             return Ok(TurnObserverOutcome::Empty);
         }
         let Some(template) = self.memoria_port.as_ref() else {
-            return Ok(TurnObserverOutcome::AccessDisabled);
+            return Ok(TurnObserverOutcome::NotConfigured);
         };
         let port = template.bind_owner(&request.user_id)?;
         if !port.admits_operation(true).await? {
@@ -418,7 +418,7 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
                 transport.base_url.trim_end_matches('/')
             ))
             .header("Authorization", transport.authorization_header())
-            .header("X-Impersonate-User", transport.owner_user_id)
+            .header("X-User-Id", &transport.owner_user_id)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(payload)
             .send()
@@ -427,6 +427,8 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
         let response = response.map_err(|error| {
             if error.is_timeout() {
                 "memoria observer request timed out".to_string()
+            } else if error.is_connect() {
+                "memoria observer connection failed".to_string()
             } else {
                 "memoria observer request failed".to_string()
             }
@@ -600,6 +602,21 @@ mod tests {
     use serde_json::json;
     use sqlx::Row;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn noop_observer_reports_not_configured() {
+        let outcome = NoopTurnObserverWorker
+            .run(TurnObserverRequest {
+                user_id: "test-owner".into(),
+                session_id: "test-session".into(),
+                messages: vec![],
+                turn_count: 0,
+                session_start: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, TurnObserverOutcome::NotConfigured);
+    }
 
     #[test]
     fn metadata_tool_name_none() {

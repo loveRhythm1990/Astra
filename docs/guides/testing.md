@@ -722,6 +722,31 @@ lease takeover. Runtime tests exercise authenticated exit/close/status HTTP
 routes and partial-stage retry after lost receipts. CLI tests cover distinct
 Astra/Memoria owners and unsuccessful queue acknowledgments without purge.
 
+## Real Memoria observer authentication smoke
+
+`memoria_observer_live` checks the production observer worker against a real
+Memoria with owner-scoped authentication support (#250 or later) and its database.
+Use only a dedicated local test service. Supply `ASTRA_TEST_MEMORIA_OBSERVER_URL`
+(a loopback HTTP origin) and `ASTRA_TEST_MEMORIA_OBSERVER_KEY` privately through
+the test process environment; do not put credentials in command arguments or
+commit them. The test creates unique synthetic owners and retains their test
+memories. It rejects remote origins and redirects.
+
+```bash
+ASTRA_TEST_MEMORIA_OBSERVER_LIVE=1 cargo test -p astra-runtime \
+  --features live-provider-tests --test memoria_observer_live \
+  live_memoria_owner_observe -- --ignored --exact --nocapture
+```
+
+The feature, ignored-test selection and explicit opt-in are all required, so
+ordinary offline and database CI lanes cannot enable it via inherited credentials.
+It verifies that the legacy impersonation header fails with 400, the production
+self-hosted observer succeeds with `X-User-Id`, the target owner's session contains
+stored memories, and a second owner's view of the same session is empty. This is
+an observer authentication/storage check, not MOI identity or prompt recall E2E.
+The deterministic `turn_observer_authority` target remains the offline contract
+suite; it does not substitute for the real-backend smoke.
+
 ## What "done" Means
 
 A change is not complete until:
