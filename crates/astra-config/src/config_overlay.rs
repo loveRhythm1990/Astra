@@ -122,6 +122,19 @@ impl RuntimeConfigLayer {
         Ok(Self(value))
     }
 
+    /// Drop top-level sections this layer may not set, returning the ones it
+    /// actually carried.
+    pub fn remove_sections(&mut self, sections: &[&'static str]) -> Vec<&'static str> {
+        let Value::Object(fields) = &mut self.0 else {
+            return Vec::new();
+        };
+        sections
+            .iter()
+            .copied()
+            .filter(|section| fields.remove(*section).is_some())
+            .collect()
+    }
+
     pub fn apply_to(&self, base: &RuntimeConfig) -> Result<RuntimeConfig, OverlayError> {
         let mut value = serde_json::to_value(base)?;
         merge_config_fields(&mut value, &self.0);

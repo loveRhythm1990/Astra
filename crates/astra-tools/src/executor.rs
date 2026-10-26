@@ -96,7 +96,7 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024; // 64 KB
 #[derive(Clone)]
 pub struct DefaultToolExecutor {
     ctx: ToolContext,
-    fetch_transport: crate::web_fetch::FetchTransport,
+    fetch_network: crate::web_fetch::FetchNetwork,
     approval_gate: Option<Arc<dyn ToolApprovalGate>>,
     progress_callback: Option<Arc<dyn ToolProgressCallback>>,
 
@@ -108,7 +108,7 @@ impl DefaultToolExecutor {
     pub fn new(ctx: ToolContext) -> Self {
         Self {
             ctx,
-            fetch_transport: Default::default(),
+            fetch_network: Default::default(),
             approval_gate: None,
             progress_callback: None,
 
@@ -143,11 +143,21 @@ impl DefaultToolExecutor {
         self
     }
 
-    /// Install the network authority of a user-owned execution boundary.
-    /// Server constructors intentionally retain the pinned-direct default.
-    pub fn with_local_network(mut self) -> Self {
-        self.fetch_transport = crate::web_fetch::FetchTransport::LocalEnvironment;
+    /// Install the network authority of a user-owned execution boundary,
+    /// with the user's fake-IP opt-in when configured (see
+    /// [`crate::web_fetch::configured_fake_ip_policy`]). Server constructors
+    /// intentionally retain the pinned-direct default.
+    pub fn with_local_network(
+        mut self,
+        fake_ip: Option<Arc<crate::web_fetch::FakeIpPolicy>>,
+    ) -> Self {
+        self.fetch_network = crate::web_fetch::FetchNetwork::local_environment(fake_ip);
         self
+    }
+
+    /// Network authority used by this executor's web tools.
+    pub fn fetch_network(&self) -> &crate::web_fetch::FetchNetwork {
+        &self.fetch_network
     }
 
     /// Access the underlying context.
@@ -631,7 +641,7 @@ impl DefaultToolExecutor {
             // ── Web search ───────────────────────────────────────────
             "web_search" => {
                 let cache_scope = format!("{}:{}", self.ctx.user_id, self.ctx.session_id);
-                crate::web_search::perform_web_search(args, &cache_scope, self.fetch_transport).await
+                crate::web_search::perform_web_search(args, &cache_scope, &self.fetch_network).await
             }
 
             // ── Utility tools ────────────────────────────────────────
@@ -664,7 +674,7 @@ impl DefaultToolExecutor {
             // ── Web fetch (HTTP GET) ─────────────────────────────────
             "web_fetch" => {
                 let cache_scope = format!("{}:{}", self.ctx.user_id, self.ctx.session_id);
-                crate::web_fetch::fetch_with_cache_scope(args, &cache_scope, self.fetch_transport).await
+                crate::web_fetch::fetch_with_cache_scope(args, &cache_scope, &self.fetch_network).await
             }
 
             // ── Display sixel (terminal image rendering) ──────────────

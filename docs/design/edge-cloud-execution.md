@@ -81,6 +81,15 @@ guarantee. Both modes validate public destinations and every redirect locally;
 proxy-only DNS names are not supported. A failed proxy request never silently
 falls back to direct or Server execution. Cache identity includes transport mode.
 
+Fake-IP DNS (a local VPN answering from `198.18.0.0/15`) is blocked like any
+reserved address. The user may opt the local transport into DNS-over-HTTPS
+verification through the user-level `[web_fetch]` configuration: a fetch whose
+answers all lie in the fake range is admitted only when the configured resolver
+reports public real addresses, and the pinned connection still uses the fake
+address. Only the local transport can carry this opt-in; Server transports are
+constructed without it. See the
+[configuration reference](../reference/configuration.md#local-web_fetch-behind-fake-ip-dns).
+
 One total fetch deadline covers DNS, redirects and body reads. Network, timeout,
 HTTP and policy failures retain typed failure metadata through search and local
 tool callbacks; a failed connection is not reported as an unreadable search page.

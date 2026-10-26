@@ -86,6 +86,10 @@ beyond a development machine, review the
 - Keep `.env`, `.env.production`, and `.models.yaml` out of version control.
 - Bind development services to loopback. `ASTRA_BIND_ADDRESS` defaults to
   `127.0.0.1` for a reason.
+- Leave Edge/CLI `[web_fetch] fake_ip_validation` off unless a fake-IP VPN
+  blocks web access. Enabling it trusts the VPN's routing and the configured
+  DoH resolver instead of the local SSRF address check; see the
+  [configuration reference](docs/reference/configuration.md#local-web_fetch-behind-fake-ip-dns).
 - Remember that Runner placement controls where execution happens, not where
   data goes. Model endpoints, context disclosure, and tool-result handling
   remain explicit policy choices.

@@ -1,0 +1,508 @@
+//! Opt-in validation of fake-IP DNS answers for user-owned networks.
+//!
+//! Fake-IP DNS (Clash/mihomo, Surge, sing-box) answers every lookup with an
+//! address from `198.18.0.0/15` and routes the connection by hostname. The
+//! SSRF guard cannot judge such an answer, so it blocks it by default. When
+//! the user opts in through the user-level `[web_fetch]` configuration, the
+//! hostname is resolved again through DNS-over-HTTPS and the fetch is admitted
+//! only if every real address is public. The connection itself still uses the
+//! fake address, because only the local VPN can route it.
+//!
+//! Only `FetchTransport::LocalEnvironment` carries a policy; Server transports
+//! never consult it.
+
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
+use std::time::Duration;
+
+use astra_config::runtime_config::{FakeIpValidationMode, RuntimeConfig, WebFetchConfig};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::rr::{Name, RData, RecordType};
+use ipnet::Ipv4Net;
+use reqwest::header;
+
+use super::{SsrfBlockReason, is_private_ip};
+
+const DNS_MESSAGE: &str = "application/dns-message";
+const DOH_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_DNS_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// RFC 2544 benchmarking range: never assigned to real hosts, and the range
+/// fake-IP implementations draw from.
+pub(super) const FAKE_IP_RANGE: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(198, 18, 0, 0), 15);
+
+#[derive(Debug)]
+pub struct FakeIpPolicy {
+    ranges: Vec<Ipv4Net>,
+    resolvers: Vec<url::Url>,
+}
+
+impl FakeIpPolicy {
+    /// Build the policy selected by configuration. `Ok(None)` means the user
+    /// has not opted in.
+    pub fn from_config(config: &WebFetchConfig) -> Result<Option<Self>, String> {
+        if config.fake_ip_validation == FakeIpValidationMode::Off {
+            return Ok(None);
+        }
+        let ranges = if config.fake_ip_ranges.is_empty() {
+            vec![FAKE_IP_RANGE]
+        } else {
+            config
+                .fake_ip_ranges
+                .iter()
+                .map(|raw| parse_fake_ip_range(raw))
+                .collect::<Result<_, _>>()?
+        };
+        if config.doh_resolvers.is_empty() {
+            return Err(
+                "web_fetch.fake_ip_validation = \"doh\" requires at least one doh_resolvers entry"
+                    .into(),
+            );
+        }
+        let resolvers = config
+            .doh_resolvers
+            .iter()
+            .map(|raw| parse_doh_resolver(raw))
+            .collect::<Result<_, _>>()?;
+        Ok(Some(Self { ranges, resolvers }))
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(resolvers: Vec<url::Url>) -> Self {
+        Self {
+            ranges: vec![FAKE_IP_RANGE],
+            resolvers,
+        }
+    }
+
+    pub(super) fn contains(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => self.ranges.iter().any(|range| range.contains(&v4)),
+            IpAddr::V6(_) => false,
+        }
+    }
+
+    /// Admit `host` only when a configured resolver reports real addresses
+    /// and all of them are public. Fails closed when no resolver answers.
+    pub(super) async fn verify(&self, host: &str) -> Result<(), SsrfBlockReason> {
+        let mut name = Name::from_ascii(host).map_err(|_| SsrfBlockReason::FakeIpUnverified)?;
+        name.set_fqdn(true);
+        let mut failures = Vec::new();
+        for resolver in &self.resolvers {
+            match resolve_via_doh(resolver, &name).await {
+                Ok(real) if real.is_empty() => return Err(SsrfBlockReason::FakeIpUnverified),
+                Ok(real) if real.iter().any(|ip| is_private_ip(*ip)) => {
+                    return Err(SsrfBlockReason::FakeIpRealAddressPrivate(real));
+                }
+                Ok(_) => return Ok(()),
+                Err(error) => failures.push(format!("{}: {error}", resolver.as_str())),
+            }
+        }
+        Err(SsrfBlockReason::FakeIpDohUnavailable(failures.join("; ")))
+    }
+}
+
+/// The policy from the user's runtime configuration, for Edge/CLI owners.
+/// Invalid configuration is reported and leaves the default block in place.
+pub fn configured_fake_ip_policy() -> Option<Arc<FakeIpPolicy>> {
+    match FakeIpPolicy::from_config(&RuntimeConfig::cached().web_fetch) {
+        Ok(policy) => policy.map(Arc::new),
+        Err(error) => {
+            tracing::warn!(%error, "invalid [web_fetch] configuration; fake-IP validation stays off");
+            None
+        }
+    }
+}
+
+fn parse_fake_ip_range(raw: &str) -> Result<Ipv4Net, String> {
+    let range = raw
+        .trim()
+        .parse::<Ipv4Net>()
+        .map_err(|e| format!("invalid web_fetch.fake_ip_ranges entry `{raw}`: {e}"))?
+        .trunc();
+    if !FAKE_IP_RANGE.contains(&range) {
+        return Err(format!(
+            "web_fetch.fake_ip_ranges entry `{raw}` must lie within {FAKE_IP_RANGE}"
+        ));
+    }
+    Ok(range)
+}
+
+fn parse_doh_resolver(raw: &str) -> Result<url::Url, String> {
+    let url = url::Url::parse(raw.trim())
+        .map_err(|e| format!("invalid web_fetch.doh_resolvers entry `{raw}`: {e}"))?;
+    if url.scheme() != "https" || url.host_str().is_none() {
+        return Err(format!(
+            "web_fetch.doh_resolvers entry `{raw}` must be an https:// URL"
+        ));
+    }
+    Ok(url)
+}
+
+async fn resolve_via_doh(resolver: &url::Url, name: &Name) -> Result<Vec<IpAddr>, String> {
+    let client = astra_core::net::client_builder_for_target(resolver.as_str())
+        .timeout(DOH_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("client init failed: {e}"))?;
+    let (v4, v6) = futures::join!(
+        query(&client, resolver, name, RecordType::A),
+        query(&client, resolver, name, RecordType::AAAA)
+    );
+    let mut addrs = v4?;
+    addrs.extend(v6?);
+    Ok(addrs)
+}
+
+async fn query(
+    client: &reqwest::Client,
+    resolver: &url::Url,
+    name: &Name,
+    record_type: RecordType,
+) -> Result<Vec<IpAddr>, String> {
+    // RFC 8484 recommends ID 0 so responses stay cacheable.
+    let mut request = Message::new(0, MessageType::Query, OpCode::Query);
+    request.metadata.recursion_desired = true;
+    request.add_query(Query::query(name.clone(), record_type));
+    let body = request.to_vec().map_err(|e| e.to_string())?;
+    let mut response = client
+        .post(resolver.clone())
+        .header(header::CONTENT_TYPE, DNS_MESSAGE)
+        .header(header::ACCEPT, DNS_MESSAGE)
+        .body(body)
+        .send()
+        .await
+        .map_err(transport_failure)?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(transport_failure)? {
+        if bytes.len() + chunk.len() > MAX_DNS_MESSAGE_BYTES {
+            return Err("DNS response too large".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let answer = Message::from_vec(&bytes).map_err(|e| format!("malformed DNS response: {e}"))?;
+    if answer.metadata.message_type != MessageType::Response {
+        return Err("DNS response is not a response message".into());
+    }
+    match answer.metadata.response_code {
+        ResponseCode::NoError => Ok(answer
+            .answers
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::A(a) => Some(IpAddr::V4(a.0)),
+                RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
+                _ => None,
+            })
+            .collect()),
+        ResponseCode::NXDomain => Ok(Vec::new()),
+        code => Err(format!("DNS response code {code}")),
+    }
+}
+
+/// Keep the underlying cause (for example "connection reset by peer"):
+/// reqwest's own message alone does not tell the user why DoH failed.
+fn transport_failure(error: reqwest::Error) -> String {
+    let error = error.without_url();
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv6Addr, SocketAddr};
+
+    use hickory_proto::rr::Record;
+    use hickory_proto::rr::rdata::{A, AAAA};
+    use wiremock::matchers::{header, method};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    use super::*;
+    use crate::web_fetch::{
+        FetchError, FetchNetwork, resolve_and_validate_host, validate_resolved_addrs,
+    };
+
+    /// A DoH endpoint answering A and AAAA queries from fixed record sets.
+    struct DohAnswers {
+        code: ResponseCode,
+        v4: Vec<Ipv4Addr>,
+        v6: Vec<Ipv6Addr>,
+    }
+
+    impl Respond for DohAnswers {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let query = Message::from_vec(&request.body).expect("DNS query body");
+            let question = query.queries[0].clone();
+            let mut response = Message::response(query.metadata.id, OpCode::Query);
+            response.metadata.response_code = self.code;
+            let name = question.name().clone();
+            let records: Vec<Record> = match question.query_type() {
+                RecordType::A => self
+                    .v4
+                    .iter()
+                    .map(|ip| Record::from_rdata(name.clone(), 60, RData::A(A(*ip))))
+                    .collect(),
+                RecordType::AAAA => self
+                    .v6
+                    .iter()
+                    .map(|ip| Record::from_rdata(name.clone(), 60, RData::AAAA(AAAA(*ip))))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            response.add_answers(records);
+            ResponseTemplate::new(200)
+                .insert_header("content-type", DNS_MESSAGE)
+                .set_body_bytes(response.to_vec().expect("encode DNS response"))
+        }
+    }
+
+    async fn doh(code: ResponseCode, v4: &[&str], v6: &[&str]) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("content-type", DNS_MESSAGE))
+            .respond_with(DohAnswers {
+                code,
+                v4: v4.iter().map(|ip| ip.parse().unwrap()).collect(),
+                v6: v6.iter().map(|ip| ip.parse().unwrap()).collect(),
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn policy(servers: &[&MockServer]) -> FakeIpPolicy {
+        FakeIpPolicy::for_test(
+            servers
+                .iter()
+                .map(|server| url::Url::parse(&format!("{}/dns-query", server.uri())).unwrap())
+                .collect(),
+        )
+    }
+
+    fn addrs(ips: &[&str]) -> Vec<SocketAddr> {
+        ips.iter()
+            .map(|ip| SocketAddr::new(ip.parse().unwrap(), 443))
+            .collect()
+    }
+
+    fn reason(error: FetchError) -> SsrfBlockReason {
+        match error {
+            FetchError::SsrfBlocked(block) => block.reason,
+            other => panic!("expected an SSRF block, got {other:?}"),
+        }
+    }
+
+    fn config(mode: FakeIpValidationMode, ranges: &[&str], resolvers: &[&str]) -> WebFetchConfig {
+        WebFetchConfig {
+            fake_ip_validation: mode,
+            fake_ip_ranges: ranges.iter().map(ToString::to_string).collect(),
+            doh_resolvers: resolvers.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn configuration_is_opt_in_and_validated() {
+        let doh = FakeIpValidationMode::Doh;
+        let resolver = ["https://1.12.12.12/dns-query"];
+        assert!(
+            FakeIpPolicy::from_config(&config(FakeIpValidationMode::Off, &[], &resolver))
+                .unwrap()
+                .is_none()
+        );
+        let default = FakeIpPolicy::from_config(&config(doh, &[], &resolver))
+            .unwrap()
+            .unwrap();
+        assert!(default.contains("198.19.255.1".parse().unwrap()));
+        let narrow = FakeIpPolicy::from_config(&config(doh, &["198.18.0.1/16"], &resolver))
+            .unwrap()
+            .unwrap();
+        assert!(narrow.contains("198.18.3.4".parse().unwrap()));
+        assert!(!narrow.contains("198.19.0.1".parse().unwrap()));
+
+        for (ranges, resolvers, expected) in [
+            (&[][..], &[][..], "requires at least one doh_resolvers"),
+            (
+                &[][..],
+                &["http://1.12.12.12/dns-query"][..],
+                "must be an https:// URL",
+            ),
+            (
+                &["10.0.0.0/8"][..],
+                &resolver[..],
+                "must lie within 198.18.0.0/15",
+            ),
+            (
+                &["198.0.0.0/8"][..],
+                &resolver[..],
+                "must lie within 198.18.0.0/15",
+            ),
+            (
+                &["fc00::/7"][..],
+                &resolver[..],
+                "invalid web_fetch.fake_ip_ranges",
+            ),
+        ] {
+            let error = FakeIpPolicy::from_config(&config(doh, ranges, resolvers)).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_ip_answer_is_blocked_with_user_opt_in_hint_by_default() {
+        let error = validate_resolved_addrs("www.bing.com", addrs(&["198.18.5.51"]), None)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("198.18.5.51"), "{message}");
+        assert!(
+            message.contains("fake_ip_validation = \"doh\""),
+            "{message}"
+        );
+        assert!(
+            message.contains("do not change their configuration"),
+            "{message}"
+        );
+        assert_eq!(reason(error), SsrfBlockReason::FakeIpNotEnabled);
+    }
+
+    #[tokio::test]
+    async fn real_private_answer_never_suggests_the_opt_in() {
+        for answer in [&["10.0.0.5"][..], &["198.18.0.9", "127.0.0.1"][..]] {
+            let error = validate_resolved_addrs("intranet.example", addrs(answer), None)
+                .await
+                .unwrap_err();
+            assert!(!error.to_string().contains("fake_ip_validation"));
+            assert_eq!(reason(error), SsrfBlockReason::PrivateAddress);
+        }
+    }
+
+    #[tokio::test]
+    async fn verified_public_destination_connects_through_the_fake_address() {
+        let server = doh(ResponseCode::NoError, &["140.82.113.4"], &[]).await;
+        let fake = addrs(&["198.18.0.23"]);
+        let admitted =
+            validate_resolved_addrs("github.com", fake.clone(), Some(&policy(&[&server])))
+                .await
+                .unwrap();
+        assert_eq!(
+            admitted, fake,
+            "the pinned connection must use the VPN's fake address"
+        );
+    }
+
+    #[tokio::test]
+    async fn doh_reporting_any_private_real_address_is_blocked() {
+        for (v4, v6) in [
+            (&["127.0.0.1"][..], &[][..]),
+            (&["93.184.216.34", "10.1.2.3"][..], &[][..]),
+            (&["93.184.216.34"][..], &["::1"][..]),
+            // A fake-range answer from DoH is not a real address either.
+            (&["198.18.0.1"][..], &[][..]),
+        ] {
+            let server = doh(ResponseCode::NoError, v4, v6).await;
+            let error = validate_resolved_addrs(
+                "evil.example",
+                addrs(&["198.18.0.7"]),
+                Some(&policy(&[&server])),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(reason(error), SsrfBlockReason::FakeIpRealAddressPrivate(_)),
+                "{v4:?} {v6:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_real_address_is_unverified() {
+        for code in [ResponseCode::NoError, ResponseCode::NXDomain] {
+            let server = doh(code, &[], &[]).await;
+            let error = validate_resolved_addrs(
+                "gone.example",
+                addrs(&["198.18.0.7"]),
+                Some(&policy(&[&server])),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(reason(error), SsrfBlockReason::FakeIpUnverified);
+        }
+    }
+
+    #[tokio::test]
+    async fn unreachable_doh_fails_closed_and_later_resolvers_are_tried() {
+        let broken = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&broken)
+            .await;
+        let error = validate_resolved_addrs(
+            "github.com",
+            addrs(&["198.18.0.23"]),
+            Some(&policy(&[&broken])),
+        )
+        .await
+        .unwrap_err();
+        let SsrfBlockReason::FakeIpDohUnavailable(detail) = reason(error) else {
+            panic!("an unreachable resolver must fail closed");
+        };
+        assert!(detail.contains("HTTP 503"), "{detail}");
+
+        let working = doh(ResponseCode::NoError, &["140.82.113.4"], &[]).await;
+        validate_resolved_addrs(
+            "github.com",
+            addrs(&["198.18.0.23"]),
+            Some(&policy(&[&broken, &working])),
+        )
+        .await
+        .expect("the next configured resolver answers");
+    }
+
+    #[tokio::test]
+    async fn doh_is_consulted_only_when_every_answer_is_fake() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let policy = policy(&[&server]);
+        let public = addrs(&["140.82.113.4"]);
+        assert_eq!(
+            validate_resolved_addrs("github.com", public.clone(), Some(&policy))
+                .await
+                .unwrap(),
+            public
+        );
+        let error = validate_resolved_addrs(
+            "mixed.example",
+            addrs(&["198.18.0.7", "10.0.0.1"]),
+            Some(&policy),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reason(error), SsrfBlockReason::PrivateAddress);
+        // A literal fake address has no hostname to verify.
+        let error = resolve_and_validate_host("http://198.18.0.5/", Some(&policy))
+            .await
+            .unwrap_err();
+        assert_eq!(reason(error), SsrfBlockReason::PrivateAddress);
+    }
+
+    #[test]
+    fn only_the_local_environment_can_carry_the_opt_in() {
+        assert!(FetchNetwork::direct_pinned().fake_ip.is_none());
+        assert!(FetchNetwork::default().fake_ip.is_none());
+        let local =
+            FetchNetwork::local_environment(Some(Arc::new(FakeIpPolicy::for_test(Vec::new()))));
+        assert!(local.fake_ip.is_some());
+    }
+}

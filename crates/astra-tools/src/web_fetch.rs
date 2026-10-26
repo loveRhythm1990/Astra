@@ -14,6 +14,10 @@ use tokio::sync::Mutex;
 
 use crate::ToolResult;
 
+mod fake_ip;
+
+pub use fake_ip::{FakeIpPolicy, configured_fake_ip_policy};
+
 /// Selected by the execution owner, never by tool arguments. A user-owned
 /// proxy is a trusted network boundary and may resolve destinations itself;
 /// Server traffic must retain direct, pinned connections instead.
@@ -23,6 +27,32 @@ pub enum FetchTransport {
     #[default]
     DirectPinned,
     LocalEnvironment,
+}
+
+/// The network authority a fetch runs under. Only the user-owned local
+/// environment can carry the user's fake-IP opt-in; Server transports are
+/// constructed without one and cannot acquire it.
+#[derive(Debug, Clone, Default)]
+pub struct FetchNetwork {
+    transport: FetchTransport,
+    fake_ip: Option<Arc<FakeIpPolicy>>,
+}
+
+impl FetchNetwork {
+    pub fn direct_pinned() -> Self {
+        Self::default()
+    }
+
+    pub fn local_environment(fake_ip: Option<Arc<FakeIpPolicy>>) -> Self {
+        Self {
+            transport: FetchTransport::LocalEnvironment,
+            fake_ip,
+        }
+    }
+
+    pub fn transport(&self) -> FetchTransport {
+        self.transport
+    }
 }
 
 pub use convert::{to_markdown, to_text};
@@ -71,8 +101,92 @@ pub enum FetchError {
     Network(String),
     #[error("{0}")]
     Timeout(String),
-    #[error("SSRF blocked: {0} resolves to a private/internal address")]
-    SsrfBlocked(String),
+    #[error("{0}")]
+    SsrfBlocked(Box<SsrfBlock>),
+}
+
+impl FetchError {
+    fn ssrf(host: &str, addrs: Vec<IpAddr>, reason: SsrfBlockReason) -> Self {
+        Self::SsrfBlocked(Box::new(SsrfBlock {
+            host: host.to_string(),
+            addrs,
+            reason,
+        }))
+    }
+}
+
+#[derive(Debug)]
+pub struct SsrfBlock {
+    host: String,
+    addrs: Vec<IpAddr>,
+    reason: SsrfBlockReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SsrfBlockReason {
+    PrivateAddress,
+    /// Every address is in the fake-IP range and the user has not opted in.
+    FakeIpNotEnabled,
+    FakeIpDohUnavailable(String),
+    FakeIpUnverified,
+    FakeIpRealAddressPrivate(Vec<IpAddr>),
+}
+
+/// The message is read by the model first, so each case says what is known
+/// and who may act. The opt-in is the user's; the model must not enable it.
+impl std::fmt::Display for SsrfBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let host = &self.host;
+        let addrs = join_ips(&self.addrs);
+        match &self.reason {
+            SsrfBlockReason::PrivateAddress if self.addrs.is_empty() => {
+                write!(f, "SSRF blocked: {host} is a private/internal address")
+            }
+            SsrfBlockReason::PrivateAddress => write!(
+                f,
+                "SSRF blocked: {host} resolves to a private/internal address ({addrs})"
+            ),
+            SsrfBlockReason::FakeIpNotEnabled => write!(
+                f,
+                "SSRF blocked: {host} resolves to {addrs}, inside {range}. Local VPN/proxy \
+                 tools with fake-IP DNS (Clash/mihomo, Surge, sing-box) answer from this \
+                 range, so the real destination cannot be verified. The user can opt in \
+                 to DNS-over-HTTPS verification in their user-level runtime.toml \
+                 (~/.astra/config/runtime.toml):\n\n[web_fetch]\n\
+                 fake_ip_validation = \"doh\"\n\
+                 doh_resolvers = [\"https://<reachable DoH endpoint>/dns-query\"]\n\n\
+                 See docs/reference/configuration.md. Tell the user about this option; \
+                 do not change their configuration on their behalf.",
+                range = fake_ip::FAKE_IP_RANGE,
+            ),
+            SsrfBlockReason::FakeIpDohUnavailable(detail) => write!(
+                f,
+                "SSRF blocked: {host} resolves to fake-IP address {addrs}, and no configured \
+                 DoH resolver answered ({detail}), so the real destination could not be \
+                 verified. The user can configure a reachable endpoint in [web_fetch] \
+                 doh_resolvers of their user-level runtime.toml."
+            ),
+            SsrfBlockReason::FakeIpUnverified => write!(
+                f,
+                "SSRF blocked: {host} resolves to fake-IP address {addrs}, but DoH returned \
+                 no address for it, so the real destination could not be verified."
+            ),
+            SsrfBlockReason::FakeIpRealAddressPrivate(real) => write!(
+                f,
+                "SSRF blocked: {host} resolves to fake-IP address {addrs}, and DoH reports \
+                 its real address is private/internal ({real})",
+                real = join_ips(real),
+            ),
+        }
+    }
+}
+
+fn join_ips(addrs: &[IpAddr]) -> String {
+    addrs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -239,13 +353,13 @@ const MAX_WALK_DEPTH: usize = 256;
 pub async fn fetch_with_cache_scope(
     args: &Value,
     cache_scope: &str,
-    transport: FetchTransport,
+    network: &FetchNetwork,
 ) -> ToolResult {
     let timeout = Duration::from_secs(args.get("timeout").and_then(Value::as_u64).unwrap_or(30));
-    let result = tokio::time::timeout(timeout, fetch_inner(args, cache_scope, transport))
+    let result = tokio::time::timeout(timeout, fetch_inner(args, cache_scope, network))
         .await
         .unwrap_or_else(|_| Err(FetchError::Timeout("Total fetch deadline exceeded".into())));
-    render_fetch_result(result, transport)
+    render_fetch_result(result, network.transport())
 }
 
 fn render_fetch_result(
@@ -296,8 +410,10 @@ fn render_fetch_result(
 async fn fetch_inner(
     args: &Value,
     cache_scope: &str,
-    transport: FetchTransport,
+    network: &FetchNetwork,
 ) -> Result<Arc<FetchResult>, FetchError> {
+    let transport = network.transport();
+    let fake_ip = network.fake_ip.as_deref();
     let (raw_url, config) = FetchConfig::from_args(args)?;
     let url = if config.allow_http {
         raw_url.clone()
@@ -308,7 +424,7 @@ async fn fetch_inner(
     // Resolve once for validation; the actual fetch paths re-resolve per hop
     // during redirect following (different host), so this is intentionally
     // consumed only for early fail on private-IP targets.
-    let _early_validate = resolve_and_validate_host(&url).await?;
+    let _early_validate = resolve_and_validate_host(&url, fake_ip).await?;
 
     let cache_key = CacheKey {
         scope: cache_scope.to_string(),
@@ -330,7 +446,7 @@ async fn fetch_inner(
 
     let start = Instant::now();
     let (status, final_url, content_type, body) =
-        fetch_reqwest(&url, config.timeout, transport).await?;
+        fetch_reqwest(&url, config.timeout, transport, fake_ip).await?;
     // Store one bounded representation independent of the caller's requested
     // slice. A later model round asking for 8k after an initial 3k read can
     // reuse the same network response; only the returned projection changes.
@@ -448,7 +564,11 @@ fn validate_url(url: &str) -> Result<(), FetchError> {
         .ok_or_else(|| FetchError::Validation("URL has no host".into()))?;
 
     if is_private_host(host) {
-        return Err(FetchError::SsrfBlocked(host.to_string()));
+        return Err(FetchError::ssrf(
+            host,
+            Vec::new(),
+            SsrfBlockReason::PrivateAddress,
+        ));
     }
 
     Ok(())
@@ -457,7 +577,10 @@ fn validate_url(url: &str) -> Result<(), FetchError> {
 /// Resolve DNS and validate ALL returned addresses are public.
 /// Returns the validated addresses so callers can pin them for the connection,
 /// preventing DNS rebinding (where a second resolution returns a different IP).
-async fn resolve_and_validate_host(url: &str) -> Result<Vec<SocketAddr>, FetchError> {
+async fn resolve_and_validate_host(
+    url: &str,
+    fake_ip: Option<&FakeIpPolicy>,
+) -> Result<Vec<SocketAddr>, FetchError> {
     let parsed =
         url::Url::parse(url).map_err(|e| FetchError::Validation(format!("Invalid URL: {e}")))?;
     let host = parsed
@@ -468,10 +591,15 @@ async fn resolve_and_validate_host(url: &str) -> Result<Vec<SocketAddr>, FetchEr
         .port_or_known_default()
         .ok_or_else(|| FetchError::Validation("URL has no port for scheme".into()))?;
 
-    // If host is already an IP literal, validate directly.
+    // If host is already an IP literal, validate directly. A literal fake-IP
+    // address has no hostname to verify, so it is never admitted.
     if let Ok(ip) = host.parse::<IpAddr>() {
         if is_private_ip(ip) {
-            return Err(FetchError::SsrfBlocked(host.to_string()));
+            return Err(FetchError::ssrf(
+                host,
+                Vec::new(),
+                SsrfBlockReason::PrivateAddress,
+            ));
         }
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
@@ -487,12 +615,38 @@ async fn resolve_and_validate_host(url: &str) -> Result<Vec<SocketAddr>, FetchEr
         )));
     }
 
-    for addr in &addrs {
-        if is_private_ip(addr.ip()) {
-            return Err(FetchError::SsrfBlocked(host.to_string()));
-        }
+    validate_resolved_addrs(host, addrs, fake_ip).await
+}
+
+/// Admit public answers. Private answers are blocked unless every one lies in
+/// the user's fake-IP range and DoH reports public real addresses; the pinned
+/// connection still uses the fake addresses the local VPN can route.
+async fn validate_resolved_addrs(
+    host: &str,
+    addrs: Vec<SocketAddr>,
+    fake_ip: Option<&FakeIpPolicy>,
+) -> Result<Vec<SocketAddr>, FetchError> {
+    let ips: Vec<IpAddr> = addrs.iter().map(SocketAddr::ip).collect();
+    if !ips.iter().copied().any(is_private_ip) {
+        return Ok(addrs);
     }
-    Ok(addrs)
+    let reason = match fake_ip {
+        Some(policy) if ips.iter().all(|ip| policy.contains(*ip)) => {
+            match policy.verify(host).await {
+                Ok(()) => return Ok(addrs),
+                Err(reason) => reason,
+            }
+        }
+        None if ips.iter().all(|ip| match ip {
+            IpAddr::V4(v4) => fake_ip::FAKE_IP_RANGE.contains(v4),
+            IpAddr::V6(_) => false,
+        }) =>
+        {
+            SsrfBlockReason::FakeIpNotEnabled
+        }
+        _ => SsrfBlockReason::PrivateAddress,
+    };
+    Err(FetchError::ssrf(host, ips, reason))
 }
 
 fn is_private_host(host: &str) -> bool {
@@ -581,6 +735,7 @@ async fn fetch_reqwest(
     url: &str,
     timeout: Duration,
     transport: FetchTransport,
+    fake_ip: Option<&FakeIpPolicy>,
 ) -> Result<(u16, Option<String>, String, String), FetchError> {
     let mut current = url.to_string();
     let mut final_url = None;
@@ -588,7 +743,7 @@ async fn fetch_reqwest(
     for redirect_count in 0..=MAX_REDIRECTS {
         validate_url(&current)?;
         // Resolve DNS and validate ALL IPs are public; pin them for the connection.
-        let resolved = resolve_and_validate_host(&current).await?;
+        let resolved = resolve_and_validate_host(&current, fake_ip).await?;
         let parsed = url::Url::parse(&current)
             .map_err(|e| FetchError::Validation(format!("Invalid URL: {e}")))?;
         let host = parsed.host_str().unwrap_or_default().to_string();
@@ -2013,8 +2168,8 @@ mod tests {
 
     #[tokio::test]
     async fn error_on_missing_url() {
-        let r =
-            fetch_with_cache_scope(&serde_json::json!({}), "", FetchTransport::DirectPinned).await;
+        let r = fetch_with_cache_scope(&serde_json::json!({}), "", &FetchNetwork::direct_pinned())
+            .await;
         assert!(r.is_error);
         assert!(r.output.contains("Missing 'url'"));
         assert_eq!(r.metadata.unwrap()["error_kind"], "tool_invalid_args");
@@ -2022,14 +2177,14 @@ mod tests {
 
     #[tokio::test]
     async fn error_on_private_ip() {
-        for transport in [
-            FetchTransport::DirectPinned,
-            FetchTransport::LocalEnvironment,
+        for network in [
+            FetchNetwork::direct_pinned(),
+            FetchNetwork::local_environment(None),
         ] {
             let r = fetch_with_cache_scope(
                 &serde_json::json!({"url": "http://127.0.0.1/admin"}),
                 "",
-                transport,
+                &network,
             )
             .await;
             assert!(r.is_error);
@@ -2043,7 +2198,7 @@ mod tests {
         let r = fetch_with_cache_scope(
             &serde_json::json!({"url": "https://x.com", "format": "raw"}),
             "",
-            FetchTransport::DirectPinned,
+            &FetchNetwork::direct_pinned(),
         )
         .await;
         assert!(r.is_error);

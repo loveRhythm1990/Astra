@@ -1624,7 +1624,7 @@ impl ToolExecutor {
                     cancel_token: None,
                 },
             )
-            .with_local_network(),
+            .with_local_network(astra_tools::web_fetch::configured_fake_ip_policy()),
             plan_mode_authoring_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             ask_user_request_tx: std::sync::Mutex::new(None),
             plan_review_request_tx: std::sync::Mutex::new(None),
@@ -5201,7 +5201,7 @@ impl ToolExecutor {
                     let result = astra_tools::web_fetch::fetch_with_cache_scope(
                         args,
                         &cache_scope,
-                        astra_tools::web_fetch::FetchTransport::LocalEnvironment,
+                        self.default_executor.fetch_network(),
                     )
                     .await;
                     *source_is_error = Some(result.is_error);
@@ -5491,7 +5491,7 @@ impl ToolExecutor {
                     let result = astra_tools::web_search::perform_web_search(
                         args,
                         &cache_scope,
-                        astra_tools::web_fetch::FetchTransport::LocalEnvironment,
+                        self.default_executor.fetch_network(),
                     )
                     .await;
                     *source_is_error = Some(result.is_error);

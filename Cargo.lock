@@ -745,6 +745,7 @@ dependencies = [
 name = "astra-tools"
 version = "0.2.13"
 dependencies = [
+ "astra-config",
  "astra-core",
  "astra-memoria",
  "astra-prompts",
@@ -760,6 +761,8 @@ dependencies = [
  "futures",
  "gix",
  "hex",
+ "hickory-proto",
+ "ipnet",
  "libc",
  "nix 0.31.3",
  "regex",

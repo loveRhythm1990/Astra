@@ -286,6 +286,42 @@ Provider admission is intentionally configured by capacity inputs only. Scope is
 
 Server-loop Memoria observer and post-loop memory cleanup are fixed internal async best-effort side effects with bounded in-process concurrency. They are intentionally not environment-configurable; they must not hold run admission slots or become deployment-specific tuning surfaces.
 
+### Local `web_fetch` behind fake-IP DNS
+
+Edge/CLI `web_fetch` and `web_search` block destinations that resolve to a
+private or reserved address, including `198.18.0.0/15`. Local VPN/proxy tools
+in fake-IP mode (Clash/mihomo, Surge, sing-box) answer every lookup from that
+range, so every fetch is blocked. Users on such a network can opt in to
+DNS-over-HTTPS verification in the user-level `~/.astra/config/runtime.toml`:
+
+```toml
+[web_fetch]
+fake_ip_validation = "doh"                       # off (default) or doh
+doh_resolvers = ["https://1.12.12.12/dns-query"] # required, tried in order
+# fake_ip_ranges = ["198.18.0.0/16"]             # optional, within 198.18.0.0/15
+```
+
+When every address from the local DNS lies in a fake range, Astra asks the
+resolvers (RFC 8484) for the hostname's real A and AAAA records and admits the
+fetch only if all of them are public. The connection still goes to the fake
+address so the VPN can route it. Mixed answers, literal fake addresses, empty
+answers and unreachable resolvers stay blocked. There is no built-in resolver:
+pick one your network does not block, because many networks that use fake-IP
+DNS also block well-known DoH endpoints.
+
+Only the user-level file and an explicit `--settings` overlay can set this
+section. A project `.astra/config/runtime.toml` cannot; the section is ignored
+with a warning. There is intentionally no environment variable, because the CLI
+loads `.env` from the working directory. Server `web_fetch` never reads it, and
+an invalid section leaves the default block in place with a warning.
+
+Enabling it trusts the VPN to connect to the destination the resolver reported.
+A domain that answers the resolver and the VPN differently (for example by DNS
+rebinding to a private address) can still reach that address through the VPN.
+Keep it off unless fake-IP DNS blocks web access. Like other Astra
+configuration, the file is protected from agent writes only by the permission
+mode: Bypass, or Auto with `allow_sensitive_path_writes`, lets the agent edit it.
+
 ### Observability
 
 - `ASTRA_LOG_FORMAT`, `ASTRA_SERVICE_NAME`, `ASTRA_OTEL_ENABLED`
