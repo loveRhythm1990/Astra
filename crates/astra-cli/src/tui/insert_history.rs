@@ -18,21 +18,21 @@ use super::custom_terminal;
 
 /// Insert history lines above the viewport into terminal scrollback.
 /// Matches Codex insert_history.rs Standard/Zellij paths.
+/// Returns whether the viewport must be fully repainted after insertion.
 pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
     terminal: &mut custom_terminal::Terminal<B>,
     rows: &[MarkdownRow],
     trusted_links: bool,
     is_zellij: bool,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     if rows.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let screen_size = terminal.backend().size().unwrap_or(Size::new(0, 0));
     let area = terminal.viewport_area;
     let last_cursor_pos = terminal.last_known_cursor_pos;
     let wrap_width = screen_size.width.max(1) as usize;
-    let mut should_update_area = false;
 
     // Sanitization is independent of copy semantics. Code and pure URLs use
     // terminal soft wrapping so only logical source rows emit CRLFs.
@@ -67,35 +67,39 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
     }
 
     if wrapped_rows == 0 {
-        return Ok(());
+        return Ok(false);
     }
 
     let writer = terminal.backend_mut();
+    let mut new_area = area;
 
-    if is_zellij {
-        // Zellij mode: emit newlines at bottom, write at absolute positions
-        let space_below = screen_size.height.saturating_sub(area.bottom());
-        let shift_down = wrapped_rows.min(space_below);
-        let scroll_up = wrapped_rows.saturating_sub(shift_down);
+    // A full-height viewport has no protected history region. Both it and
+    // Zellij need a repaint after content flows through the transient frame.
+    let needs_full_repaint = is_zellij || area.height == screen_size.height;
+    if needs_full_repaint {
+        let end = u32::from(area.top()) + u32::from(wrapped_rows);
+        new_area.y = end.min(u32::from(screen_size.height.saturating_sub(area.height))) as u16;
+        let reserve = end
+            .min(u32::from(screen_size.height))
+            .saturating_sub(u32::from(new_area.top())) as u16;
 
-        if scroll_up > 0 {
-            queue!(writer, MoveTo(0, screen_size.height.saturating_sub(1)))?;
-            for _ in 0..scroll_up {
-                queue!(writer, Print("\n"))?;
-            }
+        queue!(writer, SetAttribute(Attribute::Reset))?;
+        if area.top() < screen_size.height {
+            queue!(writer, MoveTo(0, area.top()))?;
+        } else {
+            // An empty viewport can sit just past the last screen row.
+            // Append rather than overwriting the final history row.
+            queue!(
+                writer,
+                MoveTo(0, screen_size.height.saturating_sub(1)),
+                Print("\r\n")
+            )?;
         }
+        queue!(writer, Clear(ClearType::FromCursorDown))?;
 
-        let mut new_area = area;
-        if shift_down > 0 {
-            new_area.y += shift_down;
-            should_update_area = true;
-        }
-
-        // Only emitted bottom newlines scroll existing content upward.
-        // Reserving unused space below the viewport does not move history.
-        let cursor_top = area.top().saturating_sub(scroll_up);
-        queue!(writer, MoveTo(0, cursor_top))?;
-
+        // Write first: terminal autowrap naturally scrolls even a single
+        // multi-page code row. Pre-scrolling would clamp its origin to zero
+        // and leave its tail inside the composer.
         for (i, line) in wrapped.iter().enumerate() {
             if i > 0 {
                 queue!(writer, Print("\r\n"))?;
@@ -103,16 +107,13 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
             write_history_line(writer, line, trusted_links)?;
         }
 
-        // Restore cursor position
-        queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
-        Write::flush(writer)?;
-
-        let _ = writer;
-        if should_update_area {
-            terminal.set_viewport_area(new_area);
-        }
-        if wrapped_rows > 0 {
-            terminal.note_history_rows_inserted(wrapped_rows);
+        // Reserve the transient frame only after content has flowed. This
+        // adds at most one viewport height, independent of the batch size.
+        if reserve > 0 {
+            queue!(writer, MoveTo(0, screen_size.height.saturating_sub(1)))?;
+            for _ in 0..reserve {
+                queue!(writer, Print("\n"))?;
+            }
         }
     } else {
         // Standard mode — matches Codex insert_history.rs Standard path:
@@ -123,7 +124,6 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
         // 3. Write history lines within that protected region.
         // 4. Reset scroll region and restore cursor.
 
-        let mut new_area = area;
         let cursor_top = if area.bottom() < screen_size.height {
             let scroll_amount = wrapped_rows.min(screen_size.height - area.bottom());
 
@@ -140,7 +140,6 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
 
             let ct = area.top().saturating_sub(1);
             new_area.y += scroll_amount;
-            should_update_area = true;
             ct
         } else {
             area.top().saturating_sub(1)
@@ -158,21 +157,18 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
 
             queue!(writer, Print("\x1b[r"))?;
         }
-
-        // Restore cursor position
-        queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
-        Write::flush(writer)?;
-
-        let _ = writer;
-        if should_update_area {
-            terminal.set_viewport_area(new_area);
-        }
-        if wrapped_rows > 0 {
-            terminal.note_history_rows_inserted(wrapped_rows);
-        }
     }
 
-    Ok(())
+    queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
+    Write::flush(writer)?;
+
+    let _ = writer;
+    if new_area != area {
+        terminal.set_viewport_area(new_area);
+    }
+    terminal.note_history_rows_inserted(wrapped_rows);
+
+    Ok(needs_full_repaint)
 }
 
 /// Count terminal rows without materializing physical fragments. Carry the

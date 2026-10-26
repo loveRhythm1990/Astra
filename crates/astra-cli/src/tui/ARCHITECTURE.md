@@ -266,6 +266,9 @@ Code rows start at column zero and use terminal soft wrapping; ordinary prose
 keeps its existing layout. Final writes count physical rows at the current
 terminal width without inserting hard line breaks into the code itself.
 Sanitization and structured-link trust remain independent of this layout hint.
+Zellij lets content flow before reserving space for the input area, preserving
+multi-screen code across input redraws and later replies. A full-height input
+area uses the same operation to move output into native scrollback.
 
 This guarantees that Astra adds neither a gutter nor width-generated hard breaks
 to sanitized code rows. Native clipboard selection still depends on the terminal

@@ -489,9 +489,7 @@ impl TerminalGuard {
             &lines,
             trusted_links,
             is_zellij,
-        )?;
-
-        Ok(is_zellij)
+        )
     }
 
     fn pending_history_has_ready_lines(&self) -> bool {
@@ -825,6 +823,126 @@ mod tests {
             pending_separators: 0,
             ready: VecDeque::new(),
         })])
+    }
+
+    fn drain_and_repaint_history(
+        terminal: &mut crate::tui::custom_terminal::Terminal<RecordingBackend>,
+        pending: &mut VecDeque<PendingHistory>,
+        zellij: bool,
+        parser: &mut vt100::Parser,
+    ) {
+        while !pending.is_empty() {
+            if super::TerminalGuard::flush_pending_history(terminal, pending, zellij).unwrap() {
+                terminal.invalidate_viewport();
+            }
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    ratatui::widgets::Widget::render(
+                        ratatui::widgets::Paragraph::new("composer\n".repeat(area.height as usize)),
+                        area,
+                        frame.buffer_mut(),
+                    );
+                })
+                .unwrap();
+            parser.process(&std::mem::take(&mut terminal.backend_mut().bytes));
+        }
+    }
+
+    fn text_including_scrollback(parser: &mut vt100::Parser, width: u16) -> String {
+        parser.screen_mut().set_scrollback(usize::MAX);
+        let history = parser.screen().scrollback();
+        let mut text = String::new();
+        for offset in (1..=history).rev() {
+            parser.screen_mut().set_scrollback(offset);
+            text.push_str(&parser.screen().rows(0, width).next().unwrap());
+        }
+        parser.screen_mut().set_scrollback(0);
+        for row in parser.screen().rows(0, width) {
+            text.push_str(&row);
+        }
+        text
+    }
+
+    #[test]
+    fn multi_page_code_survives_composer_repaint_and_following_reply() {
+        for width in [40_u16, 80] {
+            for top in [12_u16, 36] {
+                for physical_rows in [2_u16, 35, 36, 37, 47, 100] {
+                    let code = format!(
+                        "{}END_OF_CODE",
+                        "x".repeat(usize::from(width) * usize::from(physical_rows - 2))
+                    );
+                    for zellij in [false, true] {
+                        let mut terminal = recording_terminal(width, top);
+                        let mut parser = vt100::Parser::new(40, width, 256);
+                        parser.process(format!("\x1b[{};1Hexisting-code", top - 1).as_bytes());
+                        for row in top..top + 4 {
+                            parser.process(format!("\x1b[{};1HSTALE-UI-TAIL", row + 1).as_bytes());
+                        }
+                        let mut pending = queued_assistant(&format!("```\n{code}\n```"), width);
+                        drain_and_repaint_history(&mut terminal, &mut pending, zellij, &mut parser);
+                        let expected_top = (top + physical_rows).min(36);
+                        assert_eq!(terminal.viewport_area.y, expected_top);
+                        assert!(
+                            parser
+                                .screen()
+                                .rows(0, width)
+                                .nth(usize::from(expected_top - 1))
+                                .unwrap()
+                                .contains("END_OF_CODE"),
+                            "tail overwritten width={width} top={top} rows={physical_rows} zellij={zellij}"
+                        );
+
+                        pending.extend(queued_assistant("```\nnext-command\n```", width));
+                        drain_and_repaint_history(&mut terminal, &mut pending, zellij, &mut parser);
+                        let text = text_including_scrollback(&mut parser, width);
+                        // vt100 discards rows scrolled out of a partial DECSTBM
+                        // region. Standard still checks visible placement and
+                        // repaint; only full-screen flow can round-trip native
+                        // scrollback through this emulator.
+                        if zellij {
+                            assert!(text.contains(&code), "code lost: {text:?}");
+                            assert_eq!(text.matches("existing-code").count(), 1);
+                        }
+                        assert_eq!(text.matches("END_OF_CODE").count(), 1);
+                        assert_eq!(text.matches("next-command").count(), 1);
+                        assert!(!text.contains("STALE-UI"), "transient UI entered history");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_height_and_empty_viewports_preserve_code_in_scrollback() {
+        for (top, height) in [(0, 40), (40, 0), (12, 0)] {
+            for zellij in [false, true] {
+                for length in [39, 40, 41, 1800, 1801] {
+                    let code = "x".repeat(length);
+                    let mut terminal = recording_terminal(40, top);
+                    terminal.set_viewport_area(ratatui::layout::Rect::new(0, top, 40, height));
+                    let mut parser = vt100::Parser::new(40, 40, 256);
+                    if top > 0 {
+                        parser.process(format!("\x1b[{top};1Hexisting-code").as_bytes());
+                    }
+                    let mut pending = queued_assistant(&format!("```\n{code}\n```"), 40);
+                    drain_and_repaint_history(&mut terminal, &mut pending, zellij, &mut parser);
+                    let text = text_including_scrollback(&mut parser, 40);
+                    assert!(
+                        text.contains(&code),
+                        "code lost top={top} height={height} zellij={zellij} length={length}"
+                    );
+                    assert_eq!(text.matches('x').count(), length + usize::from(top > 0));
+                    if top > 0 {
+                        assert!(
+                            text.contains("existing-code"),
+                            "last history row overwritten"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
