@@ -515,6 +515,10 @@ Capture ends only after
 both the measured run and its observer finish: the detached observer is not
 owned by `drain_background_runs`. Observer errors, dropped work or a missing
 completion fail the probe instead of silently undercounting SQL.
+The readonly-round comparison accounts for exact periodic control reads and
+at most one account/session authentication snapshot when its 30-second cache
+expires. Those statements still count toward the raw 20-statement limit;
+repeated authentication snapshots or any other extra readonly-round SQL fail.
 
 ### Durable provider concurrency and cancellation
 

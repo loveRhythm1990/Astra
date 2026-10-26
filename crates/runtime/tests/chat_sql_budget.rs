@@ -164,6 +164,23 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SqlCapture {
 
 const CONTROL_OBSERVATION_SQL: &str = "SELECT requested.ordinal, run_id, session_id, status, waiting_for, parent_run_id, ancestor_path, run_generation, last_event_idx, CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested, CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at IS NOT NULL AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live FROM (VALUES ROW(0,?,?)) requested(ordinal, requested_user_id, requested_run_id) LEFT JOIN agent_runs ON user_id = requested_user_id AND run_id = requested_run_id AND run_id IN (?)";
 
+// The account/session snapshot is cached for 30 seconds. A slow fixture can
+// cross that boundary independently of readonly tool rounds. Attribute only
+// this exact query, at most once per request, while retaining the raw total.
+const AUTHENTICATION_SNAPSHOT_SQL: &str = "SELECT u.user_id, u.username, u.email, u.display_name, u.is_active, CAST(UNIX_TIMESTAMP(s.session_expires_at) AS SIGNED) AS session_expires_at_unix, m.provider_id AS memoria_provider_id, m.external_subject AS memoria_subject FROM (SELECT MAX(expires_at) AS session_expires_at FROM auth_refresh_tokens WHERE user_id = ? AND session_id = ? AND is_revoked = 0 AND expires_at > NOW()) s LEFT JOIN auth_users u ON u.user_id = ? LEFT JOIN (SELECT astra_user_id, provider_id, external_subject FROM auth_external_identities WHERE astra_user_id = ? AND provider_id LIKE 'memoria:%' ORDER BY CASE WHEN provider_id = ? THEN 0 ELSE 1 END, updated_at DESC, provider_id ASC LIMIT 1) m ON m.astra_user_id = u.user_id";
+
+fn authentication_snapshot_count(statements: &[String]) -> usize {
+    let count = statements
+        .iter()
+        .filter(|sql| sql.as_str() == AUTHENTICATION_SNAPSHOT_SQL)
+        .count();
+    assert!(
+        count <= 1,
+        "a request must not repeat its authentication snapshot"
+    );
+    count
+}
+
 fn answer(message: Value, reason: &str) -> ProviderResponse {
     ProviderResponse::OpenAi(json!({
         "choices": [{"index": 0, "message": message, "finish_reason": reason}],
@@ -837,6 +854,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             statements.len(),
             statements.join("\n")
         );
+        let authentication_reads = authentication_snapshot_count(statements);
         if *scenario == "ordinary" {
             continue;
         }
@@ -844,13 +862,15 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             .iter()
             .find(|(name, _, warm, _, _)| *name == "ordinary" && warm == warm_context)
             .unwrap();
-        // Explain only the exact observed periodic reads; the independent
-        // raw total budget above never deducts a query.
-        let expected = baseline.4.len() as i64 + *polls as i64 - baseline.3 as i64;
+        // Explain exact periodic reads and at most one request-auth cache
+        // miss. The independent raw total budget above never deducts a query.
+        let expected = baseline.4.len() as i64 + *polls as i64 - baseline.3 as i64
+            + authentication_reads as i64
+            - authentication_snapshot_count(&baseline.4) as i64;
         assert_eq!(
             statements.len() as i64,
             expected,
-            "{scenario} {rounds} readonly rounds (warm={warm_context}, polls={polls}) must add no SQL beyond the exact observed periodic controls"
+            "{scenario} {rounds} readonly rounds (warm={warm_context}, polls={polls}) must add no SQL beyond exact periodic controls and one request-auth cache miss"
         );
     }
 }
