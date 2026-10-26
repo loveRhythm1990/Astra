@@ -10,8 +10,8 @@
 │                                                                 │
 │  › user message                                                 │  ← UserCell
 │                                                                 │
-│  ● assistant response, streamed word by word, markdown-rendered │  ← AssistantCell
-│    with a first-row marker and plain-space continuation indent  │
+│    assistant response, streamed word by word, markdown-rendered │  ← AssistantCell
+│    prose indented with plain spaces; code blocks verbatim       │
 │                                                                 │
 │  • Ran bash (52ms)                                              │  ← ToolCell
 │    │ $ echo hello                                               │
@@ -104,7 +104,7 @@ All cells live in `history_cell/` and implement the `HistoryCell` trait
 | Cell | File | Role |
 |------|------|------|
 | **UserCell** | `user.rs` | `›` accent-bold prefix + user message text |
-| **AssistantCell** | `assistant.rs` | Streaming markdown; settled body has a `● ` first-row marker and space-indented continuation rows so scrollback copies cleanly; blinking cursor while live |
+| **AssistantCell** | `assistant.rs` | Streaming markdown; settled prose rows are space-indented with no glyph marker and code-block rows are written verbatim, so scrollback copies cleanly; blinking cursor while live |
 | **ReasoningCell** | `reasoning.rs` | `💭 Thinking` header + compact body; committed on `ReasoningDone` or first answer delta |
 | **ToolCell** | `tool.rs` | `• Ran tool (Nms)` header + `│` args + `└` output; diff-aware coloring |
 | **SystemCell** | `system.rs` | info / warning / error; error text is humanized (strips `<tool_use_error>` wrappers) |

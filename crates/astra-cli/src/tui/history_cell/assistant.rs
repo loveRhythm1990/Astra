@@ -11,9 +11,9 @@
 //! thinking window). One source of truth, one render path. See
 //! `docs/design/tui-refactor.md` §3.3.
 //!
-//! Settled reply bodies start with a `● ` marker and indent continuation
-//! prose rows with plain spaces; code-block rows stay verbatim at column 0,
-//! so a block selected from native scrollback copies exactly as written.
+//! Settled reply bodies indent prose rows with plain spaces and carry no
+//! glyph marker; code-block rows stay verbatim at column 0, so text selected
+//! from native scrollback copies as written.
 //! Live cells still use the active-slot wrapper for structure.
 //! An active response is kept visually distinct by the surrounding status line;
 //! its content itself stays free of transient transport counters.
@@ -321,11 +321,7 @@ impl AssistantCell {
         }
         let inner_width = (width as usize).saturating_sub(2).max(20);
         let (rendered, total) = self.markdown_layout_window(source, inner_width, start, maximum);
-        let lines = rendered
-            .into_iter()
-            .enumerate()
-            .map(|(offset, row)| prefix_settled_row(start.saturating_add(offset), row))
-            .collect();
+        let lines = rendered.into_iter().map(prefix_settled_row).collect();
         (lines, total)
     }
 
@@ -568,10 +564,9 @@ impl AssistantCell {
 
         rendered
             .into_iter()
-            .enumerate()
-            .map(|(index, row)| {
+            .map(|row| {
                 if prepend_gutter {
-                    prefix_settled_row(index, row)
+                    prefix_settled_row(row)
                 } else {
                     row.line
                 }
@@ -582,27 +577,19 @@ impl AssistantCell {
 
 /// Prefix a settled response body row for native scrollback.
 ///
-/// Terminal selection copies every written cell, so any prefix leaks into
-/// text users copy from a reply. Code-block rows are therefore written
-/// verbatim at column 0: a copied block (a heredoc, indentation-sensitive
-/// code) matches its source exactly. Other rows get a 2-col prefix: the first
-/// body row carries the `● ` terminal marker, in the same success colour as
-/// tool markers, and the rest are indented with plain spaces. Live responses
-/// keep the distinct focus gutter supplied by `LiveFramedCell`.
-fn prefix_settled_row(body_row: usize, row: MarkdownRow) -> Line<'static> {
+/// Terminal selection copies every written cell, so any glyph prefix leaks
+/// into text users copy from a reply, even a one-row marker on a reply that
+/// is a single command. Code-block rows are therefore written verbatim at
+/// column 0: a copied block (a heredoc, indentation-sensitive code) matches
+/// its source exactly. Prose rows get a 2-col plain-space indent, which
+/// shells ignore. Live responses keep the distinct focus gutter supplied by
+/// `LiveFramedCell`.
+fn prefix_settled_row(row: MarkdownRow) -> Line<'static> {
     if row.verbatim {
         return row.line;
     }
-    let prefix = if body_row == 0 {
-        Span::styled(
-            "● ",
-            Style::default().fg(crate::tui::theme::current().success),
-        )
-    } else {
-        Span::raw("  ")
-    };
     let mut spans = Vec::with_capacity(row.line.spans.len() + 1);
-    spans.push(prefix);
+    spans.push(Span::raw("  "));
     spans.extend(row.line.spans);
     Line::from(spans)
 }
@@ -1101,15 +1088,15 @@ mod tests {
     }
 
     #[test]
-    fn settled_assistant_marker_matches_terminal_success_marker() {
-        let c = AssistantCell::from_markdown("done");
-        let lines = c.display_lines(40);
-        let marker = lines
-            .first()
-            .and_then(|line| line.spans.first())
-            .expect("settled assistant has a marker");
-        assert_eq!(marker.content.as_ref(), "● ");
-        assert_eq!(marker.style.fg, Some(crate::tui::theme::current().success));
+    fn settled_single_line_command_reply_copies_without_glyphs() {
+        for source in ["`git status`", "git status"] {
+            let c = AssistantCell::from_markdown(source);
+            let (scrollback, _, complete) = c.scrollback_lines_chunk(80, 0, usize::MAX);
+            assert!(complete);
+            for lines in [c.display_lines(80), scrollback] {
+                assert_eq!(line_text(&lines), "  git status", "{source:?}");
+            }
+        }
     }
 
     #[test]
@@ -1131,7 +1118,7 @@ mod tests {
                     text.contains(&format!("\n{block}\n")) || text.ends_with(&format!("\n{block}")),
                     "{source:?} rendered {text:?}"
                 );
-                assert_eq!(text.matches('●').count(), 1, "{text}");
+                assert!(!text.contains('●'), "{text}");
                 assert!(!text.contains('█'), "{text}");
             }
         }
@@ -1183,12 +1170,12 @@ mod tests {
         assert_eq!(second.len(), 3);
         assert_eq!(next, 6);
         assert!(!complete);
-        assert_eq!(first[0].spans[0].content.as_ref(), "● ");
-        assert_eq!(first[1].spans[0].content.as_ref(), "  ");
-        assert_eq!(
-            second[0].spans[0].content.as_ref(),
-            "  ",
-            "a later chunk continues the body instead of restarting the marker"
+        assert!(
+            first
+                .iter()
+                .chain(&second)
+                .all(|line| line.spans[0].content.as_ref() == "  "),
+            "every chunk indents prose rows with plain spaces"
         );
     }
 
