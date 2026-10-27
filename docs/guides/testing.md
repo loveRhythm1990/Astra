@@ -340,6 +340,15 @@ The initial test roles are deliberately distinct from a claim of full support:
 | Published Edge 0.2.10, source `5aacae0d` | Explicit schema v1 rejection and upgrade guidance; it is not a positive execution baseline |
 | Candidate CLI | Explicit v2 discovery and ordinary chat through the real candidate Server; rollback checks identify the exact historical Server source rather than calling it current Prod |
 
+Cold resume after cancellation starts with a real completed turn and verifies
+its committed cursor before interrupting the following turn. Cancellation must
+preserve that cursor; a new CLI process must resume the same Session with a
+different completed Run while the cancelled Run remains cancelled. A separate
+first-turn cancellation verifies the existing boundary: cancellation revokes
+that turn's Context, so a Session with no committed history returns 404 from
+the hydration API and the historical CLI explicitly rejects cold resume. Raw
+transcript evidence is not promoted into invented canonical history.
+
 The CLI 0.2.10 sample matches the old response-field contract. This does not
 identify the original screenshot's client/server pair. Unversioned clients
 share the frozen v1 response and do not receive v2 pricing or protocol-aware

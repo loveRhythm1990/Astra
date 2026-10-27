@@ -423,9 +423,11 @@ def session_runs(origin, token, session):
     return snapshot["runs"]
 
 
-def session_root(origin, token, session, model):
+def session_root(origin, token, session, model, run_id=None, excluded_runs=()):
     roots = [run for run in session_runs(origin, token, session)
-             if run.get("depth") == 0 and run.get("parent_run_id") is None]
+             if run.get("depth") == 0 and run.get("parent_run_id") is None
+             and run.get("run_id") not in excluded_runs
+             and (run_id is None or run.get("run_id") == run_id)]
     require(len(roots) == 1, "server_run_ambiguous")
     root = roots[0]
     require(bool(root.get("run_id")), "server_run_identity_missing")
@@ -434,10 +436,10 @@ def session_root(origin, token, session, model):
 
 
 def settled_session_run(origin, token, session, model, expected_status, run_id=None):
-    # Each journey has a fresh session; no other turn can supply its terminal.
+    # A fresh session has one root; later turns must name their exact Run.
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
-        root = session_root(origin, token, session, model)
+        root = session_root(origin, token, session, model, run_id)
         require(run_id is None or run_id == root["run_id"], "server_run_identity_changed")
         run_id = root["run_id"]
         if root.get("status") == expected_status:
@@ -497,20 +499,43 @@ def approvals(binary, env, home, origin, token, model, provider, report, client)
         rpc.close()
 
 
-def cancellation(binary, env, home, origin, token, model, provider):
-    provider.case = "cancellation"
-    provider.mode = "cancel"
-    provider.arrived.clear()
-    provider.release.clear()
+def cancellation(binary, env, home, origin, token, model, provider, seed_history=False):
     rpc = Rpc(binary, env, home, origin, model)
     try:
         rpc.send("initialize", {})
         thread = rpc.send("thread/start", {})["thread"]["id"]
         require(not session_runs(origin, token, thread), "cancel_session_not_fresh")
+        seed_run = None
+        seed_cursor = None
+        if seed_history:
+            # Cancellation revokes the current turn's Context; it must not
+            # manufacture a head for a never-completed conversation. Establish
+            # real committed history before testing cross-process cold resume.
+            provider.case = "cancellation-history-seed"
+            provider.mode = "text"
+            turn = rpc.send("turn/start", {"threadId": thread,
+                "input": [{"type": "text", "text": "Establish committed history: " + provider.marker}]})["turn"]["id"]
+            terminal = rpc.wait(lambda event: event.get("method") == "turn/completed"
+                                and event.get("params", {}).get("threadId") == thread
+                                and event.get("params", {}).get("turn", {}).get("id") == turn)
+            require(terminal["params"].get("status") == "completed", "resume_history_seed_failed")
+            answer = rpc.wait(lambda event: event.get("method") == "item/completed"
+                              and event.get("params", {}).get("item", {}).get("type") == "agentMessage")
+            require(answer["params"]["item"].get("text") == provider.marker, "resume_history_seed_answer_mismatch")
+            seed_run = settled_session_run(origin, token, thread, model, "completed")
+            restored = request(origin, "/sessions/" + thread + "/resume", token, {})
+            seed_cursor = restored.get("resume_bundle", {}).get("cursor")
+            require(isinstance(seed_cursor, dict) and seed_cursor.get("completed_turn", 0) > 0,
+                    "resume_history_seed_not_committed")
+        provider.case = "cancellation-after-history" if seed_history else "cancellation-first-turn"
+        provider.mode = "cancel"
+        provider.arrived.clear()
+        provider.release.clear()
         turn = rpc.send("turn/start", {"threadId": thread,
             "input": [{"type": "text", "text": "Wait until cancelled: " + provider.marker}]})["turn"]["id"]
         require(provider.arrived.wait(60), "cancel_run_not_admitted")
-        run_id = session_root(origin, token, thread, model)["run_id"]
+        run_id = session_root(origin, token, thread, model,
+                              excluded_runs=() if seed_run is None else (seed_run,))["run_id"]
         interrupted = rpc.send("turn/interrupt", {"threadId": thread, "turnId": turn})
         require(interrupted.get("ok") is True, "cancel_not_acknowledged")
         terminal = rpc.wait(lambda event: event.get("method") == "turn/completed"
@@ -520,6 +545,17 @@ def cancellation(binary, env, home, origin, token, model, provider):
         # status, rather than that display label, proves cancellation settled.
         require(terminal["params"].get("status") == "failed", "cancel_client_terminal_mismatch")
         settled_session_run(origin, token, thread, model, "cancelled", run_id)
+        if seed_history:
+            restored = request(origin, "/sessions/" + thread + "/resume", token, {})
+            require(restored.get("resume_bundle", {}).get("cursor") == seed_cursor,
+                    "cancelled_turn_changed_committed_history")
+        else:
+            try:
+                request(origin, "/sessions/" + thread + "/resume", token, {})
+            except Failure as error:
+                require(str(error) == "server_http_404", "cancel_without_history_unexpected_restore_error")
+            else:
+                raise Failure("cancel_without_history_invented_resume_state")
         return thread, run_id
     finally:
         provider.mode = "text"
@@ -746,13 +782,25 @@ def run(args, report):
                     report["cases"].append({"client": version, "case": "ordinary_chat", "status": "passed"})
                     approvals(binary, env, home, origin, token, model, provider, report, version)
                     report["cases"].append({"client": version, "case": "tool_approval_allow_and_deny", "status": "passed"})
-                    begin_case(report, version, "cancel_authoritative_settlement")
-                    session, cancelled_run = cancellation(binary, env, home, origin, token, model, provider)
+                    begin_case(report, version, "cancel_before_first_commit")
+                    empty_session, _ = cancellation(binary, env, home, origin, token, model, provider)
+                    empty_resume = command(binary, env, home, [*one_shot_chat_base(origin, model),
+                        "--json", "--session-id", empty_session, "-m", "Continue: " + provider.marker])
+                    require(empty_resume.returncode != 0
+                            and b"no restorable canonical state" in empty_resume.stderr,
+                            "cancel_without_history_client_not_explicitly_rejected")
+                    report["cases"].append({"client": version, "case": "cancel_before_first_commit",
+                        "status": "passed", "resume": "no_committed_history"})
+                    begin_case(report, version, "cancel_with_committed_history")
+                    session, cancelled_run = cancellation(binary, env, home, origin, token, model, provider,
+                                                          seed_history=True)
                     provider.case = "resume-after-cancellation"
                     begin_case(report, version, "resume_after_cancellation")
                     resumed = completed(command(binary, env, home, [*one_shot_chat_base(origin, model), "--json", "--session-id", session, "-m", "Continue after cancellation: " + provider.marker]), provider.marker)
                     require(resumed["session_id"] == session and resumed["run_id"] != cancelled_run,
                             "resume_run_identity_mismatch")
+                    settled_session_run(origin, token, session, model, "completed", resumed["run_id"])
+                    settled_session_run(origin, token, session, model, "cancelled", cancelled_run)
                     report["cases"].append({"client": version, "case": "cancel_and_resume", "status": "passed"})
                 edge_case(artifacts / version / "astra-edge", env, home, origin, token, version, model, provider, report)
                 report["cases"].append({"client": version, "case": "edge_handshake_and_tool_execution" if version == "0.2.12" else "edge_schema1_rejection", "status": "passed"})
