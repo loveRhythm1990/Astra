@@ -360,7 +360,9 @@ production router with fresh storage, then invokes
 and the already-built candidate CLI. The provider is a finite, controlled
 OpenAI wire fixture. Client state is isolated in temporary HOME/XDG/workspace
 directories, and authorization, tool admission, approvals, and persistence
-still cross their production owners. The special performance/capture-SHA
+still cross their production owners. Each CLI logs the synthetic fixture account
+into its isolated profile through `admin login`; a bearer environment variable
+alone is not a bound stdio profile. The special performance/capture-SHA
 baseline is not loosened to accept historical clients.
 
 Both IDC and public candidate-image smoke jobs invoke the same driver after

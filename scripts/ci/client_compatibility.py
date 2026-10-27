@@ -73,7 +73,7 @@ def child_environment(home, origin, token):
         "XDG_CACHE_HOME": str(home / ".cache"), "XDG_DATA_HOME": str(home / ".local/share"),
         "ASTRA_CLI_CREDENTIALS_DIR": str(home / ".astra"),
         "ASTRA_LOCAL_STATE_ROOT": str(home / ".astra"),
-        "ASTRA_ACCESS_TOKEN": token, "ASTRA_TOKEN": token,
+        "ASTRA_TOKEN": token,
         "ASTRA_API_URL": origin, "ASTRA_SERVER_URL": origin,
         "NO_COLOR": "1", "NO_PROXY": "*", "no_proxy": "*",
     })
@@ -90,6 +90,15 @@ def command(binary, env, home, args, timeout=120):
 
 def cli_base(origin, model):
     return ["--api-url", origin, "--profile", "compatibility", "--model", model, "--no-instructions"]
+
+
+def authenticate_cli(binary, env, home, origin, username, password):
+    # The stdio owner requires a bound profile even when one-shot commands
+    # accept a bearer environment variable. Populate it through real login,
+    # never by inventing a credential-file schema or reading developer state.
+    result = command(binary, env, home, ["--api-url", origin, "--profile", "compatibility",
+                     "admin", "login", "--username", username, "--password", password])
+    require(result.returncode == 0, "client_profile_login_failed")
 
 
 def result_json(result):
@@ -510,8 +519,9 @@ def edge_case(binary, env, home, origin, token, version, model, provider, report
 
 def bootstrap(origin, provider, provider_host):
     user = "compatibility_" + uuid.uuid4().hex
+    password = uuid.uuid4().hex + "Aa9!"
     registered = request(origin, "/admin/register", payload={"username": user,
-        "email": user + "@example.test", "password": uuid.uuid4().hex + "Aa9!", "display_name": "CI compatibility"})
+        "email": user + "@example.test", "password": password, "display_name": "CI compatibility"})
     token = registered["access_token"]
     model = "compatibility-" + uuid.uuid4().hex
     request(origin, "/models", token, {"name": model, "provider": "openai", "api_key": "synthetic-only",
@@ -519,7 +529,7 @@ def bootstrap(origin, provider, provider_host):
         "context_window": 128000, "max_completion_tokens": 1024, "supported_parameters": ["tools"],
         "tags": ["chat", "code"], "quirks": {"thinking_protocol": "unknown"}})
     provider.expected_model = model
-    return token, model
+    return token, model, user, password
 
 
 def rollback(args, artifacts, report):
@@ -563,11 +573,13 @@ def rollback(args, artifacts, report):
             require(health.get("build_git_sha") == "70a5ee3ec25bb3b02d3f591675a13abc33a85159",
                     "released_server_source_mismatch")
             begin_case(report, "candidate", "released_server_bootstrap")
-            token, model = bootstrap(origin, provider, "127.0.0.1")
+            token, model, username, password = bootstrap(origin, provider, "127.0.0.1")
             provider.case = "rollback-chat"
             with tempfile.TemporaryDirectory(prefix="astra-rollback-client-") as client_directory:
                 client_home = Path(client_directory)
                 client_env = child_environment(client_home, origin, token)
+                begin_case(report, "candidate", "login_against_released_server")
+                authenticate_cli(args.current_cli.resolve(), client_env, client_home, origin, username, password)
                 begin_case(report, "candidate", "catalog_against_released_server")
                 listed = command(args.current_cli.resolve(), client_env, client_home,
                                  [*cli_base(origin, model), "model", "list"])
@@ -601,7 +613,7 @@ def run(args, report):
     provider = Provider()
     try:
         begin_case(report, "server", "bootstrap")
-        token, model = bootstrap(origin, provider, args.provider_host)
+        token, model, username, password = bootstrap(origin, provider, args.provider_host)
         for baseline in baseline_document()["baselines"]:
             version = baseline["version"]
             with tempfile.TemporaryDirectory(prefix="astra-compatibility-") as directory:
@@ -614,6 +626,8 @@ def run(args, report):
                 begin_case(report, version, "cli_component_version")
                 identity = command(binary, env, home, ["--version"])
                 require(identity.returncode == 0 and version in identity.stdout.decode(), "client_version_mismatch")
+                begin_case(report, version, "profile_login")
+                authenticate_cli(binary, env, home, origin, username, password)
                 begin_case(report, version, "model_catalog")
                 listed = command(binary, env, home, [*cli_base(origin, model), "model", "list"])
                 require(listed.returncode == 0 and model in listed.stdout.decode(errors="replace"), "historical_catalog_unreadable")
@@ -646,6 +660,8 @@ def run(args, report):
                 env = child_environment(home, origin, token)
                 begin_case(report, "candidate", "cli_component_identity")
                 identify_current(args.current_cli.resolve(), env, home, report)
+                begin_case(report, "candidate", "profile_login")
+                authenticate_cli(args.current_cli.resolve(), env, home, origin, username, password)
                 provider.case = "candidate-chat"
                 begin_case(report, "candidate", "ordinary_chat")
                 completed(command(args.current_cli.resolve(), env, home,
