@@ -501,6 +501,7 @@ system HTTP journeys. Run this test by exact name in its own process because
 it owns the global SQL tracing subscriber:
 
 ```bash
+MEMORIA_SELF_HOSTED_MASTER_ACCESS=1 \
 cargo test -p astra-runtime --features e2e-hooks --test chat_sql_budget \
   ordinary_chat_and_readonly_rounds_have_bounded_total_sql -- --ignored --exact --nocapture
 ```
@@ -519,6 +520,10 @@ The readonly-round comparison accounts for exact periodic control reads and
 at most one account/session authentication snapshot when its 30-second cache
 expires. Those statements still count toward the raw 20-statement limit;
 repeated authentication snapshots or any other extra readonly-round SQL fail.
+The HTTP fixture binds both the Memoria URL and its master credential to the
+strict local mock. Enabling self-hosted access exercises the authenticated
+observer request, including its authority queries; a run with access disabled
+does not validate that HTTP path. Wrong credentials still fail authentication.
 
 ### Durable provider concurrency and cancellation
 

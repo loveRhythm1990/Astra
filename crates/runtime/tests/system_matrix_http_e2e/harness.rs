@@ -175,6 +175,13 @@ pub fn build_e2e_access_token(user_id: &str, username: &str, exp_unix: u64) -> S
     )
 }
 
+const MOCK_MEMORIA_MASTER_KEY: &str = "system-e2e-mock-master-key";
+
+fn bind_mock_memoria(settings: &mut astra_core::MemoriaSettings, base_url: String) {
+    settings.base_url = base_url;
+    settings.master_key = Some(MOCK_MEMORIA_MASTER_KEY.to_owned());
+}
+
 async fn build_state(
     memoria: Arc<E2eMemoriaStub>,
     memoria_base_url: String,
@@ -189,7 +196,7 @@ async fn build_state(
     // independently of the forwarder replaced below. Bind every client to
     // the fixture before construction; never let this mock-provider suite
     // observe or mutate the Memoria service configured in a developer's env.
-    settings.memoria.base_url = memoria_base_url;
+    bind_mock_memoria(&mut settings.memoria, memoria_base_url);
     let matrixone_database = settings.matrixone.database.clone();
     let url = settings.matrixone.database_url_with_password();
     let state = build_server_state(settings).await;
@@ -261,7 +268,7 @@ async fn start_mock_memoria() -> String {
             post(|headers: axum::http::HeaderMap| async move {
                 memoria_observer_auth::validate_observer_auth(
                     &headers,
-                    "system-e2e-mock-master-key",
+                    MOCK_MEMORIA_MASTER_KEY,
                     None,
                 )
                 .err()
@@ -323,10 +330,20 @@ async fn mock_memoria_accepts_production_observer_without_blanket_success() {
     use astra_runtime::{DatabaseTurnObserverWorker, TurnObserverRequest, TurnObserverWorker};
 
     let base_url = start_mock_memoria().await;
+    // Mirror build_state: credentials inherited from CI/developer settings
+    // belong to the replaced upstream, not to this strict local mock.
+    let mut settings = astra_core::MemoriaSettings {
+        base_url: "http://127.0.0.1:1".to_owned(),
+        master_key: Some("different-upstream-test-key".to_owned()),
+        self_hosted_master_access: true,
+        issuer: None,
+        web_url: None,
+    };
+    bind_mock_memoria(&mut settings, base_url.clone());
     let observer = DatabaseTurnObserverWorker::new(Some(Arc::new(
         astra_runtime::turn::cloud::memoria_compact::HttpMemoriaPort::self_hosted(
-            base_url.clone(),
-            "system-e2e-mock-master-key".to_string(),
+            settings.base_url,
+            settings.master_key.unwrap(),
         ),
     )));
     tokio::time::timeout(
@@ -353,12 +370,27 @@ async fn mock_memoria_accepts_production_observer_without_blanket_success() {
         .build()
         .unwrap()
         .post(format!("{base_url}/v1/observe"))
-        .header("Authorization", "Memoria-Owner system-e2e-mock-master-key")
+        .header(
+            "Authorization",
+            format!("Memoria-Owner {MOCK_MEMORIA_MASTER_KEY}"),
+        )
         .header("X-Impersonate-User", "fixture-user")
         .send()
         .await
         .unwrap();
     assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    let foreign_credential = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("{base_url}/v1/observe"))
+        .header("Authorization", "Memoria-Owner different-upstream-test-key")
+        .header("X-User-Id", "fixture-user")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign_credential.status(), StatusCode::UNAUTHORIZED);
 
     let response = reqwest::Client::builder()
         .no_proxy()
