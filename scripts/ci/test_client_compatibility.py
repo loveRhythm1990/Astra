@@ -1,8 +1,9 @@
 """Ensure synthetic compatibility diagnostics do not expose secrets or locations."""
 
 import unittest
+from subprocess import CompletedProcess
 
-from client_compatibility import paired_tool_result, safe_error_summary
+from client_compatibility import Failure, paired_tool_result, result_json, safe_error_summary
 
 
 class CompatibilityDiagnosticsTests(unittest.TestCase):
@@ -27,6 +28,20 @@ class CompatibilityDiagnosticsTests(unittest.TestCase):
     def test_summary_is_bounded_and_does_not_accept_structured_raw_responses(self):
         self.assertIsNone(safe_error_summary({"error": "untrusted body"}))
         self.assertLessEqual(len(safe_error_summary("safe diagnostic " * 300)), 1024)
+
+    def test_non_json_preflight_failure_keeps_only_redacted_diagnostics(self):
+        result = CompletedProcess([], 2, stdout=b"", stderr=(
+            b"resume bundle schema 9 is unsupported; password=synthetic-secret "
+            b"https://fixture.invalid/private /home/fixture/private-file"))
+        with self.assertRaises(Failure) as caught:
+            result_json(result)
+        self.assertEqual(str(caught.exception), "client_terminal_invalid")
+        diagnostics = caught.exception.diagnostics
+        self.assertEqual(diagnostics["exit_code"], 2)
+        self.assertNotIn("stdout_summary", diagnostics)
+        self.assertIn("resume bundle schema 9 is unsupported", diagnostics["stderr_summary"])
+        for forbidden in ("synthetic-secret", "fixture.invalid", "private-file"):
+            self.assertNotIn(forbidden, diagnostics["stderr_summary"])
 
 
 class CompatibilityToolHistoryTests(unittest.TestCase):

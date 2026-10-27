@@ -115,7 +115,18 @@ def result_json(result):
     try:
         body = json.loads(result.stdout)
     except (ValueError, UnicodeDecodeError):
-        raise Failure("client_terminal_invalid") from None
+        # Historical clients can fail during command preflight before their
+        # JSON terminal writer is entered. Retain bounded, redacted evidence
+        # from this isolated synthetic command instead of losing the cause.
+        diagnostics = {"exit_code": result.returncode}
+        for name in ("stdout", "stderr"):
+            output = getattr(result, name)
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            summary = safe_error_summary(output)
+            if summary:
+                diagnostics[name + "_summary"] = summary
+        raise Failure("client_terminal_invalid", diagnostics) from None
     require(isinstance(body, dict), "client_terminal_shape")
     return body
 
