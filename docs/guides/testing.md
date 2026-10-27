@@ -372,6 +372,10 @@ Tool journeys pair their own case-specific call IDs with a unique preceding
 assistant declaration and tool result in the complete provider request. A
 runtime context suffix may legitimately appear as `role=user` after a tool
 result, so the fixture never treats the last user-role message as a turn boundary.
+After an approved write, the controlled model performs a full `read_file` of
+the same target and checks its real content before returning its single final
+answer. This satisfies the existing post-mutation observation boundary. The
+denied-write branch performs no readback and must leave the target absent.
 
 Both IDC and public candidate-image smoke jobs invoke the same driver after
 the existing candidate digest/revision and stack health checks. They reuse

@@ -209,6 +209,8 @@ class Provider:
         self.arrived = threading.Event()
         self.release = threading.Event()
         self.tool_result_seen = False
+        self.require_readback = False
+        self.readback_verified = False
         self.expected_model = None
         self.case = None
         self.claimed = set()
@@ -237,25 +239,42 @@ class Provider:
                     owner.release.wait(30)
                 messages = body.get("messages", [])
                 operation_id = "compat-operation-" + str(case)
-                search_id = "compat-search-" + str(case)
+                readback_id = "compat-readback-" + str(case)
                 with owner.lock:
                     issued_operation = (case, operation_id) in owner.claimed
-                    issued_search = (case, search_id) in owner.claimed
+                    issued_readback = (case, readback_id) in owner.claimed
                 tool_result = (paired_tool_result(messages, operation_id, owner.tool_name)
                                if issued_operation else None)
-                if mode == "tool" and not tool_result:
+                desired_tool, call_id = owner.tool_name, operation_id
+                if mode == "tool" and tool_result is not None:
+                    owner.tool_result_seen = True
+                    desired_tool = None
+                    if owner.require_readback:
+                        readback = (paired_tool_result(messages, readback_id, "read_file")
+                                    if issued_readback else None)
+                        if readback is None:
+                            desired_tool, call_id = "read_file", readback_id
+                        elif owner.marker not in json.dumps(readback.get("content")):
+                            owner.errors.append("readback_content_missing")
+                            return mock.write_json(self, mock.HTTPStatus.BAD_REQUEST,
+                                                   {"error": {"code": "fixture_readback_content_missing"}})
+                        else:
+                            owner.readback_verified = True
+                if mode == "tool" and desired_tool is not None:
                     names = {tool.get("function", {}).get("name") for tool in body.get("tools", [])}
-                    tool = owner.tool_name if owner.tool_name in names else None
+                    tool = desired_tool if desired_tool in names else None
                     arguments = {"path": owner.target}
                     if tool == "write_file":
                         arguments["content"] = owner.marker + "\n"
-                    call_id = operation_id
+                    search_id = "compat-search-" + desired_tool + "-" + str(case)
+                    with owner.lock:
+                        issued_search = (case, search_id) in owner.claimed
                     search_result = (paired_tool_result(messages, search_id, "tool_search")
                                      if issued_search else None)
                     if not tool and "tool_search" in names and search_result is None:
                         # Discover through the real admission owner, never inject a hidden tool.
                         tool = "tool_search"
-                        arguments = {"query": "select:" + owner.tool_name}
+                        arguments = {"query": "select:" + desired_tool}
                         call_id = search_id
                     if not tool:
                         owner.errors.append("tool_not_admitted")
@@ -432,6 +451,8 @@ def approvals(binary, env, home, origin, token, model, provider, report, client)
             provider.tool_name = "write_file"
             provider.target = "compatibility-" + decision + ".txt"
             provider.tool_result_seen = False
+            provider.require_readback = decision == "allow_once"
+            provider.readback_verified = False
             turn = rpc.send("turn/start", {"threadId": thread,
                 "input": [{"type": "text", "text": "Write the synthetic compatibility fixture: " + provider.marker}],
                 "permissionMode": "prompt"})["turn"]["id"]
@@ -442,19 +463,26 @@ def approvals(binary, env, home, origin, token, model, provider, report, client)
             rpc.send("approval/respond", {"approvalId": approval["id"], "decision": decision})
             terminal = rpc.wait(lambda event: event.get("method") == "turn/completed"
                                 and event.get("params", {}).get("turn", {}).get("id") == turn)
-            require(terminal["params"]["status"] == "completed", "approved_turn_failed")
+            content_matches = target.is_file() and target.read_bytes() == (provider.marker + "\n").encode()
+            observations = {"file_exists": target.is_file(), "content_matches": content_matches,
+                            "tool_result_seen": provider.tool_result_seen,
+                            "readback_verified": provider.readback_verified}
+            report.setdefault("approval_observations", {})[decision] = observations
+            if terminal["params"]["status"] != "completed":
+                raise Failure("approved_turn_failed", observations)
             answer = rpc.wait(lambda event: event.get("method") == "item/completed"
                               and event.get("params", {}).get("item", {}).get("type") == "agentMessage")
             require(answer["params"]["item"].get("text") == provider.marker, "approval_answer_mismatch")
             settled_session_run(origin, token, thread, model, "completed")
             require(provider.tool_result_seen, "tool_result_not_returned_to_model")
             if decision == "allow_once":
-                require(target.is_file() and target.read_bytes() == (provider.marker + "\n").encode(),
-                        "approved_write_missing")
+                require(content_matches, "approved_write_missing")
+                require(provider.readback_verified, "approved_write_readback_missing")
             else:
                 require(not target.exists(), "denied_write_executed")
     finally:
         provider.mode = "text"
+        provider.require_readback = False
         rpc.close()
 
 
