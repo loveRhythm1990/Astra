@@ -370,8 +370,10 @@ required job results include these failures; no skip, retry, or larger timeout
 is used to turn a failure into success.
 
 Reports record exact artifact/source identities, scenario outcomes, failure
-categories, and elapsed time. They do not contain tokens, raw client output,
-provider responses, or user data. Passing a catalog parser test is not a full
+categories, and elapsed time. PR jobs retain the JSON report in the job summary
+without changing the existing CLI JUnit timing artifact. Candidate-image jobs
+also upload the report as a standalone artifact. Reports do not contain tokens,
+raw client output, provider responses, or user data. Passing a catalog parser test is not a full
 conversation result. Support is advertised only for the exact successful
 combinations and feature scopes recorded by CI; testing two versions does not
 prove every intervening version or all-platform installation behavior.

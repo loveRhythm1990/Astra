@@ -219,7 +219,8 @@ jobs:
         run: |
           set -euo pipefail
           digest_files=(/tmp/digest/*)
-          export ASTRA_COMPAT_SERVER_IMAGE_DIGEST="sha256:$(basename "${digest_files[0]}")"
+          ASTRA_COMPAT_SERVER_IMAGE_DIGEST="sha256:$(basename "${digest_files[0]}")"
+          export ASTRA_COMPAT_SERVER_IMAGE_DIGEST
           python3 scripts/ci/client_compatibility.py \
             --api-url http://127.0.0.1:17001 \
             --provider-host host.docker.internal \

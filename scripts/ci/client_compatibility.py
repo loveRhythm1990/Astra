@@ -686,7 +686,12 @@ def main():
         signal.alarm(0)
         report["elapsed_seconds"] = round(time.monotonic() - started, 3)
         args.report.parent.mkdir(parents=True, exist_ok=True)
-        args.report.write_text(json.dumps(report, indent=2) + "\n")
+        serialized = json.dumps(report, indent=2) + "\n"
+        args.report.write_text(serialized)
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            with Path(summary).open("a") as output:
+                output.write("\n### Historical client compatibility\n\n```json\n" + serialized + "```\n")
     print("Historical client compatibility: " + report["status"])
     return 0 if report["status"] == "passed" else 1
 
