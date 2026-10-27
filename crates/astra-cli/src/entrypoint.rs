@@ -57,10 +57,13 @@ use cli::project_instructions::{
 
 /// Variables that relocate trusted user state (credentials, user-level
 /// configuration, permissions and workspace trust). A workspace `.env` must
-/// not supply them; only the launching shell may.
-const SHELL_ONLY_ENV: [&str; 2] = [
+/// not supply them; only the launching shell may. `HOME` is the fallback root
+/// for all of these when the others are unset, so a sanitized environment
+/// without it must not let the workspace choose it.
+const SHELL_ONLY_ENV: [&str; 3] = [
     "MOI_AUTH_DIR",
     astra_core::local_state::ASTRA_LOCAL_STATE_ROOT_ENV,
+    "HOME",
 ];
 
 fn validate_shell_only_source(

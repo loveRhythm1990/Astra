@@ -206,7 +206,8 @@ do not delete identity files or login credentials as a repair step.
 `ASTRA_LOCAL_STATE_ROOT` relocates user-level state, including the user
 configuration, permissions and workspace trust, so it must be set in the
 launching shell. The CLI exits with an error when a workspace `.env` supplies it,
-as it does for `MOI_AUTH_DIR`.
+as it does for `MOI_AUTH_DIR`. The same applies to `HOME`, the fallback root for
+all of these state locations, when the launching environment does not set it.
 
 The configuration editor saves user defaults under `ASTRA_LOCAL_STATE_ROOT/config/runtime.toml`
 when that root is set, otherwise under `~/.astra/config/runtime.toml`; local versions
@@ -330,7 +331,8 @@ Only the user-level file and an explicit `--settings` overlay can set this
 section. A project `.astra/config/runtime.toml` cannot; the section is ignored
 with a warning. There is intentionally no environment variable, because the CLI
 loads `.env` from the working directory. For the same reason a workspace `.env`
-cannot set `ASTRA_LOCAL_STATE_ROOT`, which relocates the user-level file. Server
+cannot set `ASTRA_LOCAL_STATE_ROOT` or a missing `HOME`, which locate the
+user-level file. Server
 `web_fetch` never reads the section, and an invalid section leaves the default
 block in place with a warning.
 

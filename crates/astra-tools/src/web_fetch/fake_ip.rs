@@ -96,37 +96,37 @@ impl FakeIpPolicy {
         }
     }
 
-    /// Pass `host` only when a configured resolver reports addresses and all
-    /// of them are public. Fails closed when no resolver answers. Passing
-    /// does not bind the VPN's destination; see the module documentation.
+    /// Pass `host` only when a configured resolver gives complete, consistent
+    /// answers for both address families and every reported address is
+    /// public. Fails closed when no resolver does. Passing does not bind the
+    /// VPN's destination; see the module documentation.
     ///
-    /// A private address from either address family blocks the host even if
-    /// the other family's query failed: a later resolver must not be able to
-    /// outvote evidence that has already been seen.
+    /// A private address blocks the host even when it came from a truncated
+    /// response or the other family's query failed: a later resolver must not
+    /// be able to outvote evidence that has already been seen.
     pub(super) async fn screen(&self, host: &str) -> Result<(), SsrfBlockReason> {
         let mut name = Name::from_ascii(host).map_err(|_| SsrfBlockReason::FakeIpNoDohAnswer)?;
         name.set_fqdn(true);
         let mut failures = Vec::new();
         for (index, resolver) in self.resolvers.iter().enumerate() {
             let (v4, v6) = resolve_via_doh(resolver, &name).await;
-            let real: Vec<IpAddr> = [&v4, &v6]
-                .into_iter()
-                .filter_map(|family| family.as_ref().ok())
-                .flatten()
-                .copied()
-                .collect();
+            let real: Vec<IpAddr> = v4.addrs.iter().chain(&v6.addrs).copied().collect();
             if real.iter().any(|ip| is_private_ip(*ip)) {
                 return Err(SsrfBlockReason::FakeIpRealAddressPrivate(real));
             }
-            match (v4, v6) {
-                (Ok(_), Ok(_)) if real.is_empty() => {
-                    return Err(SsrfBlockReason::FakeIpNoDohAnswer);
+            let failure = match (&v4.status, &v6.status) {
+                (AnswerStatus::Failed(error), _) | (_, AnswerStatus::Failed(error)) => {
+                    error.clone()
                 }
-                (Ok(_), Ok(_)) => return Ok(()),
-                (Err(error), _) | (_, Err(error)) => {
-                    failures.push(format!("{}: {error}", resolver_label(index, resolver)));
+                // NXDOMAIN says the name has no records of any type.
+                (AnswerStatus::NxDomain, _) | (_, AnswerStatus::NxDomain) if !real.is_empty() => {
+                    "contradictory answers: NXDOMAIN for one address family, records for the other"
+                        .to_string()
                 }
-            }
+                _ if real.is_empty() => return Err(SsrfBlockReason::FakeIpNoDohAnswer),
+                _ => return Ok(()),
+            };
+            failures.push(format!("{}: {failure}", resolver_label(index, resolver)));
         }
         Err(SsrfBlockReason::FakeIpDohUnavailable(failures.join("; ")))
     }
@@ -179,12 +179,32 @@ fn parse_doh_resolver(index: usize, raw: &str) -> Result<url::Url, String> {
     Ok(url)
 }
 
+/// One address family's answer from one resolver.
+struct FamilyAnswer {
+    /// Addresses the response carried, even when it is unusable as a whole: a
+    /// private address in a truncated response is still evidence.
+    addrs: Vec<IpAddr>,
+    status: AnswerStatus,
+}
+
+enum AnswerStatus {
+    Complete,
+    NxDomain,
+    Failed(String),
+}
+
+impl FamilyAnswer {
+    fn failed(error: String) -> Self {
+        Self {
+            addrs: Vec::new(),
+            status: AnswerStatus::Failed(error),
+        }
+    }
+}
+
 /// A and AAAA answers from one resolver, kept apart so a failure in one
 /// family does not discard what the other reported.
-async fn resolve_via_doh(
-    resolver: &url::Url,
-    name: &Name,
-) -> (Result<Vec<IpAddr>, String>, Result<Vec<IpAddr>, String>) {
+async fn resolve_via_doh(resolver: &url::Url, name: &Name) -> (FamilyAnswer, FamilyAnswer) {
     let client = match astra_core::net::client_builder_for_target(resolver.as_str())
         .timeout(DOH_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
@@ -193,12 +213,19 @@ async fn resolve_via_doh(
         Ok(client) => client,
         Err(error) => {
             let error = format!("client init failed: {}", transport_failure(error));
-            return (Err(error.clone()), Err(error));
+            return (
+                FamilyAnswer::failed(error.clone()),
+                FamilyAnswer::failed(error),
+            );
         }
     };
-    futures::join!(
+    let (v4, v6) = futures::join!(
         query(&client, resolver, name, RecordType::A),
         query(&client, resolver, name, RecordType::AAAA)
+    );
+    (
+        v4.unwrap_or_else(FamilyAnswer::failed),
+        v6.unwrap_or_else(FamilyAnswer::failed),
     )
 }
 
@@ -207,7 +234,7 @@ async fn query(
     resolver: &url::Url,
     name: &Name,
     record_type: RecordType,
-) -> Result<Vec<IpAddr>, String> {
+) -> Result<FamilyAnswer, String> {
     // RFC 8484 recommends ID 0 so responses stay cacheable.
     let mut request = Message::new(0, MessageType::Query, OpCode::Query);
     request.metadata.recursion_desired = true;
@@ -235,19 +262,26 @@ async fn query(
     if answer.metadata.message_type != MessageType::Response {
         return Err("DNS response is not a response message".into());
     }
-    match answer.metadata.response_code {
-        ResponseCode::NoError => Ok(answer
-            .answers
-            .iter()
-            .filter_map(|record| match &record.data {
-                RData::A(a) => Some(IpAddr::V4(a.0)),
-                RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
-                _ => None,
-            })
-            .collect()),
-        ResponseCode::NXDomain => Ok(Vec::new()),
-        code => Err(format!("DNS response code {code}")),
-    }
+    let addrs = answer
+        .answers
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::A(a) => Some(IpAddr::V4(a.0)),
+            RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
+            _ => None,
+        })
+        .collect();
+    // A truncated response may have dropped records, including private ones.
+    let status = if answer.metadata.truncation {
+        AnswerStatus::Failed(format!("truncated {record_type} response"))
+    } else {
+        match answer.metadata.response_code {
+            ResponseCode::NoError => AnswerStatus::Complete,
+            ResponseCode::NXDomain => AnswerStatus::NxDomain,
+            code => AnswerStatus::Failed(format!("DNS response code {code}")),
+        }
+    };
+    Ok(FamilyAnswer { addrs, status })
 }
 
 /// Keep the underlying cause (for example "connection reset by peer"):
@@ -278,32 +312,49 @@ mod tests {
         FetchError, FetchNetwork, resolve_and_validate_host, validate_resolved_addrs,
     };
 
+    /// How a DoH fixture misanswers queries for one record type.
+    #[derive(Clone, Copy, Debug)]
+    enum Degrade {
+        Http503,
+        /// TC=1, still carrying the configured records.
+        Truncated,
+        /// NXDOMAIN with no records, while the other type answers normally.
+        NxDomain,
+    }
+
     /// A DoH endpoint answering A and AAAA queries from fixed record sets.
-    /// Queries for `failing` get HTTP 503.
     struct DohAnswers {
         code: ResponseCode,
         v4: Vec<Ipv4Addr>,
         v6: Vec<Ipv6Addr>,
-        failing: Option<RecordType>,
+        degraded: Option<(RecordType, Degrade)>,
     }
 
     impl Respond for DohAnswers {
         fn respond(&self, request: &Request) -> ResponseTemplate {
             let query = Message::from_vec(&request.body).expect("DNS query body");
             let question = query.queries[0].clone();
-            if Some(question.query_type()) == self.failing {
-                return ResponseTemplate::new(503);
-            }
+            let degrade = self
+                .degraded
+                .filter(|(record_type, _)| *record_type == question.query_type())
+                .map(|(_, degrade)| degrade);
             let mut response = Message::response(query.metadata.id, OpCode::Query);
             response.metadata.response_code = self.code;
+            match degrade {
+                Some(Degrade::Http503) => return ResponseTemplate::new(503),
+                Some(Degrade::Truncated) => response.metadata.truncation = true,
+                Some(Degrade::NxDomain) => response.metadata.response_code = ResponseCode::NXDomain,
+                None => {}
+            }
             let name = question.name().clone();
-            let records: Vec<Record> = match question.query_type() {
-                RecordType::A => self
+            let records: Vec<Record> = match (degrade, question.query_type()) {
+                (Some(Degrade::NxDomain), _) => Vec::new(),
+                (_, RecordType::A) => self
                     .v4
                     .iter()
                     .map(|ip| Record::from_rdata(name.clone(), 60, RData::A(A(*ip))))
                     .collect(),
-                RecordType::AAAA => self
+                (_, RecordType::AAAA) => self
                     .v6
                     .iter()
                     .map(|ip| Record::from_rdata(name.clone(), 60, RData::AAAA(AAAA(*ip))))
@@ -318,14 +369,14 @@ mod tests {
     }
 
     async fn doh(code: ResponseCode, v4: &[&str], v6: &[&str]) -> MockServer {
-        doh_failing(code, v4, v6, None).await
+        doh_degraded(code, v4, v6, None).await
     }
 
-    async fn doh_failing(
+    async fn doh_degraded(
         code: ResponseCode,
         v4: &[&str],
         v6: &[&str],
-        failing: Option<RecordType>,
+        degraded: Option<(RecordType, Degrade)>,
     ) -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -334,7 +385,7 @@ mod tests {
                 code,
                 v4: v4.iter().map(|ip| ip.parse().unwrap()).collect(),
                 v6: v6.iter().map(|ip| ip.parse().unwrap()).collect(),
-                failing,
+                degraded,
             })
             .mount(&server)
             .await;
@@ -564,7 +615,13 @@ mod tests {
             (RecordType::AAAA, &["127.0.0.1"][..], &[][..]),
             (RecordType::A, &[][..], &["::1"][..]),
         ] {
-            let partial = doh_failing(ResponseCode::NoError, v4, v6, Some(failing)).await;
+            let partial = doh_degraded(
+                ResponseCode::NoError,
+                v4,
+                v6,
+                Some((failing, Degrade::Http503)),
+            )
+            .await;
             let error = validate_resolved_addrs(
                 "evil.example",
                 addrs(&["198.18.0.7"]),
@@ -578,11 +635,11 @@ mod tests {
             );
         }
         // A partial public answer is not proof either: try the next resolver.
-        let partial = doh_failing(
+        let partial = doh_degraded(
             ResponseCode::NoError,
             &["140.82.113.4"],
             &[],
-            Some(RecordType::AAAA),
+            Some((RecordType::AAAA, Degrade::Http503)),
         )
         .await;
         let error = validate_resolved_addrs(
@@ -595,6 +652,77 @@ mod tests {
         assert!(matches!(
             reason(error),
             SsrfBlockReason::FakeIpDohUnavailable(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn incomplete_or_contradictory_doh_answers_are_not_trusted() {
+        let public = doh(ResponseCode::NoError, &["140.82.113.4"], &[]).await;
+        for (degraded, v4, v6, expected) in [
+            (
+                (RecordType::A, Degrade::Truncated),
+                &["140.82.113.4"][..],
+                &[][..],
+                "truncated A response",
+            ),
+            (
+                (RecordType::AAAA, Degrade::Truncated),
+                &["140.82.113.4"][..],
+                &["2606:50c0:8000::154"][..],
+                "truncated AAAA response",
+            ),
+            (
+                (RecordType::A, Degrade::NxDomain),
+                &[][..],
+                &["2606:50c0:8000::154"][..],
+                "contradictory answers",
+            ),
+            (
+                (RecordType::AAAA, Degrade::NxDomain),
+                &["140.82.113.4"][..],
+                &[][..],
+                "contradictory answers",
+            ),
+        ] {
+            let suspect = doh_degraded(ResponseCode::NoError, v4, v6, Some(degraded)).await;
+            let error = validate_resolved_addrs(
+                "github.com",
+                addrs(&["198.18.0.23"]),
+                Some(&policy(&[&suspect])),
+            )
+            .await
+            .unwrap_err();
+            let SsrfBlockReason::FakeIpDohUnavailable(detail) = reason(error) else {
+                panic!("{degraded:?} must fail closed");
+            };
+            assert!(detail.contains(expected), "{degraded:?}: {detail}");
+            validate_resolved_addrs(
+                "github.com",
+                addrs(&["198.18.0.23"]),
+                Some(&policy(&[&suspect, &public])),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{degraded:?} must fall back: {error:?}"));
+        }
+
+        // What a truncated response did carry still counts as evidence.
+        let truncated = doh_degraded(
+            ResponseCode::NoError,
+            &["140.82.113.4", "127.0.0.1"],
+            &[],
+            Some((RecordType::A, Degrade::Truncated)),
+        )
+        .await;
+        let error = validate_resolved_addrs(
+            "evil.example",
+            addrs(&["198.18.0.7"]),
+            Some(&policy(&[&truncated, &public])),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            reason(error),
+            SsrfBlockReason::FakeIpRealAddressPrivate(_)
         ));
     }
 

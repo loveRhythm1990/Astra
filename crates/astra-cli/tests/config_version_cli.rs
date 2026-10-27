@@ -419,15 +419,17 @@ async fn workspace_dotenv_cannot_relocate_the_user_configuration_root() {
     "#,
     )
     .unwrap();
-    let run = |shell_root: Option<&std::path::Path>| {
+    let run_with = |shell_home: Option<&std::path::Path>, shell_root: Option<&std::path::Path>| {
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_astra"));
         command
             .env_clear()
-            .env("HOME", &home)
             .current_dir(workspace.path())
             .args(["config", "version", "current"])
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
+        if let Some(home) = shell_home {
+            command.env("HOME", home);
+        }
         if let Some(root) = shell_root {
             command.env("ASTRA_LOCAL_STATE_ROOT", root);
         }
@@ -438,6 +440,7 @@ async fn workspace_dotenv_cannot_relocate_the_user_configuration_root() {
                 .unwrap()
         }
     };
+    let run = |shell_root: Option<&std::path::Path>| run_with(Some(&home), shell_root);
     let hash = |config: &RuntimeConfig| {
         VersionId::from_toml_bytes(toml::to_string_pretty(config).unwrap().as_bytes())
     };
@@ -477,5 +480,33 @@ async fn workspace_dotenv_cannot_relocate_the_user_configuration_root() {
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
         hash(&opted_in).as_str()
+    );
+
+    // `HOME` is the fallback root. A sanitized environment without it must
+    // not let the `.env` point it at the workspace, whose `.astra` would then
+    // load unfiltered as the user layer.
+    std::fs::write(
+        workspace.path().join(".env"),
+        format!("HOME={}\n", workspace.path().display()),
+    )
+    .unwrap();
+    let output = run_with(None, None).await;
+    assert_eq!(output.status.code(), Some(2));
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        diagnostic.contains("HOME cannot be supplied by a workspace .env"),
+        "{diagnostic}"
+    );
+    assert!(output.stdout.is_empty());
+    // A shell HOME is kept; the `.env` value does not override it.
+    let output = run(None).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        hash(&RuntimeConfig::default()).as_str()
     );
 }
