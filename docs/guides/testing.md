@@ -362,7 +362,10 @@ OpenAI wire fixture. Client state is isolated in temporary HOME/XDG/workspace
 directories, and authorization, tool admission, approvals, and persistence
 still cross their production owners. Each CLI logs the synthetic fixture account
 into its isolated profile through `admin login`; a bearer environment variable
-alone is not a bound stdio profile. The special performance/capture-SHA
+alone is not a bound stdio profile. Captured one-shot chats explicitly select
+the published read-only `plan` permission mode because they have no terminal
+or approval channel; stdio approval journeys retain `prompt` mode and its real
+approval channel. The special performance/capture-SHA
 baseline is not loosened to accept historical clients.
 
 Both IDC and public candidate-image smoke jobs invoke the same driver after
