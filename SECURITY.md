@@ -88,9 +88,11 @@ beyond a development machine, review the
   `ASTRA_LOCAL_STATE_ROOT` or `MOI_AUTH_DIR`; set those in the shell.
 - Bind development services to loopback. `ASTRA_BIND_ADDRESS` defaults to
   `127.0.0.1` for a reason.
-- Leave Edge/CLI `[web_fetch] fake_ip_validation` off unless a fake-IP VPN
-  blocks web access. Enabling it trusts the VPN's routing and the configured
-  DoH resolver instead of the local SSRF address check; see the
+- Leave Edge/CLI `[web_fetch] fake_ip` at `block` unless a fake-IP VPN
+  blocks web access. `allow_doh_screened` relaxes the private-network SSRF
+  boundary for fake-IP answers: the VPN picks the real destination, and the
+  DoH screen cannot detect a host that answers the VPN with a private address;
+  see the
   [configuration reference](docs/reference/configuration.md#local-web_fetch-behind-fake-ip-dns).
 - Remember that Runner placement controls where execution happens, not where
   data goes. Model endpoints, context disclosure, and tool-result handling

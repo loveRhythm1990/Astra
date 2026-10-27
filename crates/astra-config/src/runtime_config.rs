@@ -86,27 +86,29 @@ pub const USER_ONLY_SECTIONS: &[&str] = &["web_fetch"];
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WebFetchConfig {
-    /// `off` (default) blocks fake-IP answers like any reserved address.
-    /// `doh` asks `doh_resolvers` for the real addresses and admits the
-    /// fetch only when every real address is public.
+    /// `block` (default) treats fake-IP answers like any reserved address.
+    /// `allow_doh_screened` relaxes the private-network boundary for them:
+    /// the fetch goes to the fake address, and the VPN chooses the real
+    /// destination. `doh_resolvers` only screen out hosts whose public DNS
+    /// answer is private; they cannot confirm where the VPN connects.
     #[serde(default)]
-    pub fake_ip_validation: FakeIpValidationMode,
+    pub fake_ip: FakeIpMode,
     /// IPv4 CIDRs the local DNS uses for fake answers. Empty means
     /// `198.18.0.0/15`; entries must lie inside that range.
     #[serde(default)]
     pub fake_ip_ranges: Vec<String>,
     /// HTTPS DNS-over-HTTPS endpoints (RFC 8484), tried in order. Required
-    /// when `fake_ip_validation = "doh"`; there is no built-in provider.
+    /// when `fake_ip = "allow_doh_screened"`; there is no built-in provider.
     #[serde(default)]
     pub doh_resolvers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum FakeIpValidationMode {
+pub enum FakeIpMode {
     #[default]
-    Off,
-    Doh,
+    Block,
+    AllowDohScreened,
 }
 
 /// Human-readable Explain Analyze report formats.
@@ -1232,8 +1234,9 @@ pub fn user_runtime_config_path() -> Option<PathBuf> {
 
 /// Parse a project `runtime.toml` without the sections only the user may set.
 fn project_layer_from_toml(content: &str) -> Result<RuntimeConfigLayer, OverlayError> {
-    let mut layer = RuntimeConfigLayer::from_toml(content)?;
-    for section in layer.remove_sections(USER_ONLY_SECTIONS) {
+    let (layer, ignored) =
+        RuntimeConfigLayer::from_toml_without_sections(content, USER_ONLY_SECTIONS)?;
+    for section in ignored {
         tracing::warn!(
             section,
             "ignoring user-only section in project runtime.toml; \
@@ -2263,17 +2266,17 @@ mod tests {
     #[test]
     fn project_layer_cannot_set_user_only_web_fetch_policy() {
         let user = RuntimeConfigLayer::from_toml(
-            "[web_fetch]\nfake_ip_validation = \"doh\"\ndoh_resolvers = [\"https://1.12.12.12/dns-query\"]\n",
+            "[web_fetch]\nfake_ip = \"allow_doh_screened\"\ndoh_resolvers = [\"https://1.12.12.12/dns-query\"]\n",
         )
         .unwrap()
         .apply_to(&RuntimeConfig::default())
         .unwrap();
-        assert_eq!(user.web_fetch.fake_ip_validation, FakeIpValidationMode::Doh);
+        assert_eq!(user.web_fetch.fake_ip, FakeIpMode::AllowDohScreened);
 
         // A cloned repository can neither enable nor redirect the opt-in, and
         // the rest of its project file still applies.
         let project = project_layer_from_toml(
-            "[web_fetch]\nfake_ip_validation = \"doh\"\ndoh_resolvers = [\"https://evil.example/dns-query\"]\n\
+            "[web_fetch]\nfake_ip = \"allow_doh_screened\"\ndoh_resolvers = [\"https://evil.example/dns-query\"]\n\
              [safety]\ntrust_mode = \"strict\"\n",
         )
         .unwrap();
@@ -2282,18 +2285,35 @@ mod tests {
         assert_eq!(merged.safety.trust_mode, Some(TrustModeSerde::Strict));
         let merged = project.apply_to(&user).unwrap();
         assert_eq!(merged.web_fetch, user.web_fetch);
+
+        // The ignored section is not validated, so a malformed one cannot
+        // discard the project's other settings.
+        for ignored in [
+            "[web_fetch]\nfake_ip = \"typo\"\n",
+            "[web_fetch]\nunknown_field = true\n",
+            "web_fetch = 3\n",
+        ] {
+            let project =
+                project_layer_from_toml(&format!("{ignored}[safety]\ntrust_mode = \"strict\"\n"))
+                    .unwrap_or_else(|error| panic!("{ignored}: {error}"));
+            let merged = project.apply_to(&RuntimeConfig::default()).unwrap();
+            assert_eq!(merged.web_fetch, WebFetchConfig::default());
+            assert_eq!(merged.safety.trust_mode, Some(TrustModeSerde::Strict));
+        }
+        // Other sections are still validated.
+        assert!(project_layer_from_toml("[safety]\ntrust_mode = \"typo\"\n").is_err());
     }
 
     #[test]
     fn web_fetch_policy_defaults_off_and_rejects_unknown_fields() {
         assert_eq!(
-            RuntimeConfig::default().web_fetch.fake_ip_validation,
-            FakeIpValidationMode::Off
+            RuntimeConfig::default().web_fetch.fake_ip,
+            FakeIpMode::Block
         );
-        assert!(RuntimeConfigLayer::from_toml("[web_fetch]\nfake_ip = true\n").is_err());
         assert!(
-            RuntimeConfigLayer::from_toml("[web_fetch]\nfake_ip_validation = \"on\"\n").is_err()
+            RuntimeConfigLayer::from_toml("[web_fetch]\nfake_ip_validation = \"doh\"\n").is_err()
         );
+        assert!(RuntimeConfigLayer::from_toml("[web_fetch]\nfake_ip = \"on\"\n").is_err());
     }
 
     #[test]

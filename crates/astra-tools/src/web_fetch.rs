@@ -132,7 +132,7 @@ enum SsrfBlockReason {
     /// addresses (an IPv6 fake range, or fake mixed with real addresses).
     FakeIpUnsupportedAnswer,
     FakeIpDohUnavailable(String),
-    FakeIpUnverified,
+    FakeIpNoDohAnswer,
     FakeIpRealAddressPrivate(Vec<IpAddr>),
 }
 
@@ -154,10 +154,12 @@ impl std::fmt::Display for SsrfBlock {
                 f,
                 "SSRF blocked: {host} resolves to {addrs}, inside {range}. Local VPN/proxy \
                  tools with fake-IP DNS (Clash/mihomo, Surge, sing-box) answer from this \
-                 range, so the real destination cannot be verified. The user can opt in \
-                 to DNS-over-HTTPS verification in their user-level runtime.toml \
-                 (~/.astra/config/runtime.toml):\n\n[web_fetch]\n\
-                 fake_ip_validation = \"doh\"\n\
+                 range and choose the real destination themselves, so Astra cannot check \
+                 it. The user can choose to relax private-network protection for such \
+                 answers in their user-level runtime.toml (~/.astra/config/runtime.toml); \
+                 a DNS-over-HTTPS lookup then screens out hosts whose public address is \
+                 private, but cannot confirm where the VPN connects:\n\n[web_fetch]\n\
+                 fake_ip = \"allow_doh_screened\"\n\
                  doh_resolvers = [\"https://<reachable DoH endpoint>/dns-query\"]\n\n\
                  See docs/reference/configuration.md. Tell the user about this option; \
                  do not change their configuration on their behalf.",
@@ -166,29 +168,28 @@ impl std::fmt::Display for SsrfBlock {
             SsrfBlockReason::FakeIpUnsupportedAnswer => write!(
                 f,
                 "SSRF blocked: {host} resolves to {addrs}, which looks like fake-IP DNS from \
-                 a local VPN/proxy. Astra can verify only answers made entirely of IPv4 fake \
-                 addresses in {v4}; IPv6 fake-IP ranges such as {v6} and answers mixing fake \
-                 and real addresses are not supported, so the real destination cannot be \
-                 verified. Tell the user; do not change their configuration on their behalf.",
+                 a local VPN/proxy. Only answers made entirely of IPv4 fake addresses in {v4} \
+                 can be allowed; IPv6 fake-IP ranges such as {v6} and answers mixing fake \
+                 and real addresses are not supported. Tell the user; do not change their \
+                 configuration on their behalf.",
                 v4 = fake_ip::FAKE_IP_RANGE,
                 v6 = fake_ip::FAKE_IPV6_RANGE,
             ),
             SsrfBlockReason::FakeIpDohUnavailable(detail) => write!(
                 f,
                 "SSRF blocked: {host} resolves to fake-IP address {addrs}, and no configured \
-                 DoH resolver answered ({detail}), so the real destination could not be \
-                 verified. The user can configure a reachable endpoint in [web_fetch] \
+                 DoH resolver answered ({detail}), so the host could not be screened. The user can configure a reachable endpoint in [web_fetch] \
                  doh_resolvers of their user-level runtime.toml."
             ),
-            SsrfBlockReason::FakeIpUnverified => write!(
+            SsrfBlockReason::FakeIpNoDohAnswer => write!(
                 f,
                 "SSRF blocked: {host} resolves to fake-IP address {addrs}, but DoH returned \
-                 no address for it, so the real destination could not be verified."
+                 no address for it, so the host could not be screened."
             ),
             SsrfBlockReason::FakeIpRealAddressPrivate(real) => write!(
                 f,
                 "SSRF blocked: {host} resolves to fake-IP address {addrs}, and DoH reports \
-                 its real address is private/internal ({real})",
+                 its public address is private/internal ({real})",
                 real = join_ips(real),
             ),
         }
@@ -435,10 +436,10 @@ async fn fetch_inner(
         upgrade_scheme(&raw_url)
     };
     validate_url(&url)?;
-    // Resolve once for validation; the actual fetch paths re-resolve per hop
-    // during redirect following (different host), so this is intentionally
-    // consumed only for early fail on private-IP targets.
-    let _early_validate = resolve_and_validate_host(&url, fake_ip).await?;
+    // Validate before the cache lookup so a cached body is never served for a
+    // host that is now blocked. A cache miss pins the first hop to these
+    // addresses; redirects are resolved and validated per hop.
+    let first_hop = resolve_and_validate_host(&url, fake_ip).await?;
 
     let cache_key = CacheKey {
         scope: cache_scope.to_string(),
@@ -460,7 +461,7 @@ async fn fetch_inner(
 
     let start = Instant::now();
     let (status, final_url, content_type, body) =
-        fetch_reqwest(&url, config.timeout, transport, fake_ip).await?;
+        fetch_reqwest(&url, first_hop, config.timeout, transport, fake_ip).await?;
     // Store one bounded representation independent of the caller's requested
     // slice. A later model round asking for 8k after an initial 3k read can
     // reuse the same network response; only the returned projection changes.
@@ -633,8 +634,9 @@ async fn resolve_and_validate_host(
 }
 
 /// Admit public answers. Private answers are blocked unless every one lies in
-/// the user's IPv4 fake-IP range and DoH reports public real addresses; the
-/// pinned connection still uses the fake addresses the local VPN can route.
+/// the user's IPv4 fake-IP range, the user relaxed the boundary for such
+/// answers, and DoH screening passes. The pinned connection uses the fake
+/// addresses, so the local VPN, not this check, picks the real destination.
 async fn validate_resolved_addrs(
     host: &str,
     addrs: Vec<SocketAddr>,
@@ -651,7 +653,7 @@ async fn validate_resolved_addrs(
     };
     let reason = if ips.iter().all(ipv4_fake) {
         match fake_ip {
-            Some(policy) => match policy.verify(host).await {
+            Some(policy) => match policy.screen(host).await {
                 Ok(()) => return Ok(addrs),
                 Err(reason) => reason,
             },
@@ -767,19 +769,26 @@ fn is_private_ipv4(v4: Ipv4Addr) -> bool {
 
 // ─── HTTP Fetch ──────────────────────────────────────────────────────────────
 
+/// `first_hop` is the validated address set for `url`; every redirect hop is
+/// resolved and validated again.
 async fn fetch_reqwest(
     url: &str,
+    first_hop: Vec<SocketAddr>,
     timeout: Duration,
     transport: FetchTransport,
     fake_ip: Option<&FakeIpPolicy>,
 ) -> Result<(u16, Option<String>, String, String), FetchError> {
     let mut current = url.to_string();
     let mut final_url = None;
+    let mut first_hop = Some(first_hop);
 
     for redirect_count in 0..=MAX_REDIRECTS {
         validate_url(&current)?;
         // Resolve DNS and validate ALL IPs are public; pin them for the connection.
-        let resolved = resolve_and_validate_host(&current, fake_ip).await?;
+        let resolved = match first_hop.take() {
+            Some(resolved) => resolved,
+            None => resolve_and_validate_host(&current, fake_ip).await?,
+        };
         let parsed = url::Url::parse(&current)
             .map_err(|e| FetchError::Validation(format!("Invalid URL: {e}")))?;
         let host = parsed.host_str().unwrap_or_default().to_string();
@@ -1713,6 +1722,50 @@ mod tests {
                 "{literal}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn first_hop_reuses_validated_addresses_and_redirects_are_revalidated() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(path("/page"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("first hop"))
+            .mount(&server)
+            .await;
+        Mock::given(path("/redirect"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/page", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        // `.example` never resolves to this server: the request can only reach
+        // it through the pinned first-hop addresses, without another lookup.
+        let pinned = vec![*server.address()];
+        let (status, _, _, body) = fetch_reqwest(
+            "http://first-hop.example/page",
+            pinned.clone(),
+            Duration::from_secs(5),
+            FetchTransport::DirectPinned,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!((status, body.as_str()), (200, "first hop"));
+
+        // The redirect target is a new hop and goes through validation again.
+        let error = fetch_reqwest(
+            "http://first-hop.example/redirect",
+            pinned,
+            Duration::from_secs(5),
+            FetchTransport::DirectPinned,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, FetchError::SsrfBlocked(_)), "{error}");
     }
 
     #[test]

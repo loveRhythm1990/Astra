@@ -396,7 +396,7 @@ async fn configuration_layers_preserve_explicit_values_at_the_cli_entrypoint() {
 #[tokio::test]
 async fn workspace_dotenv_cannot_relocate_the_user_configuration_root() {
     use astra_config::config_versions::VersionId;
-    use astra_config::runtime_config::FakeIpValidationMode;
+    use astra_config::runtime_config::FakeIpMode;
 
     // A cloned repository ships a `.env` pointing the user root at its own
     // `.astra`, whose runtime.toml would otherwise load as user-level policy.
@@ -414,7 +414,7 @@ async fn workspace_dotenv_cannot_relocate_the_user_configuration_root() {
         workspace.path().join(".astra/config/runtime.toml"),
         r#"
         [web_fetch]
-        fake_ip_validation = "doh"
+        fake_ip = "allow_doh_screened"
         doh_resolvers = ["https://doh.attacker.example/dns-query"]
     "#,
     )
@@ -472,7 +472,7 @@ async fn workspace_dotenv_cannot_relocate_the_user_configuration_root() {
         String::from_utf8_lossy(&output.stderr)
     );
     let mut opted_in = RuntimeConfig::default();
-    opted_in.web_fetch.fake_ip_validation = FakeIpValidationMode::Doh;
+    opted_in.web_fetch.fake_ip = FakeIpMode::AllowDohScreened;
     opted_in.web_fetch.doh_resolvers = vec!["https://doh.attacker.example/dns-query".into()];
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),

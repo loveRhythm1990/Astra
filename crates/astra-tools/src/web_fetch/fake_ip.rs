@@ -1,12 +1,15 @@
-//! Opt-in validation of fake-IP DNS answers for user-owned networks.
+//! User opt-in that relaxes the private-network SSRF boundary for fake-IP
+//! DNS answers.
 //!
 //! Fake-IP DNS (Clash/mihomo, Surge, sing-box) answers every lookup with an
 //! address from `198.18.0.0/15` and routes the connection by hostname. The
 //! SSRF guard cannot judge such an answer, so it blocks it by default. When
 //! the user opts in through the user-level `[web_fetch]` configuration, the
-//! hostname is resolved again through DNS-over-HTTPS and the fetch is admitted
-//! only if every real address is public. The connection itself still uses the
-//! fake address, because only the local VPN can route it.
+//! fetch goes to the fake address and the VPN resolves and picks the real
+//! destination. Astra cannot observe that destination. A DNS-over-HTTPS lookup
+//! screens out hosts whose public answer is private; it is not proof of where
+//! the VPN connects, because a host may answer the resolver and the VPN
+//! differently.
 //!
 //! Only `FetchTransport::LocalEnvironment` carries a policy; Server transports
 //! never consult it.
@@ -15,7 +18,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use astra_config::runtime_config::{FakeIpValidationMode, RuntimeConfig, WebFetchConfig};
+use astra_config::runtime_config::{FakeIpMode, RuntimeConfig, WebFetchConfig};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -32,7 +35,7 @@ const MAX_DNS_MESSAGE_BYTES: usize = 64 * 1024;
 pub(super) const FAKE_IP_RANGE: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(198, 18, 0, 0), 15);
 
 /// RFC 5180 IPv6 benchmarking range, used by sing-box's documented IPv6
-/// fake-IP configuration. Only IPv4 fake answers can be verified; an answer
+/// fake-IP configuration. Only IPv4 fake answers can be allowed; an answer
 /// from this range is reported as unsupported rather than as a LAN address.
 pub(super) const FAKE_IPV6_RANGE: Ipv6Net =
     Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x0002, 0, 0, 0, 0, 0, 0), 48);
@@ -51,7 +54,7 @@ impl FakeIpPolicy {
     /// Build the policy selected by configuration. `Ok(None)` means the user
     /// has not opted in.
     pub fn from_config(config: &WebFetchConfig) -> Result<Option<Self>, String> {
-        if config.fake_ip_validation == FakeIpValidationMode::Off {
+        if config.fake_ip == FakeIpMode::Block {
             return Ok(None);
         }
         let ranges = if config.fake_ip_ranges.is_empty() {
@@ -65,7 +68,7 @@ impl FakeIpPolicy {
         };
         if config.doh_resolvers.is_empty() {
             return Err(
-                "web_fetch.fake_ip_validation = \"doh\" requires at least one doh_resolvers entry"
+                "web_fetch.fake_ip = \"allow_doh_screened\" requires at least one doh_resolvers entry"
                     .into(),
             );
         }
@@ -93,14 +96,15 @@ impl FakeIpPolicy {
         }
     }
 
-    /// Admit `host` only when a configured resolver reports real addresses
-    /// and all of them are public. Fails closed when no resolver answers.
+    /// Pass `host` only when a configured resolver reports addresses and all
+    /// of them are public. Fails closed when no resolver answers. Passing
+    /// does not bind the VPN's destination; see the module documentation.
     ///
     /// A private address from either address family blocks the host even if
     /// the other family's query failed: a later resolver must not be able to
     /// outvote evidence that has already been seen.
-    pub(super) async fn verify(&self, host: &str) -> Result<(), SsrfBlockReason> {
-        let mut name = Name::from_ascii(host).map_err(|_| SsrfBlockReason::FakeIpUnverified)?;
+    pub(super) async fn screen(&self, host: &str) -> Result<(), SsrfBlockReason> {
+        let mut name = Name::from_ascii(host).map_err(|_| SsrfBlockReason::FakeIpNoDohAnswer)?;
         name.set_fqdn(true);
         let mut failures = Vec::new();
         for (index, resolver) in self.resolvers.iter().enumerate() {
@@ -116,7 +120,7 @@ impl FakeIpPolicy {
             }
             match (v4, v6) {
                 (Ok(_), Ok(_)) if real.is_empty() => {
-                    return Err(SsrfBlockReason::FakeIpUnverified);
+                    return Err(SsrfBlockReason::FakeIpNoDohAnswer);
                 }
                 (Ok(_), Ok(_)) => return Ok(()),
                 (Err(error), _) | (_, Err(error)) => {
@@ -359,9 +363,9 @@ mod tests {
         }
     }
 
-    fn config(mode: FakeIpValidationMode, ranges: &[&str], resolvers: &[&str]) -> WebFetchConfig {
+    fn config(mode: FakeIpMode, ranges: &[&str], resolvers: &[&str]) -> WebFetchConfig {
         WebFetchConfig {
-            fake_ip_validation: mode,
+            fake_ip: mode,
             fake_ip_ranges: ranges.iter().map(ToString::to_string).collect(),
             doh_resolvers: resolvers.iter().map(ToString::to_string).collect(),
         }
@@ -369,10 +373,10 @@ mod tests {
 
     #[test]
     fn configuration_is_opt_in_and_validated() {
-        let doh = FakeIpValidationMode::Doh;
+        let doh = FakeIpMode::AllowDohScreened;
         let resolver = ["https://1.12.12.12/dns-query"];
         assert!(
-            FakeIpPolicy::from_config(&config(FakeIpValidationMode::Off, &[], &resolver))
+            FakeIpPolicy::from_config(&config(FakeIpMode::Block, &[], &resolver))
                 .unwrap()
                 .is_none()
         );
@@ -428,7 +432,7 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("198.18.5.51"), "{message}");
         assert!(
-            message.contains("fake_ip_validation = \"doh\""),
+            message.contains("fake_ip = \"allow_doh_screened\""),
             "{message}"
         );
         assert!(
@@ -444,13 +448,13 @@ mod tests {
             let error = validate_resolved_addrs("intranet.example", addrs(answer), None)
                 .await
                 .unwrap_err();
-            assert!(!error.to_string().contains("fake_ip_validation"));
+            assert!(!error.to_string().contains("fake_ip"));
             assert_eq!(reason(error), SsrfBlockReason::PrivateAddress);
         }
     }
 
     #[tokio::test]
-    async fn verified_public_destination_connects_through_the_fake_address() {
+    async fn screened_host_connects_through_the_fake_address() {
         let server = doh(ResponseCode::NoError, &["140.82.113.4"], &[]).await;
         let fake = addrs(&["198.18.0.23"]);
         let admitted =
@@ -460,6 +464,26 @@ mod tests {
         assert_eq!(
             admitted, fake,
             "the pinned connection must use the VPN's fake address"
+        );
+    }
+
+    /// Documents the accepted limitation: screening sees only the DoH answer.
+    /// A host that gives DoH a public address and the VPN's DNS a private one
+    /// is admitted, and the connection goes to the fake address, which the VPN
+    /// then routes to wherever its own lookup pointed.
+    #[tokio::test]
+    async fn screening_cannot_bind_the_destination_the_vpn_picks() {
+        let doh_view = doh(ResponseCode::NoError, &["93.184.216.34"], &[]).await;
+        let vpn_view = "127.0.0.1".parse::<IpAddr>().unwrap();
+        let fake = addrs(&["198.18.0.7"]);
+        let admitted =
+            validate_resolved_addrs("rebind.example", fake.clone(), Some(&policy(&[&doh_view])))
+                .await
+                .expect("screening passes on the DoH view alone");
+        assert_eq!(admitted, fake);
+        assert!(
+            admitted.iter().all(|addr| addr.ip() != vpn_view),
+            "Astra never sees the VPN's destination, so it cannot reject it"
         );
     }
 
@@ -489,7 +513,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_real_address_is_unverified() {
+    async fn missing_doh_answer_is_blocked() {
         for code in [ResponseCode::NoError, ResponseCode::NXDomain] {
             let server = doh(code, &[], &[]).await;
             let error = validate_resolved_addrs(
@@ -499,7 +523,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert_eq!(reason(error), SsrfBlockReason::FakeIpUnverified);
+            assert_eq!(reason(error), SsrfBlockReason::FakeIpNoDohAnswer);
         }
     }
 
@@ -659,7 +683,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(reason(error), SsrfBlockReason::PrivateAddress);
-        // A literal fake address has no hostname to verify.
+        // A literal fake address has no hostname to screen.
         let error = resolve_and_validate_host("http://198.18.0.5/", Some(&policy))
             .await
             .unwrap_err();

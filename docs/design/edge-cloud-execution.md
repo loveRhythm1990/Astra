@@ -82,13 +82,15 @@ proxy-only DNS names are not supported. A failed proxy request never silently
 falls back to direct or Server execution. Cache identity includes transport mode.
 
 Fake-IP DNS (a local VPN answering from `198.18.0.0/15`) is blocked like any
-reserved address. The user may opt the local transport into DNS-over-HTTPS
-verification through the user-level `[web_fetch]` configuration: a fetch whose
-answers all lie in the IPv4 fake range is admitted only when the configured
-resolver reports public real addresses, and the pinned connection still uses the
-fake address. IPv6 fake-IP answers and answers mixing fake and real addresses
-are rejected as unsupported. Only the local transport can carry this opt-in; Server transports are
-constructed without it. See the
+reserved address. The user may relax the private-network boundary for the local
+transport through the user-level `[web_fetch]` configuration: a fetch whose
+answers all lie in the IPv4 fake range goes to the fake address, and the VPN
+picks the real destination. A DNS-over-HTTPS screen blocks hosts whose public
+answer is private, but it cannot bind the VPN's destination, so the opt-in is an
+explicit relaxation rather than a verified boundary. IPv6 fake-IP answers and
+answers mixing fake and real addresses are rejected as unsupported. Only the
+local transport can carry this opt-in; Server transports are constructed without
+it. See the
 [configuration reference](../reference/configuration.md#local-web_fetch-behind-fake-ip-dns).
 
 One total fetch deadline covers DNS, redirects and body reads. Network, timeout,

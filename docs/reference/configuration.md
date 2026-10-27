@@ -296,20 +296,23 @@ Server-loop Memoria observer and post-loop memory cleanup are fixed internal asy
 Edge/CLI `web_fetch` and `web_search` block destinations that resolve to a
 private or reserved address, including `198.18.0.0/15`. Local VPN/proxy tools
 in fake-IP mode (Clash/mihomo, Surge, sing-box) answer every lookup from that
-range, so every fetch is blocked. Users on such a network can opt in to
-DNS-over-HTTPS verification in the user-level `~/.astra/config/runtime.toml`:
+range, so every fetch is blocked. Users on such a network can relax the
+private-network boundary for fake-IP answers in the user-level
+`~/.astra/config/runtime.toml`:
 
 ```toml
 [web_fetch]
-fake_ip_validation = "doh"                       # off (default) or doh
+fake_ip = "allow_doh_screened"                   # block (default) or allow_doh_screened
 doh_resolvers = ["https://1.12.12.12/dns-query"] # required, tried in order
 # fake_ip_ranges = ["198.18.0.0/16"]             # optional, within 198.18.0.0/15
 ```
 
-When every address from the local DNS lies in an IPv4 fake range, Astra asks
-the resolvers (RFC 8484) for the hostname's real A and AAAA records and admits
-the fetch only if all of them are public. The connection still goes to the fake
-address so the VPN can route it. Literal fake addresses, empty answers and
+This is a relaxation, not a verification. When every address from the local
+DNS lies in an IPv4 fake range, the fetch goes to the fake address and the VPN
+resolves the hostname and picks the real destination; Astra cannot see or
+check it. Before allowing the fetch, Astra screens the hostname by asking the
+resolvers (RFC 8484) for its public A and AAAA records and blocks it if any of
+them is private. Literal fake addresses, empty answers and
 unreachable resolvers stay blocked, and a private address reported for either
 record type blocks the fetch even if the other query failed. There is no
 built-in resolver: pick one your network does not block, because many networks
@@ -331,10 +334,13 @@ cannot set `ASTRA_LOCAL_STATE_ROOT`, which relocates the user-level file. Server
 `web_fetch` never reads the section, and an invalid section leaves the default
 block in place with a warning.
 
-Enabling it trusts the VPN to connect to the destination the resolver reported.
-A domain that answers the resolver and the VPN differently (for example by DNS
-rebinding to a private address) can still reach that address through the VPN.
-Keep it off unless fake-IP DNS blocks web access. Like other Astra
+Screening does not bind the VPN's destination. A hostname that answers the
+resolver with a public address and the VPN's DNS with a private one (DNS
+rebinding by an attacker-controlled domain, or split-horizon DNS) passes the
+screen, and the VPN then connects to the private address. With this option on,
+Edge/CLI `web_fetch` therefore no longer guarantees that requests stay off
+private networks for hosts answered with fake addresses; it relies on the VPN's
+routing instead. Keep it at `block` unless fake-IP DNS blocks web access. Like other Astra
 configuration, the file is protected from agent writes only by the permission
 mode: Bypass, or Auto with `allow_sensitive_path_writes`, lets the agent edit it.
 

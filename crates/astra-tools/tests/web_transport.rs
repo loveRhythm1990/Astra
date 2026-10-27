@@ -50,8 +50,8 @@ async fn live_owner_network() {
 
 #[tokio::test]
 #[ignore = "requires a fake-IP DNS, a reachable DoH resolver and public network"]
-async fn live_fake_ip_validation() {
-    use astra_config::runtime_config::{FakeIpValidationMode, WebFetchConfig};
+async fn live_fake_ip_screening() {
+    use astra_config::runtime_config::{FakeIpMode, WebFetchConfig};
     use astra_tools::web_fetch::FakeIpPolicy;
     let url = std::env::var("ASTRA_TEST_PUBLIC_URL").expect("explicit public URL required");
     let resolver = std::env::var("ASTRA_TEST_DOH_RESOLVER").expect("explicit DoH URL required");
@@ -63,7 +63,7 @@ async fn live_fake_ip_validation() {
     );
     println!("without opt-in: {}", blocked.output);
     let policy = FakeIpPolicy::from_config(&WebFetchConfig {
-        fake_ip_validation: FakeIpValidationMode::Doh,
+        fake_ip: FakeIpMode::AllowDohScreened,
         fake_ip_ranges: Vec::new(),
         doh_resolvers: vec![resolver],
     })
