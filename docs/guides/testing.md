@@ -484,6 +484,15 @@ users or sessions. The Phase-0 production baseline journeys have additional
 exclusive-run configuration; see their dedicated instructions before enabling
 them.
 
+The slow-fanout root-cancellation journey uses the fixture-owned Session, so
+`ctx.close()` drains run/finalizer work before deleting its data. It must not
+delete another Session before that drain. All cancelled-child replay responses
+share one 10-second deadline and retain the 1 MiB body limit. Its
+`root_cancel_phase` markers record only phase names and elapsed time, allowing a
+CI timeout to distinguish setup, provider entry, cancellation, replay and
+teardown without publishing identities or payloads. The suite's 60-second
+per-test limit and cancellation/late-output assertions remain in force.
+
 Requires the same environment as `astra-server`: `MATRIXONE_*`,
 `ASTRA_JWT_SECRET`, `ASTRA_TOKEN_ENCRYPTION_KEY`, Memoria, and embedding
 settings parsed by `astra_core::AppSettings::from_env`. Use a local `.env` if
