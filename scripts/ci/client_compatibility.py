@@ -95,11 +95,11 @@ def cli_base(origin, model):
     return ["--api-url", origin, "--profile", "compatibility", "--model", model, "--no-instructions"]
 
 
-def one_shot_base(origin, model):
+def one_shot_chat_base(origin, model):
     # Captured one-shot commands have neither a terminal nor an approval
     # channel. Use the published read-only mode; stdio approval journeys
     # retain prompt mode and exercise the real approval transport separately.
-    return [*cli_base(origin, model), "--permission-mode", "plan"]
+    return [*cli_base(origin, model), "chat", "--permission-mode", "plan"]
 
 
 def authenticate_cli(binary, env, home, origin, username, password):
@@ -622,7 +622,7 @@ def rollback(args, artifacts, report):
                 require(listed.returncode == 0 and model in listed.stdout.decode(errors="replace"), "rollback_catalog_unreadable")
                 begin_case(report, "candidate", "ordinary_chat_against_released_server")
                 completed(command(args.current_cli.resolve(), client_env, client_home,
-                    [*one_shot_base(origin, model), "chat", "--json", "--no-resume", "-m", "Reply to the fixture: " + provider.marker]), provider.marker)
+                    [*one_shot_chat_base(origin, model), "--json", "--no-resume", "-m", "Reply to the fixture: " + provider.marker]), provider.marker)
                 require(not provider.errors, "rollback_provider_contract_failed")
             report["cases"].append({"client": "candidate", "case": "catalog_and_chat_against_released_server",
                 "server_source": "70a5ee3ec25bb3b02d3f591675a13abc33a85159", "server_version": "0.2.12", "status": "passed"})
@@ -670,7 +670,7 @@ def run(args, report):
                 report["cases"].append({"client": version, "case": "model_catalog", "status": "passed"})
                 provider.case = version + "-ordinary-chat"
                 begin_case(report, version, "unsupported_schema1_execution" if version == "0.2.10" else "ordinary_chat")
-                chat = command(binary, env, home, [*one_shot_base(origin, model), "chat", "--json", "--no-resume", "-m", "Reply to the fixture: " + provider.marker])
+                chat = command(binary, env, home, [*one_shot_chat_base(origin, model), "--json", "--no-resume", "-m", "Reply to the fixture: " + provider.marker])
                 if version == "0.2.10":
                     detail = (chat.stdout + chat.stderr).decode(errors="replace")
                     require(chat.returncode != 0 and "schema v1" in detail and "upgrade" in detail.lower(), "legacy_execution_not_explicitly_rejected")
@@ -684,7 +684,7 @@ def run(args, report):
                     session, cancelled_run = cancellation(binary, env, home, origin, token, model, provider)
                     provider.case = "resume-after-cancellation"
                     begin_case(report, version, "resume_after_cancellation")
-                    resumed = completed(command(binary, env, home, [*one_shot_base(origin, model), "chat", "--json", "--session-id", session, "-m", "Continue after cancellation: " + provider.marker]), provider.marker)
+                    resumed = completed(command(binary, env, home, [*one_shot_chat_base(origin, model), "--json", "--session-id", session, "-m", "Continue after cancellation: " + provider.marker]), provider.marker)
                     require(resumed["session_id"] == session and resumed["run_id"] != cancelled_run,
                             "resume_run_identity_mismatch")
                     report["cases"].append({"client": version, "case": "cancel_and_resume", "status": "passed"})
@@ -701,7 +701,7 @@ def run(args, report):
                 provider.case = "candidate-chat"
                 begin_case(report, "candidate", "ordinary_chat")
                 completed(command(args.current_cli.resolve(), env, home,
-                    [*one_shot_base(origin, model), "chat", "--json", "--no-resume", "-m", "Reply to the fixture: " + provider.marker]), provider.marker)
+                    [*one_shot_chat_base(origin, model), "--json", "--no-resume", "-m", "Reply to the fixture: " + provider.marker]), provider.marker)
                 report["cases"].append({"client": "candidate", "case": "ordinary_chat", "status": "passed"})
         require(not provider.errors, "provider_contract_failed")
     finally:
