@@ -493,6 +493,33 @@ Optionally set **`ASTRA_AUTO_CREATE_DATABASE=1`** so the first
 `ensure_core_schema` (server or online tests) runs `CREATE DATABASE IF NOT
 EXISTS` for that effective name (bootstrap catalog defaults to `mysql`).
 
+### Ordinary-chat SQL budget
+
+`chat_sql_budget::ordinary_chat_and_readonly_rounds_have_bounded_total_sql`
+uses the same isolated MatrixOne setup and scripted loopback provider as the
+system HTTP journeys. Run this test by exact name in its own process because
+it owns the global SQL tracing subscriber:
+
+```bash
+cargo test -p astra-runtime --features e2e-hooks --test chat_sql_budget \
+  ordinary_chat_and_readonly_rounds_have_bounded_total_sql -- --ignored --exact --nocapture
+```
+
+The 20-statement limit measures each request on an initialized server pool,
+including transactions, periodic control reads and the real observer's SQL.
+Pool initialization happens before capture; no statements are filtered out
+inside the measured interval. Warm-context setup consumes its complete SSE
+response and waits for observer completion before the next request starts;
+it must not use shutdown drain, which closes admission for that next request.
+Capture ends only after
+both the measured run and its observer finish: the detached observer is not
+owned by `drain_background_runs`. Observer errors, dropped work or a missing
+completion fail the probe instead of silently undercounting SQL.
+The readonly-round comparison accounts for exact periodic control reads and
+at most one account/session authentication snapshot when its 30-second cache
+expires. Those statements still count toward the raw 20-statement limit;
+repeated authentication snapshots or any other extra readonly-round SQL fail.
+
 ### Durable provider concurrency and cancellation
 
 The ignored runtime test
