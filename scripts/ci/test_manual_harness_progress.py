@@ -23,6 +23,12 @@ def supervised(command):
             "--identity", "manual-progress-test", "--", *command]
 
 
+def execution_diagnostic():
+    return {"final_state":None, "interruption_kind":None, "error_kind":None,
+            "error_code":None, "server_admission_not_dispatched":False,
+            "stream":None, "journal":None}
+
+
 def row(name, status="passed"):
     checks = [{"type":"judger", "severity":"quality", "score":None,
                "passed":None, "evaluation":"unscored", "diagnostic":None},
@@ -32,8 +38,9 @@ def row(name, status="passed"):
             "has_warnings":False, "failure_class":None if status == "passed" else "Unknown",
             "exit_code":0 if status == "passed" else 1, "criteria":checks,
             "steps":[{"step_index":0, "passed":status == "passed", "duration_ms":100,
-                      "criteria":[dict(c) for c in checks]}],
-            "token_usage_coverage":None, "terminal_reported":dict.fromkeys(h.METRICS, 10)}
+                      "criteria":[dict(c) for c in checks], "execution_diagnostic":execution_diagnostic()}],
+            "token_usage_coverage":None, "terminal_reported":dict.fromkeys(h.METRICS, 10),
+            "execution_diagnostic":execution_diagnostic()}
 
 
 def events(statuses=("passed", "passed")):
@@ -58,6 +65,48 @@ def write_events(root, data, tail=b""):
 
 
 class ManualHarnessProgressTests(unittest.TestCase):
+    def test_execution_diagnostics_survive_failed_summary_without_regrading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = events(("failed",))
+            result = next(e["row"] for e in data if e["type"] == "case_completed")
+            diagnostic = result["execution_diagnostic"]
+            diagnostic.update(final_state="failed", error_kind="contract_violation",
+                              error_code="canonical_persistence_failed")
+            diagnostic["stream"] = {"identity_verified":True, "has_diagnostics":False, "last_event":"terminated_completed",
+                                    "event_counts":{"run_started":1, "terminated_completed":1}}
+            diagnostic["journal"] = {"skipped_lines":0, "dropped_lines":0, "integrity_errors":0,
+                                     "last_event":"turn_error", "event_counts":{"turn_error":1}}
+            write_events(root, data)
+            (root / "report.json").write_text("private-sentinel")
+            (root / "execution.json").write_text(json.dumps({"exit_code":1, "termination":"finished"}))
+            code, summary = self.publish(root, "failure", cli=True)
+            self.assertEqual(code, 1)
+            self.assertIsNone(summary["observation_error"])
+            self.assertEqual(summary["runs"][0]["execution_diagnostic"], diagnostic)
+            self.assertEqual(summary["runs"][0]["status"], "failed")
+            self.assertEqual(summary["runs"][0]["exit_code"], 1)
+            self.assertIn("contract_violation", (root / "job-summary").read_text())
+            self.assertIn("terminated_completed", (root / "job-summary").read_text())
+            self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
+
+    def test_execution_diagnostics_reject_private_tags_and_extra_payload(self):
+        h.safe_execution_diagnostic(execution_diagnostic())
+        for key in ("final_state", "interruption_kind", "error_kind", "error_code", "detail"):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                h.safe_execution_diagnostic({**execution_diagnostic(), key:"private-sentinel"})
+        stream = {"identity_verified":True, "has_diagnostics":False, "last_event":"terminated_completed",
+                  "event_counts":{"terminated_completed":1}}
+        for changes in ({"last_event":"private-sentinel"}, {"reason":"private-sentinel"},
+                        {"event_counts":{"private-sentinel":1}},
+                        {"event_counts":{"terminated_completed":True}}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                h.safe_execution_diagnostic({**execution_diagnostic(), "stream":{**stream, **changes}})
+        result = row("case", "failed")
+        result["steps"][0]["execution_diagnostic"]["error_code"] = "private-sentinel"
+        with self.assertRaises(ValueError):
+            h.safe_row(result)
+
     def test_cache_scope_evidence_survives_summary_without_regrading(self):
         diagnostic = {"kind":"cache_scope", "scope":"conversation_turns",
                       "observations":None, "post_cold_cache_read_tokens":None,

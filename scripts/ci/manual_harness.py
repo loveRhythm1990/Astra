@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-SCHEMA = "astra.harness_progress.v5"
+SCHEMA = "astra.harness_progress.v6"
 MAX_RECORD = 262_144
 MAX_FILE = 32 * 1024 * 1024
 STATUSES = ("passed", "failed", "cancelled", "unavailable")
@@ -53,6 +53,61 @@ OUTCOME_ERROR_KINDS = ERROR_KINDS | {"other", "not_reported",
                "delegation_model_scope_unresolved", "delegation_model_unavailable",
                "delegation_preparation_unavailable", "delegation_model_assessment_unavailable",
                "invalid_delegation_model_scope", "execution_time_budget_exhausted"}
+INTERRUPTION_KINDS = frozenset("""
+budget_exhausted empty_completion token_budget_exceeded rate_limited cooldown_rejected
+user_cancelled context_overflow auth_failure critical_verdict approval_rejected server_overload
+stream_transport stream_idle provider_deadline harness_blocked harness_paused interrupted
+execution_incomplete executor_dropped timeout cancelled other
+""".split())
+ERROR_CODES = ERROR_KINDS | INTERRUPTION_KINDS | {
+    "canonical_persistence_failed", "crash_recovery", "genesis_unavailable",
+    "terminal_handoff_window_closed", "internal_error", "tool_error", "api_error"}
+STREAM_EVENTS = frozenset("""
+run_started transcript_committed output_delta terminated_completed terminated_delegated
+terminated_failed terminated_interrupted terminated_cancelled gap other
+""".split())
+JOURNAL_EVENTS = frozenset("""
+llm_round turn turn_error tool_invocation llm_round_started llm_round_completed llm_round_failed
+ tool_call_started tool_call_completed tool_call_failed tool_call_skipped
+step_started step_completed step_incomplete step_failed other
+""".split())
+
+
+def safe_execution_diagnostic(value):
+    if (not isinstance(value, dict) or set(value) != {
+        "final_state", "interruption_kind", "error_kind", "error_code",
+        "server_admission_not_dispatched", "stream", "journal"}):
+        raise ValueError("invalid execution diagnostic")
+    for key, allowed in (("final_state", {"completed", "failed", "interrupted", "other"}),
+                         ("interruption_kind", INTERRUPTION_KINDS),
+                         ("error_kind", ERROR_KINDS | {"other"}), ("error_code", ERROR_CODES)):
+        tag = value[key]
+        if tag is not None and (not isinstance(tag, str) or tag not in allowed):
+            raise ValueError("invalid execution tag")
+    if type(value["server_admission_not_dispatched"]) is not bool:
+        raise ValueError("invalid admission diagnostic")
+    for key, allowed, fields in (
+        ("stream", STREAM_EVENTS, {"identity_verified", "has_diagnostics"}),
+        ("journal", JOURNAL_EVENTS, {"skipped_lines", "dropped_lines", "integrity_errors"})):
+        capture = value[key]
+        if capture is None:
+            continue
+        if not isinstance(capture, dict) or set(capture) != fields | {"last_event", "event_counts"}:
+            raise ValueError("invalid capture diagnostic")
+        if key == "stream":
+            if any(type(capture[field]) is not bool for field in fields):
+                raise ValueError("invalid capture identity")
+        else:
+            for field in fields:
+                integer(capture[field])
+        counts = capture["event_counts"]
+        if not isinstance(counts, dict) or not set(counts) <= allowed:
+            raise ValueError("invalid event counters")
+        for count in counts.values():
+            integer(count)
+        last = capture["last_event"]
+        if last is not None and (not isinstance(last, str) or last not in allowed):
+            raise ValueError("invalid last event")
 
 VALIDATION_CODES = frozenset("""
 required type const enum min_length max_length minimum maximum unique_items
@@ -370,10 +425,16 @@ def check_lines(items, prefix):
 
 def row_checks(row):
     lines = list(check_lines(row["criteria"], "root"))
+    if row["status"] != "passed":
+        lines.append("Execution diagnostics (observations, not causal attribution): " +
+                     json.dumps(row["execution_diagnostic"], sort_keys=True))
     if row["token_usage_coverage"] is None:
         lines.append("Provider usage coverage unavailable; terminal-reported zero counters do not prove zero usage or no tool execution.")
     for step in row["steps"]:
         lines.extend(check_lines(step["criteria"], f"step[{step['step_index']}]"))
+        if not step["passed"]:
+            lines.append(f"step[{step['step_index']}] execution diagnostics: " +
+                         json.dumps(step["execution_diagnostic"], sort_keys=True))
     if not any(c["type"] in ("judger", "hard_judger") for checks in
                [row["criteria"], *(s["criteria"] for s in row["steps"])] for c in checks):
         lines.append("LLM judge: not configured for this case; checks are deterministic, not an LLM assessment.")
@@ -382,7 +443,8 @@ def row_checks(row):
 
 def safe_row(row):
     if set(row) != {"case", "model", "run_index", "status", "has_warnings", "failure_class",
-                    "exit_code", "criteria", "steps", "token_usage_coverage", "terminal_reported"}:
+                    "exit_code", "criteria", "steps", "token_usage_coverage", "terminal_reported",
+                    "execution_diagnostic"}:
         raise ValueError("unexpected row payload")
     identity(row["case"]), identity(row["model"]), integer(row["run_index"])
     if row["status"] not in STATUSES or type(row["has_warnings"]) is not bool or type(row["exit_code"]) is not int:
@@ -390,15 +452,17 @@ def safe_row(row):
     if row["failure_class"] is not None:
         identity(row["failure_class"])
     safe_criteria(row["criteria"], owner_passed=row["status"] == "passed")
+    safe_execution_diagnostic(row["execution_diagnostic"])
     if not isinstance(row["steps"], list) or set(row["terminal_reported"]) != set(METRICS):
         raise ValueError("invalid steps or metrics")
     for value in row["terminal_reported"].values():
         integer(value)
     for step in row["steps"]:
-        if set(step) != {"step_index", "passed", "duration_ms", "criteria"} or type(step["passed"]) is not bool:
+        if set(step) != {"step_index", "passed", "duration_ms", "criteria", "execution_diagnostic"} or type(step["passed"]) is not bool:
             raise ValueError("unexpected step payload")
         integer(step["step_index"]), integer(step["duration_ms"])
         safe_criteria(step["criteria"], owner_passed=step["passed"])
+        safe_execution_diagnostic(step["execution_diagnostic"])
     if row["status"] == "passed" and any(not step["passed"] for step in row["steps"]):
         raise ValueError("passed status contradicts canonical checks")
     coverage = row["token_usage_coverage"]

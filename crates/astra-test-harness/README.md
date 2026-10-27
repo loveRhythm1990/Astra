@@ -405,7 +405,7 @@ loss or file-write failure cancels via the existing runner and fails closed.
 Selected custom source revisions must support this option and the repository
 helper; unsupported sources fail explicitly, without an old-log fallback.
 
-Progress uses `astra.harness_progress.v5`. Unavailable judges report the canonical
+Progress uses `astra.harness_progress.v6`. Unavailable judges report the canonical
 error kind and a fixed failure stage; unknown causes remain `unknown`. Required
 quorum failures retain the first typed cause and still fail closed. Raw errors
 and individual vote diagnostics remain private. Argument failures include bounded
@@ -1084,6 +1084,20 @@ This distinction is important for unhappy-path diagnosis: a long queue wait is
 harness scheduling pressure, a heartbeat without new typed evidence is an
 efficiency/non-convergence signal, and a terminal report with incomplete
 evidence is never promoted to success merely because the process stayed alive.
+
+The CI safe progress stream (`astra.harness_progress.v6`) includes an
+`execution_diagnostic` on each terminal row and step. Failed rows print it in
+the job log and summary, and retain it in `summary.json` and
+`progress.safe.jsonl`. It preserves recognized terminal state, interruption,
+error kind/code, admission status, and available journal/live-stream event
+counts and last event type. Unknown tags become `other`; missing capture
+remains `null`. No stderr, response bodies, event text, identities, or tool
+arguments are published. Live termination counters count observed events,
+not unique children or verified adoption, and captured events may be partial.
+These diagnostics do not change verdicts, retries, timeouts, or cleanup.
+In particular, a cancellation observed after an outer timeout is not proof of
+the original failure cause. Push a new commit to exercise new diagnostics;
+rerunning an older workflow run still checks out that run's original PR SHA.
 
 ## Preflight checks
 

@@ -13,8 +13,127 @@ use std::sync::{
 };
 use tokio::sync::broadcast;
 
-pub const SCHEMA: &str = "astra.harness_progress.v5";
+pub const SCHEMA: &str = "astra.harness_progress.v6";
 pub const MAX_RECORD_BYTES: usize = 262_144;
+
+// Closed projections only: even machine-looking upstream tags can contain
+// private input. Never publish stderr, arbitrary codes, or live event bodies.
+fn error_kind(value: &str) -> &'static str {
+    serde_json::from_value::<astra_core::ErrorKind>(json!(value))
+        .map_or("other", astra_core::ErrorKind::as_str)
+}
+
+fn interruption(value: &str) -> &'static str {
+    match value {
+        // Synthetic outer harness outcomes, not runtime interruption kinds.
+        "timeout" => "timeout",
+        "cancelled" => "cancelled",
+        _ => astra_turn_core::interruption::InterruptionKind::from_label(value)
+            .map_or("other", |kind| kind.label()),
+    }
+}
+
+fn error_code(value: &str) -> &'static str {
+    match value {
+        "canonical_persistence_failed" => "canonical_persistence_failed",
+        "crash_recovery" => "crash_recovery",
+        "genesis_unavailable" => "genesis_unavailable",
+        "terminal_handoff_window_closed" => "terminal_handoff_window_closed",
+        "internal_error" => "internal_error",
+        "tool_error" => "tool_error",
+        "api_error" => "api_error",
+        _ => {
+            let kind = error_kind(value);
+            if kind != "other" {
+                kind
+            } else {
+                interruption(value)
+            }
+        }
+    }
+}
+
+fn execution_diagnostic(
+    outcome: &RunOutcome,
+    session: Option<&crate::session_capture::SessionCapture>,
+) -> Value {
+    use crate::runner::StreamCaptureRecord;
+    use astra_turn_core::agent_live_event::{AgentLiveEventKind, AgentLiveSignal};
+    use std::collections::BTreeMap;
+
+    let stream = outcome.stream_capture.as_ref().map(|stream| {
+        let mut counts = BTreeMap::<&str, u64>::new();
+        let mut last_event = None;
+        for record in &stream.records {
+            let tag = match record {
+                StreamCaptureRecord::AgentLiveGap { .. } => "gap",
+                StreamCaptureRecord::AgentLive { event, .. } => match &event.kind {
+                    AgentLiveEventKind::OutputDelta { .. } => "output_delta",
+                    AgentLiveEventKind::AgentTerminated { termination, .. } => {
+                        use astra_turn_core::agent_live_event::AgentLiveTermination;
+                        match termination {
+                            AgentLiveTermination::Completed => "terminated_completed",
+                            AgentLiveTermination::Delegated => "terminated_delegated",
+                            AgentLiveTermination::Failed => "terminated_failed",
+                            AgentLiveTermination::Interrupted => "terminated_interrupted",
+                            AgentLiveTermination::Cancelled => "terminated_cancelled",
+                        }
+                    }
+                    AgentLiveEventKind::Signal(AgentLiveSignal::RunStarted { .. }) => "run_started",
+                    AgentLiveEventKind::Signal(AgentLiveSignal::TranscriptCommitted { .. }) => {
+                        "transcript_committed"
+                    }
+                    _ => "other",
+                },
+            };
+            *counts.entry(tag).or_default() += 1;
+            last_event = Some(tag);
+        }
+        // Event counts are observations, not a certified count/status of children.
+        json!({"identity_verified":stream.identity_verified, "has_diagnostics":!stream.diagnostics.is_empty(),
+            "last_event":last_event, "event_counts":counts})
+    });
+    let journal = session.map(|session| {
+        let mut counts = BTreeMap::<&str, u64>::new();
+        let mut last_event = None;
+        for event in &session.events {
+            let tag = match event.event_type.as_str() {
+                "llm_round" => "llm_round",
+                "turn" => "turn",
+                "turn_error" => "turn_error",
+                "tool_invocation" => "tool_invocation",
+                "LlmRoundStarted" => "llm_round_started",
+                "LlmRoundCompleted" => "llm_round_completed",
+                "LlmRoundFailed" => "llm_round_failed",
+                "ToolCallStarted" => "tool_call_started",
+                "ToolCallCompleted" => "tool_call_completed",
+                "ToolCallFailed" => "tool_call_failed",
+                "ToolCallSkipped" => "tool_call_skipped",
+                "StepStarted" => "step_started",
+                "StepCompleted" => "step_completed",
+                "StepIncomplete" => "step_incomplete",
+                "StepFailed" => "step_failed",
+                _ => "other",
+            };
+            *counts.entry(tag).or_default() += 1;
+            last_event = Some(tag);
+        }
+        json!({"skipped_lines":session.skipped_lines, "dropped_lines":session.dropped_lines,
+            "integrity_errors":session.integrity_errors,
+            "last_event":last_event, "event_counts":counts})
+    });
+    json!({
+        "final_state":outcome.final_state.as_deref().map(|state| match state {
+            "completed" => "completed", "interrupted" => "interrupted", "failed" => "failed",
+            _ => "other",
+        }),
+        "interruption_kind":outcome.interruption_kind.as_deref().map(interruption),
+        "error_kind":outcome.error_kind.as_deref().map(error_kind),
+        "error_code":outcome.error_code.as_deref().map(error_code),
+        "server_admission_not_dispatched":outcome.server_admission_not_dispatched,
+        "stream":stream, "journal":journal,
+    })
+}
 
 fn criteria(
     values: &[CriterionResult],
@@ -95,6 +214,7 @@ fn row(report: &CaseRunReport) -> io::Result<Value> {
         .map(|s| {
             Ok(json!({
                 "step_index":s.step_index, "passed":s.passed, "duration_ms":s.duration_ms,
+                "execution_diagnostic":execution_diagnostic(&s.outcome, None),
                 "criteria":criteria(&s.criteria, &s.outcome, report.session.as_ref())?
             }))
         })
@@ -103,6 +223,7 @@ fn row(report: &CaseRunReport) -> io::Result<Value> {
         json!({"case":report.case_name, "model":report.model, "run_index":report.run_index,
         "status":report.status, "has_warnings":report.has_warnings,
         "failure_class":failure, "exit_code":o.exit_code,
+        "execution_diagnostic":execution_diagnostic(o, report.session.as_ref()),
         "criteria":criteria(&report.criteria, o, report.session.as_ref())?, "steps":steps?,
         "token_usage_coverage":o.token_usage_coverage,
         "terminal_reported":{"duration_ms":o.duration_ms, "ttft_ms":o.ttft_ms,
@@ -239,6 +360,107 @@ pub async fn observe(
 mod tests {
     use super::*;
     use crate::{report::StepResult, runner::RunOutcome};
+
+    #[test]
+    fn execution_diagnostics_keep_typed_failure_and_missing_evidence_distinct() {
+        let outcome = RunOutcome {
+            exit_code: 3,
+            final_state: Some("failed".into()),
+            error_kind: Some("contract_violation".into()),
+            error_code: Some("canonical_persistence_failed".into()),
+            text: "private-sentinel".into(),
+            stderr: "private-sentinel".into(),
+            ..RunOutcome::new("model")
+        };
+        let diagnostic = execution_diagnostic(&outcome, None);
+        assert_eq!(diagnostic["final_state"], "failed");
+        assert_eq!(diagnostic["error_kind"], "contract_violation");
+        assert_eq!(diagnostic["error_code"], "canonical_persistence_failed");
+        assert!(diagnostic["stream"].is_null());
+        assert!(diagnostic["journal"].is_null());
+        assert!(!diagnostic.to_string().contains("private-sentinel"));
+        for kind in ["timeout", "stream_transport", "executor_dropped"] {
+            let timeout = RunOutcome {
+                final_state: Some("interrupted".into()),
+                interruption_kind: Some(kind.into()),
+                ..outcome.clone()
+            };
+            assert_eq!(
+                execution_diagnostic(&timeout, None)["interruption_kind"],
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn execution_diagnostics_redact_unknown_tags_and_count_only_event_shapes() {
+        use crate::session_capture::{JournalEvent, SessionCapture};
+        let mut stream = crate::runner::StreamCapture::default();
+        for (index, kind) in [
+            json!({"type":"output_delta", "model_item_id":null, "text":"private-sentinel"}),
+            json!({"type":"agent_terminated", "termination":"completed", "duration_ms":20,
+                "reason":"private-sentinel"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            stream.observe(
+                &json!({"type":"agent_live", "event":{
+                    "run_id":"private-sentinel", "agent_id":"private-sentinel", "kind":kind
+                }}),
+                index as u64,
+            );
+        }
+        let outcome = RunOutcome {
+            final_state: Some("private-sentinel".into()),
+            error_kind: Some("private-sentinel".into()),
+            error_code: Some("private-sentinel".into()),
+            interruption_kind: Some("private-sentinel".into()),
+            stream_capture: Some(stream),
+            ..RunOutcome::new("model")
+        };
+        let session = SessionCapture {
+            events: [
+                "llm_round",
+                "ToolCallCompleted",
+                "turn_error",
+                "private-sentinel",
+            ]
+            .into_iter()
+            .map(|tag| JournalEvent {
+                event_type: tag.into(),
+                raw: json!({"private-sentinel":"private-sentinel"}),
+            })
+            .collect(),
+            dropped_lines: 2,
+            ..Default::default()
+        };
+        let diagnostic = execution_diagnostic(&outcome, Some(&session));
+        for field in [
+            "final_state",
+            "error_kind",
+            "error_code",
+            "interruption_kind",
+        ] {
+            assert_eq!(diagnostic[field], "other");
+        }
+        assert_eq!(diagnostic["stream"]["identity_verified"], false);
+        assert_eq!(diagnostic["stream"]["has_diagnostics"], false);
+        assert_eq!(diagnostic["stream"]["last_event"], "terminated_completed");
+        assert_eq!(
+            diagnostic["stream"]["event_counts"]["terminated_completed"],
+            1
+        );
+        assert_eq!(diagnostic["stream"]["event_counts"]["output_delta"], 1);
+        assert_eq!(diagnostic["journal"]["event_counts"]["turn_error"], 1);
+        assert_eq!(
+            diagnostic["journal"]["event_counts"]["tool_call_completed"],
+            1
+        );
+        assert_eq!(diagnostic["journal"]["last_event"], "other");
+        assert_eq!(diagnostic["journal"]["dropped_lines"], 2);
+        assert!(!diagnostic.to_string().contains("private-sentinel"));
+    }
 
     fn fixture_evaluate(criteria: &[Criterion], outcome: &RunOutcome) -> Vec<CriterionResult> {
         let trace = outcome
