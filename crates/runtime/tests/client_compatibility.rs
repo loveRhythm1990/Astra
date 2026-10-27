@@ -91,14 +91,20 @@ async fn historical_clients_use_the_fresh_server() {
     let output = result
         .expect("historical client driver exceeded its bound")
         .expect("historical client driver must start");
-    assert!(
-        output.status.success(),
-        "historical client compatibility failed; inspect the categorical compatibility report"
-    );
     let report: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(report).expect("successful driver must create its report"),
+        &std::fs::read_to_string(report).expect("driver must create its categorical report"),
     )
     .expect("compatibility report must be valid JSON");
+    assert!(
+        output.status.success(),
+        "historical client compatibility failed: client={}, case={}, category={}, diagnostics={}, provider_errors={}, provider_phases={}; inspect the job summary",
+        report["active_client"],
+        report["active_case"],
+        report["failure_category"],
+        report["diagnostics"],
+        report["provider_error_categories"],
+        report["provider_phases"],
+    );
     assert_eq!(report["status"], "passed");
     assert_eq!(report["server_source"], source);
 }

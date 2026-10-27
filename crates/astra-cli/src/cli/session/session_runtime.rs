@@ -2555,11 +2555,10 @@ mod tests {
     }
 
     use super::{
-        ACCESS_TOKEN_REFRESH_SKEW_SECS, BannerTextStyle, ModelCatalogError, RestoredSessionState,
-        ServerDefaultModel, SilentRefreshError, access_token_needs_refresh,
-        applied_user_intents_from_turn_metadata, banner_session_display, banner_welcome_text,
-        create_pipeline_modules, current_access_token, current_git_root,
-        default_model_selection_from_access, ensure_state_default_model,
+        ACCESS_TOKEN_REFRESH_SKEW_SECS, BannerTextStyle, RestoredSessionState, ServerDefaultModel,
+        SilentRefreshError, access_token_needs_refresh, applied_user_intents_from_turn_metadata,
+        banner_session_display, banner_welcome_text, create_pipeline_modules, current_access_token,
+        current_git_root, default_model_selection_from_access, ensure_state_default_model,
         fetch_server_model_catalog, fresh_access_token, git_root_from, initialize_session_state,
         load_server_model_access, model_default_invalid_reason_message,
         model_selection_for_name_from_catalog, pending_recovery_status_line,

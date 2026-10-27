@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import signal
 import socket
 import subprocess
@@ -31,7 +32,9 @@ import mock_openai_server as mock  # noqa: E402
 
 
 class Failure(RuntimeError):
-    pass
+    def __init__(self, category, diagnostics=None):
+        super().__init__(category)
+        self.diagnostics = diagnostics
 
 
 def deadline_exceeded(_signal, _frame):
@@ -112,7 +115,16 @@ def result_json(result):
 
 def completed(result, expected):
     body = result_json(result)
-    require(result.returncode == 0 and body.get("success") is True, "client_chat_failed")
+    if result.returncode != 0 or body.get("success") is not True:
+        diagnostics = {"exit_code": result.returncode,
+                       "server_terminal_authoritative": body.get("server_terminal_authoritative") is True}
+        # Retain only bounded machine classifications from the synthetic
+        # journey, never free-form error messages or provider/client output.
+        for field in ("error_kind", "error_code", "final_state"):
+            value = body.get(field)
+            if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,79}", value):
+                diagnostics[field] = value
+        raise Failure("client_chat_failed", diagnostics)
     require(body.get("final_state") == "completed", "client_terminal_not_completed")
     require(body.get("text") == expected, "client_answer_mismatch")
     require(bool(body.get("session_id")) and bool(body.get("run_id")), "client_terminal_identity_missing")
@@ -669,6 +681,9 @@ def run(args, report):
                 report["cases"].append({"client": "candidate", "case": "ordinary_chat", "status": "passed"})
         require(not provider.errors, "provider_contract_failed")
     finally:
+        with provider.lock:
+            report["provider_error_categories"] = list(provider.errors)
+            report["provider_phases"] = sorted([list(phase) for phase in provider.claimed])
         provider.close()
     if args.current_cli is not None:
         rollback(args, artifacts, report)
@@ -698,6 +713,8 @@ def main():
         report["active_client"] = None
     except Exception as error:
         report["failure_category"] = str(error) if isinstance(error, (Failure, ArtifactError)) else type(error).__name__
+        if isinstance(error, Failure) and error.diagnostics is not None:
+            report["diagnostics"] = error.diagnostics
     finally:
         signal.alarm(0)
         report["elapsed_seconds"] = round(time.monotonic() - started, 3)
