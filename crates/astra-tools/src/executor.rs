@@ -149,7 +149,7 @@ impl DefaultToolExecutor {
     /// intentionally retain the pinned-direct default.
     pub fn with_local_network(
         mut self,
-        fake_ip: Option<Arc<crate::web_fetch::FakeIpPolicy>>,
+        fake_ip: Result<Option<Arc<crate::web_fetch::FakeIpPolicy>>, String>,
     ) -> Self {
         self.fetch_network = crate::web_fetch::FetchNetwork::local_environment(fake_ip);
         self

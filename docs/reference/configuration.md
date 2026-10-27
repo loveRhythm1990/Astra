@@ -295,7 +295,7 @@ Server-loop Memoria observer and post-loop memory cleanup are fixed internal asy
 ### Local `web_fetch` behind fake-IP DNS
 
 Edge/CLI `web_fetch` and `web_search` block destinations that resolve to a
-private or reserved address, including `198.18.0.0/15`. Local VPN/proxy tools
+known private or reserved address, including `198.18.0.0/15`. Local VPN/proxy tools
 in fake-IP mode (Clash/mihomo, Surge, sing-box) answer every lookup from that
 range, so every fetch is blocked. Users on such a network can relax the
 private-network boundary for fake-IP answers in the user-level
@@ -312,13 +312,19 @@ This is a relaxation, not a verification. When every address from the local
 DNS lies in an IPv4 fake range, the fetch goes to the fake address and the VPN
 resolves the hostname and picks the real destination; Astra cannot see or
 check it. Before allowing the fetch, Astra screens the hostname by asking the
-resolvers (RFC 8484) for its public A and AAAA records and blocks it if any of
-them is private. Literal fake addresses, empty answers and
-unreachable resolvers stay blocked, and a private address reported for either
+resolvers (RFC 8484) for A and AAAA records and blocks it if any falls in
+Astra's blocked address ranges. The list is not an exhaustive registry of all
+special-purpose addresses; broader classification is tracked in #1140.
+Resolvers are tried in order when one is unreachable, gives
+an unusable response, or returns no address. Literal fake addresses and hosts
+with no usable resolver answer stay blocked, and a private address reported for either
 record type blocks the fetch even if the other query failed. There is no
 built-in resolver: pick one your network does not block, because many networks
 that use fake-IP DNS also block well-known DoH endpoints. Resolver URLs must
-not contain credentials; errors name a resolver only by its position and host.
+not contain userinfo; paths and query parameters may contain sensitive values,
+and errors name a resolver only by its position and host.
+The `0.0.0.0/8` this-network range is also blocked, including when embedded in
+IPv4-mapped or NAT64 IPv6 addresses.
 
 Only IPv4 fake answers are supported. IPv6 fake-IP ranges (for example
 `2001:2::/48`, used in sing-box's documented configuration) and answers that mix
@@ -329,12 +335,17 @@ need this option.
 
 Only the user-level file and an explicit `--settings` overlay can set this
 section. A project `.astra/config/runtime.toml` cannot; the section is ignored
-with a warning. There is intentionally no environment variable, because the CLI
+with a warning, and the config editor omits it when saving project defaults.
+If the project and user file are the same file, save as user defaults instead.
+User defaults and local config-version blobs are written with private file
+permissions on Unix. There is intentionally no environment variable, because the CLI
 loads `.env` from the working directory. For the same reason a workspace `.env`
 cannot set `ASTRA_LOCAL_STATE_ROOT` or a missing `HOME`, which locate the
 user-level file. Server
-`web_fetch` never reads the section, and an invalid section leaves the default
-block in place with a warning.
+`web_fetch` never reads the section. An invalid resolver or fake-IP range
+keeps the default block and reports the configuration error when a fake-IP
+host is fetched. A syntactically invalid user file is rejected as a whole;
+use `--diagnostic-log` to see the configuration-loader warning.
 
 Screening does not bind the VPN's destination. A hostname that answers the
 resolver with a public address and the VPN's DNS with a private one (DNS

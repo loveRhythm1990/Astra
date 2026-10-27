@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use astra_config::runtime_config::{FakeIpMode, RuntimeConfig, WebFetchConfig};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::{Name, RData, RecordType};
+use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
 use ipnet::{Ipv4Net, Ipv6Net};
 use reqwest::header;
 
@@ -29,6 +29,7 @@ use super::{SsrfBlockReason, is_private_ip};
 const DNS_MESSAGE: &str = "application/dns-message";
 const DOH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DNS_MESSAGE_BYTES: usize = 64 * 1024;
+const MAX_CNAME_HOPS: usize = 16;
 
 /// RFC 2544 benchmarking range: never assigned to real hosts, and the range
 /// fake-IP implementations draw from.
@@ -97,8 +98,8 @@ impl FakeIpPolicy {
     }
 
     /// Pass `host` only when a configured resolver gives complete, consistent
-    /// answers for both address families and every reported address is
-    /// public. Fails closed when no resolver does. Passing does not bind the
+    /// answers for both address families and no reported address is in an
+    /// Astra-blocked range. Fails closed when no resolver does. Passing does not bind the
     /// VPN's destination; see the module documentation.
     ///
     /// A private address blocks the host even when it came from a truncated
@@ -108,6 +109,7 @@ impl FakeIpPolicy {
         let mut name = Name::from_ascii(host).map_err(|_| SsrfBlockReason::FakeIpNoDohAnswer)?;
         name.set_fqdn(true);
         let mut failures = Vec::new();
+        let mut empty_answers = 0;
         for (index, resolver) in self.resolvers.iter().enumerate() {
             let (v4, v6) = resolve_via_doh(resolver, &name).await;
             let real: Vec<IpAddr> = v4.addrs.iter().chain(&v6.addrs).copied().collect();
@@ -123,36 +125,37 @@ impl FakeIpPolicy {
                     "contradictory answers: NXDOMAIN for one address family, records for the other"
                         .to_string()
                 }
-                _ if real.is_empty() => return Err(SsrfBlockReason::FakeIpNoDohAnswer),
+                _ if real.is_empty() => {
+                    empty_answers += 1;
+                    "no address records".to_string()
+                }
                 _ => return Ok(()),
             };
             failures.push(format!("{}: {failure}", resolver_label(index, resolver)));
         }
-        Err(SsrfBlockReason::FakeIpDohUnavailable(failures.join("; ")))
+        if empty_answers == self.resolvers.len() {
+            Err(SsrfBlockReason::FakeIpNoDohAnswer)
+        } else {
+            Err(SsrfBlockReason::FakeIpDohUnavailable(failures.join("; ")))
+        }
     }
 }
 
 /// The policy from the user's runtime configuration, for Edge/CLI owners.
 /// Invalid configuration is reported and leaves the default block in place.
-pub fn configured_fake_ip_policy() -> Option<Arc<FakeIpPolicy>> {
-    match FakeIpPolicy::from_config(&RuntimeConfig::cached().web_fetch) {
-        Ok(policy) => policy.map(Arc::new),
-        Err(error) => {
-            tracing::warn!(%error, "invalid [web_fetch] configuration; fake-IP validation stays off");
-            None
-        }
-    }
+pub fn configured_fake_ip_policy() -> Result<Option<Arc<FakeIpPolicy>>, String> {
+    FakeIpPolicy::from_config(&RuntimeConfig::cached().web_fetch).map(|policy| policy.map(Arc::new))
 }
 
 fn parse_fake_ip_range(raw: &str) -> Result<Ipv4Net, String> {
     let range = raw
         .trim()
         .parse::<Ipv4Net>()
-        .map_err(|e| format!("invalid web_fetch.fake_ip_ranges entry `{raw}`: {e}"))?
+        .map_err(|_| "invalid web_fetch.fake_ip_ranges entry".to_string())?
         .trunc();
     if !FAKE_IP_RANGE.contains(&range) {
         return Err(format!(
-            "web_fetch.fake_ip_ranges entry `{raw}` must lie within {FAKE_IP_RANGE}"
+            "web_fetch.fake_ip_ranges entry must lie within {FAKE_IP_RANGE}"
         ));
     }
     Ok(range)
@@ -220,13 +223,22 @@ async fn resolve_via_doh(resolver: &url::Url, name: &Name) -> (FamilyAnswer, Fam
         }
     };
     let (v4, v6) = futures::join!(
-        query(&client, resolver, name, RecordType::A),
-        query(&client, resolver, name, RecordType::AAAA)
+        bounded_query(&client, resolver, name, RecordType::A),
+        bounded_query(&client, resolver, name, RecordType::AAAA)
     );
-    (
-        v4.unwrap_or_else(FamilyAnswer::failed),
-        v6.unwrap_or_else(FamilyAnswer::failed),
-    )
+    (v4, v6)
+}
+
+async fn bounded_query(
+    client: &reqwest::Client,
+    resolver: &url::Url,
+    name: &Name,
+    record_type: RecordType,
+) -> FamilyAnswer {
+    match tokio::time::timeout(DOH_TIMEOUT, query(client, resolver, name, record_type)).await {
+        Ok(answer) => answer,
+        Err(_) => FamilyAnswer::failed(format!("{record_type} query timed out")),
+    }
 }
 
 async fn query(
@@ -234,7 +246,134 @@ async fn query(
     resolver: &url::Url,
     name: &Name,
     record_type: RecordType,
-) -> Result<FamilyAnswer, String> {
+) -> FamilyAnswer {
+    let mut current = name.clone();
+    let mut visited = vec![current.clone()];
+    loop {
+        let answer = match query_message(client, resolver, &current, record_type).await {
+            Ok(answer) => answer,
+            Err(error) => return FamilyAnswer::failed(error),
+        };
+        // Retain private evidence even if this response is otherwise invalid.
+        let addrs: Vec<IpAddr> = answer
+            .answers
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::A(a) => Some(IpAddr::V4(a.0)),
+                RData::AAAA(a) => Some(IpAddr::V6(a.0)),
+                _ => None,
+            })
+            .collect();
+        let failed = |error: String| FamilyAnswer {
+            addrs: addrs.clone(),
+            status: AnswerStatus::Failed(error),
+        };
+        if answer.metadata.message_type != MessageType::Response
+            || answer.metadata.op_code != OpCode::Query
+            || answer.metadata.id != 0
+            || answer.queries.len() != 1
+            || answer.queries[0].name() != &current
+            || answer.queries[0].query_type() != record_type
+            || answer.queries[0].query_class() != DNSClass::IN
+        {
+            return failed("DNS response does not match the query".into());
+        }
+        if addrs.iter().any(|ip| is_private_ip(*ip)) {
+            return FamilyAnswer {
+                addrs,
+                status: AnswerStatus::Complete,
+            };
+        }
+        if answer.metadata.truncation {
+            return failed(format!("truncated {record_type} response"));
+        }
+        match answer.metadata.response_code {
+            ResponseCode::NoError => {}
+            ResponseCode::NXDomain => {
+                return FamilyAnswer {
+                    addrs,
+                    status: AnswerStatus::NxDomain,
+                };
+            }
+            code => return failed(format!("DNS response code {code}")),
+        }
+
+        let mut terminal = current.clone();
+        let mut chain = vec![terminal.clone()];
+        loop {
+            let mut targets = answer.answers.iter().filter_map(|record| {
+                if record.name == terminal
+                    && record.dns_class == DNSClass::IN
+                    && let RData::CNAME(target) = &record.data
+                {
+                    return Some(target.0.clone());
+                }
+                None
+            });
+            let Some(target) = targets.next() else { break };
+            if targets.any(|other| other != target)
+                || visited.contains(&target)
+                || visited.len() >= MAX_CNAME_HOPS
+            {
+                return failed("invalid or cyclic CNAME chain".into());
+            }
+            visited.push(target.clone());
+            chain.push(target.clone());
+            terminal = target;
+        }
+        for record in &answer.answers {
+            match &record.data {
+                RData::A(_) | RData::AAAA(_) => {
+                    if record.name != terminal
+                        || record.dns_class != DNSClass::IN
+                        || record.record_type() != record_type
+                    {
+                        return failed("unrelated DNS address record".into());
+                    }
+                }
+                RData::CNAME(_)
+                    if record.dns_class != DNSClass::IN
+                        || !chain[..chain.len() - 1].contains(&record.name) =>
+                {
+                    return failed("unrelated DNS CNAME record".into());
+                }
+                _ => {}
+            }
+        }
+        if !addrs.is_empty() {
+            return FamilyAnswer {
+                addrs,
+                status: AnswerStatus::Complete,
+            };
+        }
+        let has_soa = answer.authorities.iter().any(|r| {
+            r.dns_class == DNSClass::IN
+                && matches!(r.data, RData::SOA(_))
+                && r.name.zone_of(&terminal)
+        });
+        let referral = answer
+            .authorities
+            .iter()
+            .any(|r| matches!(r.data, RData::NS(_)));
+        if referral && !has_soa {
+            return failed("DNS response is a referral".into());
+        }
+        if chain.len() == 1 || has_soa {
+            return FamilyAnswer {
+                addrs,
+                status: AnswerStatus::Complete,
+            };
+        }
+        current = terminal;
+    }
+}
+
+async fn query_message(
+    client: &reqwest::Client,
+    resolver: &url::Url,
+    name: &Name,
+    record_type: RecordType,
+) -> Result<Message, String> {
     // RFC 8484 recommends ID 0 so responses stay cacheable.
     let mut request = Message::new(0, MessageType::Query, OpCode::Query);
     request.metadata.recursion_desired = true;
@@ -258,30 +397,7 @@ async fn query(
         }
         bytes.extend_from_slice(&chunk);
     }
-    let answer = Message::from_vec(&bytes).map_err(|e| format!("malformed DNS response: {e}"))?;
-    if answer.metadata.message_type != MessageType::Response {
-        return Err("DNS response is not a response message".into());
-    }
-    let addrs = answer
-        .answers
-        .iter()
-        .filter_map(|record| match &record.data {
-            RData::A(a) => Some(IpAddr::V4(a.0)),
-            RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
-            _ => None,
-        })
-        .collect();
-    // A truncated response may have dropped records, including private ones.
-    let status = if answer.metadata.truncation {
-        AnswerStatus::Failed(format!("truncated {record_type} response"))
-    } else {
-        match answer.metadata.response_code {
-            ResponseCode::NoError => AnswerStatus::Complete,
-            ResponseCode::NXDomain => AnswerStatus::NxDomain,
-            code => AnswerStatus::Failed(format!("DNS response code {code}")),
-        }
-    };
-    Ok(FamilyAnswer { addrs, status })
+    Message::from_vec(&bytes).map_err(|e| format!("malformed DNS response: {e}"))
 }
 
 /// Keep the underlying cause (for example "connection reset by peer"):
@@ -339,6 +455,7 @@ mod tests {
                 .filter(|(record_type, _)| *record_type == question.query_type())
                 .map(|(_, degrade)| degrade);
             let mut response = Message::response(query.metadata.id, OpCode::Query);
+            response.add_query(question.clone());
             response.metadata.response_code = self.code;
             match degrade {
                 Some(Degrade::Http503) => return ResponseTemplate::new(503),
@@ -420,6 +537,227 @@ mod tests {
             fake_ip_ranges: ranges.iter().map(ToString::to_string).collect(),
             doh_resolvers: resolvers.iter().map(ToString::to_string).collect(),
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ChallengedAnswer {
+        WrongQuestion,
+        WrongId,
+        WrongType,
+        WrongClass,
+        WrongRecordClass,
+        WrongQuestionPrivate,
+        UnrelatedAddress,
+        Alias,
+        AliasPrivate,
+        AliasPrivateV6,
+        BundledAlias,
+        AliasSoa,
+        UnrelatedSoaReferral,
+        AliasLoop,
+        Referral,
+    }
+
+    impl Respond for ChallengedAnswer {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            use hickory_proto::rr::rdata::{CNAME, NS, SOA};
+            let request = Message::from_vec(&request.body).unwrap();
+            let question = &request.queries[0];
+            let mut response = Message::response(
+                if matches!(self, Self::WrongId) {
+                    42
+                } else {
+                    request.metadata.id
+                },
+                OpCode::Query,
+            );
+            let unrelated = Name::from_ascii("unrelated.example.").unwrap();
+            let alias = Name::from_ascii("alias.example.").unwrap();
+            let mut echoed = question.clone();
+            if matches!(self, Self::WrongQuestion | Self::WrongQuestionPrivate) {
+                echoed = Query::query(unrelated.clone(), question.query_type());
+            }
+            if matches!(self, Self::WrongType) {
+                echoed = Query::query(question.name().clone(), RecordType::MX);
+            }
+            if matches!(self, Self::WrongClass) {
+                echoed.set_query_class(DNSClass::CH);
+            }
+            response.add_query(echoed);
+            match self {
+                Self::Alias | Self::AliasPrivate | Self::AliasPrivateV6 | Self::AliasLoop
+                    if question.name() != &alias =>
+                {
+                    response.add_answer(Record::from_rdata(
+                        question.name().clone(),
+                        60,
+                        RData::CNAME(CNAME(alias)),
+                    ));
+                }
+                Self::AliasLoop => {
+                    response.add_answer(Record::from_rdata(
+                        alias,
+                        60,
+                        RData::CNAME(CNAME(Name::from_ascii("target.example.").unwrap())),
+                    ));
+                }
+                Self::Referral => {
+                    response.add_authority(Record::from_rdata(
+                        question.name().clone(),
+                        60,
+                        RData::NS(NS(alias)),
+                    ));
+                }
+                Self::BundledAlias if question.query_type() == RecordType::A => {
+                    let terminal = Name::from_ascii("END.example.").unwrap();
+                    response.add_answer(Record::from_rdata(
+                        terminal.clone(),
+                        60,
+                        RData::A(A("8.8.8.8".parse().unwrap())),
+                    ));
+                    response.add_answer(Record::from_rdata(
+                        alias.clone(),
+                        60,
+                        RData::CNAME(CNAME(terminal)),
+                    ));
+                    response.add_answer(Record::from_rdata(
+                        question.name().clone(),
+                        60,
+                        RData::CNAME(CNAME(Name::from_ascii("ALIAS.example.").unwrap())),
+                    ));
+                }
+                Self::AliasSoa | Self::UnrelatedSoaReferral
+                    if question.query_type() == RecordType::AAAA =>
+                {
+                    response.add_answer(Record::from_rdata(
+                        question.name().clone(),
+                        60,
+                        RData::CNAME(CNAME(alias.clone())),
+                    ));
+                    let zone = if matches!(self, Self::AliasSoa) {
+                        Name::from_ascii("example.").unwrap()
+                    } else {
+                        unrelated.clone()
+                    };
+                    response.add_authority(Record::from_rdata(
+                        zone,
+                        60,
+                        RData::SOA(SOA::new(alias.clone(), alias.clone(), 1, 1, 1, 1, 1)),
+                    ));
+                    if matches!(self, Self::UnrelatedSoaReferral) {
+                        response.add_authority(Record::from_rdata(
+                            unrelated.clone(),
+                            60,
+                            RData::NS(NS(alias)),
+                        ));
+                    }
+                }
+                Self::AliasPrivateV6 if question.query_type() == RecordType::AAAA => {
+                    response.add_answer(Record::from_rdata(
+                        question.name().clone(),
+                        60,
+                        RData::AAAA(AAAA("::1".parse().unwrap())),
+                    ));
+                }
+                _ if question.query_type() == RecordType::A => {
+                    let owner = if matches!(self, Self::UnrelatedAddress) {
+                        unrelated
+                    } else {
+                        question.name().clone()
+                    };
+                    let ip = if matches!(self, Self::AliasPrivate | Self::WrongQuestionPrivate) {
+                        "127.0.0.1"
+                    } else {
+                        "8.8.8.8"
+                    };
+                    let mut record =
+                        Record::from_rdata(owner, 60, RData::A(A(ip.parse().unwrap())));
+                    if matches!(self, Self::WrongRecordClass) {
+                        record.dns_class = DNSClass::CH;
+                    }
+                    response.add_answer(record);
+                }
+                _ => {}
+            }
+            ResponseTemplate::new(200).set_body_bytes(response.to_vec().unwrap())
+        }
+    }
+
+    #[tokio::test]
+    async fn screening_checks_question_and_address_ownership() {
+        for answer in [
+            ChallengedAnswer::WrongQuestion,
+            ChallengedAnswer::WrongId,
+            ChallengedAnswer::WrongType,
+            ChallengedAnswer::WrongClass,
+            ChallengedAnswer::WrongRecordClass,
+            ChallengedAnswer::UnrelatedAddress,
+            ChallengedAnswer::UnrelatedSoaReferral,
+            ChallengedAnswer::AliasLoop,
+            ChallengedAnswer::Referral,
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(answer)
+                .mount(&server)
+                .await;
+            assert!(policy(&[&server]).screen("target.example").await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn screening_follows_aliases_and_blocks_private_terminal_addresses() {
+        for (answer, accepted) in [
+            (ChallengedAnswer::Alias, true),
+            (ChallengedAnswer::AliasPrivate, false),
+            (ChallengedAnswer::AliasPrivateV6, false),
+            (ChallengedAnswer::BundledAlias, true),
+            (ChallengedAnswer::AliasSoa, true),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(answer)
+                .mount(&server)
+                .await;
+            let result = policy(&[&server]).screen("target.example").await;
+            assert_eq!(result.is_ok(), accepted, "{result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_policy_reason_reaches_the_local_tool_result() {
+        let selection = FakeIpPolicy::from_config(&config(FakeIpMode::AllowDohScreened, &[], &[]))
+            .map(|policy| policy.map(Arc::new));
+        let network = FetchNetwork::local_environment(selection);
+        let blocked = validate_resolved_addrs("target.example", addrs(&["198.18.0.1"]), None)
+            .await
+            .unwrap_err();
+        let result = crate::web_fetch::render_fetch_result(Err(blocked), &network);
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .contains("requires at least one doh_resolvers"),
+            "{}",
+            result.output
+        );
+        assert!(!result.output.contains("The user can choose to relax"));
+    }
+
+    #[tokio::test]
+    async fn private_evidence_in_a_mismatched_answer_cannot_be_overruled() {
+        let suspect = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ChallengedAnswer::WrongQuestionPrivate)
+            .mount(&suspect)
+            .await;
+        let public = doh(ResponseCode::NoError, &["8.8.8.8"], &[]).await;
+        let result = policy(&[&suspect, &public]).screen("target.example").await;
+        assert!(matches!(
+            result,
+            Err(SsrfBlockReason::FakeIpRealAddressPrivate(_))
+        ));
+        assert!(public.received_requests().await.unwrap().is_empty());
     }
 
     #[test]
@@ -541,6 +879,7 @@ mod tests {
     #[tokio::test]
     async fn doh_reporting_any_private_real_address_is_blocked() {
         for (v4, v6) in [
+            (&["0.0.0.1"][..], &[][..]),
             (&["127.0.0.1"][..], &[][..]),
             (&["93.184.216.34", "10.1.2.3"][..], &[][..]),
             (&["93.184.216.34"][..], &["::1"][..]),
@@ -606,6 +945,15 @@ mod tests {
         )
         .await
         .expect("the next configured resolver answers");
+
+        let empty = doh(ResponseCode::NoError, &[], &[]).await;
+        validate_resolved_addrs(
+            "github.com",
+            addrs(&["198.18.0.23"]),
+            Some(&policy(&[&empty, &working])),
+        )
+        .await
+        .expect("an empty answer does not prevent trying the next resolver");
     }
 
     #[tokio::test]
@@ -820,10 +1168,10 @@ mod tests {
 
     #[test]
     fn only_the_local_environment_can_carry_the_opt_in() {
-        assert!(FetchNetwork::direct_pinned().fake_ip.is_none());
-        assert!(FetchNetwork::default().fake_ip.is_none());
+        assert!(matches!(FetchNetwork::direct_pinned().fake_ip, Ok(None)));
+        assert!(matches!(FetchNetwork::default().fake_ip, Ok(None)));
         let local =
-            FetchNetwork::local_environment(Some(Arc::new(FakeIpPolicy::for_test(Vec::new()))));
-        assert!(local.fake_ip.is_some());
+            FetchNetwork::local_environment(Ok(Some(Arc::new(FakeIpPolicy::for_test(Vec::new())))));
+        assert!(matches!(local.fake_ip, Ok(Some(_))));
     }
 }

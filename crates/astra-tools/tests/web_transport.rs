@@ -15,7 +15,7 @@ async fn live_owner_network() {
     let workspace = tempfile::tempdir().unwrap();
     let direct = DefaultToolExecutor::for_workspace(workspace.path(), "network-test", "direct");
     let local = DefaultToolExecutor::for_workspace(workspace.path(), "network-test", "local")
-        .with_local_network(None);
+        .with_local_network(Ok(None));
     let url = std::env::var("ASTRA_TEST_PUBLIC_URL").expect("explicit public URL required");
     let args = json!({"url": url, "timeout": 5, "max_content": 2048});
     let result = local.execute("web_fetch", &args).await;
@@ -56,7 +56,8 @@ async fn live_fake_ip_screening() {
     let url = std::env::var("ASTRA_TEST_PUBLIC_URL").expect("explicit public URL required");
     let resolver = std::env::var("ASTRA_TEST_DOH_RESOLVER").expect("explicit DoH URL required");
     let args = json!({"url": url, "timeout": 15, "max_content": 2048});
-    let blocked = fetch_with_cache_scope(&args, "", &FetchNetwork::local_environment(None)).await;
+    let blocked =
+        fetch_with_cache_scope(&args, "", &FetchNetwork::local_environment(Ok(None))).await;
     assert!(
         blocked.is_error,
         "requires a host the local DNS maps to 198.18.0.0/15"
@@ -70,7 +71,7 @@ async fn live_fake_ip_screening() {
     .unwrap()
     .map(std::sync::Arc::new);
     let admitted =
-        fetch_with_cache_scope(&args, "", &FetchNetwork::local_environment(policy)).await;
+        fetch_with_cache_scope(&args, "", &FetchNetwork::local_environment(Ok(policy))).await;
     assert!(!admitted.is_error, "with opt-in: {admitted:?}");
     let data: Value = serde_json::from_str(&admitted.output).unwrap();
     println!(
@@ -88,7 +89,7 @@ async fn proxy_worker() {
     let network = if mode == "direct" {
         FetchNetwork::direct_pinned()
     } else {
-        FetchNetwork::local_environment(None)
+        FetchNetwork::local_environment(Ok(None))
     };
     let result = fetch_with_cache_scope(
         &json!({"url": TARGET, "allow_http": true, "timeout": 1}),
