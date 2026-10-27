@@ -22,6 +22,7 @@ async fn wait_for_chat_observers(
         loop {
             let metrics = registry.render_prometheus();
             let mut completed = 0;
+            let mut scheduled = 0;
             for line in metrics.lines().filter(|line| {
                 line.starts_with("astra_turn_observer_runs_total{")
                     || line.starts_with("astra_turn_observer_dispatches_total{")
@@ -44,10 +45,15 @@ async fn wait_for_chat_observers(
                         "astra_turn_observer_dispatches_total{mode=\"async\",outcome=\"scheduled\"}",
                         "authorized SQL budget requires scheduled observation: {line}"
                     );
+                    scheduled += value;
                 }
             }
+            assert!(
+                scheduled <= expected_observers,
+                "unexpected extra scheduled observer"
+            );
             assert!(completed <= expected_observers, "unexpected extra observer");
-            if completed == expected_observers {
+            if scheduled == expected_observers && completed == expected_observers {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -57,16 +63,38 @@ async fn wait_for_chat_observers(
     .expect("each chat must finish its detached observer before ending SQL capture");
 }
 
-#[tokio::test]
-async fn sql_budget_requires_the_expected_successful_observations() {
+fn observer_metrics(
+    scheduled: u64,
+    successes: u64,
+) -> Arc<astra_turn_core::pipeline_metrics::MetricsRegistry> {
     let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+    registry.register_counter("astra_turn_observer_dispatches_total", "observer test");
     registry.register_counter("astra_turn_observer_runs_total", "observer test");
+    registry.increment_counter(
+        "astra_turn_observer_dispatches_total",
+        &[("mode", "async"), ("outcome", "scheduled")],
+        scheduled,
+    );
     registry.increment_counter(
         "astra_turn_observer_runs_total",
         &[("mode", "async"), ("outcome", "success")],
-        2,
+        successes,
     );
-    wait_for_chat_observers(registry, 2).await;
+    registry
+}
+
+#[tokio::test]
+async fn sql_budget_requires_the_expected_successful_observations() {
+    wait_for_chat_observers(observer_metrics(2, 2), 2).await;
+}
+
+#[tokio::test]
+async fn sql_budget_rejects_extra_scheduled_but_pending_observer() {
+    let result = tokio::spawn(wait_for_chat_observers(observer_metrics(2, 1), 1)).await;
+    assert!(
+        result.is_err_and(|error| error.is_panic()),
+        "the first success must not end capture while a duplicate scheduled observer can still issue SQL"
+    );
 }
 
 #[tokio::test]
@@ -80,14 +108,7 @@ async fn sql_budget_rejects_skipped_failed_or_dropped_observations() {
         ("astra_turn_observer_dispatches_total", "skipped_empty"),
     ] {
         for successes in [0, 1] {
-            let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
-            registry.register_counter(metric, "observer test");
-            registry.register_counter("astra_turn_observer_runs_total", "observer test");
-            registry.increment_counter(
-                "astra_turn_observer_runs_total",
-                &[("mode", "async"), ("outcome", "success")],
-                successes,
-            );
+            let registry = observer_metrics(1, successes);
             registry.increment_counter(metric, &[("mode", "async"), ("outcome", outcome)], 1);
             let result = tokio::spawn(wait_for_chat_observers(registry, 1)).await;
             assert!(
