@@ -62,8 +62,17 @@ ID token and MOI/Astra bootstraps as browser login. The grant secret is held onl
 in memory. Pending, denial, expiry, cancellation and failed preparation preserve
 the previous local sign-in. Ctrl+C stops waiting; the pending server-side request
 expires on its own. Once tokens arrive, wait for bounded sign-in preparation and
-publication to settle. An uncertain token response requires starting a new
-request, rather than treating the terminal as authenticated.
+publication to settle; Ctrl+C does not cancel this credential finalization phase.
+The 60-second preparation timeout does not include local publication or the
+separate old-session revocation attempt. An uncertain token response requires
+starting a new request, rather than treating the terminal as authenticated.
+
+The CLI waits at most 600 seconds, or the server's shorter device-code lifetime.
+A longer server lifetime is accepted, but reaching the local limit reports a
+waiting timeout, not a claim that the server grant has expired. Polling intervals
+and retry delays are never shortened to fit one last request before the deadline.
+If device-code creation is rate limited, wait before retrying; a temporarily
+unavailable UC service is reported separately from a rejected request.
 
 UC binds the browser identity to the original device session; Keycloak owns the
 single final approval/denial and the resulting grant. Existing browser SSO does

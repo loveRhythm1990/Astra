@@ -42,14 +42,12 @@ fn device_endpoints_cannot_change_origin_or_escape_the_fixed_protocol() {
 }
 
 #[test]
-fn invalid_device_codes_and_unbounded_lifetimes_are_rejected() {
+fn invalid_device_codes_and_zero_lifetimes_are_rejected() {
     let issuer = "https://uc.example.test/realms/moi";
     assert!(grant(issuer).validate(issuer).is_ok());
-    for lifetime in [0, 601, u64::MAX] {
-        let mut value = grant(issuer);
-        value.expires_in = lifetime;
-        assert!(value.validate(issuer).is_err());
-    }
+    let mut value = grant(issuer);
+    value.expires_in = 0;
+    assert!(value.validate(issuer).is_err());
     for code in [
         "",
         "short",
@@ -67,6 +65,75 @@ fn invalid_device_codes_and_unbounded_lifetimes_are_rejected() {
     value = grant(issuer);
     value.interval = 0;
     assert!(value.validate(issuer).is_err());
+}
+
+#[test]
+fn longer_server_lifetimes_limit_waiting_without_claiming_expiry() {
+    let issuer = "https://uc.example.test/realms/moi";
+    for lifetime in [1, 600, 601, u64::MAX] {
+        let mut value = grant(issuer);
+        value.expires_in = lifetime;
+        assert!(value.validate(issuer).is_ok());
+        assert_eq!(value.wait_duration().as_secs(), lifetime.min(600));
+        assert_eq!(
+            value.deadline_error(),
+            if lifetime > 600 { WAIT_TIMEOUT } else { EXPIRED }
+        );
+    }
+}
+
+#[tokio::test]
+async fn authorization_failures_distinguish_throttling_availability_and_rejection() {
+    for (status, expected) in [
+        (429, "Too many device sign-in requests"),
+        (500, "temporarily unavailable"),
+        (503, "temporarily unavailable"),
+        (400, "was rejected"),
+        (403, "was rejected"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(status).set_body_string("DO_NOT_RENDER_THIS"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let response = native::http_client()
+            .unwrap()
+            .post(server.uri())
+            .send()
+            .await
+            .unwrap();
+        let error = authorization_response(response, &environment(&server).issuer)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains(expected));
+        assert!(error.contains("no local session was changed"));
+        assert!(!error.contains("DO_NOT_RENDER"));
+    }
+}
+
+#[tokio::test]
+async fn longer_authorization_response_is_accepted_and_wait_is_bounded() {
+    let server = MockServer::start().await;
+    let issuer = environment(&server).issuer;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "device_code": "memory-only-grant", "user_code": "ABCD-EFGH",
+            "verification_uri": format!("{issuer}/device"), "expires_in": 900
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let response = native::http_client()
+        .unwrap()
+        .post(server.uri())
+        .send()
+        .await
+        .unwrap();
+    let value = authorization_response(response, &issuer).await.unwrap();
+    assert_eq!(value.expires_in, 900);
+    assert_eq!(value.wait_duration(), Duration::from_secs(600));
 }
 
 #[test]
@@ -111,6 +178,83 @@ async fn expiry_stops_before_another_poll_request() {
         &grant(&environment.issuer),
         "private-verifier",
         Instant::now() + Duration::from_millis(20),
+    )
+    .await;
+    assert!(matches!(result, Err(error) if error == EXPIRED));
+}
+
+#[tokio::test]
+async fn local_wait_timeout_does_not_claim_the_server_grant_expired() {
+    let server = MockServer::start().await;
+    let environment = environment(&server);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let mut value = grant(&environment.issuer);
+    value.expires_in = u64::MAX;
+    value.interval = u64::MAX;
+    let error = poll(
+        &native::http_client().unwrap(),
+        &environment,
+        &value,
+        "private-verifier",
+        Instant::now() + Duration::from_millis(20),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(error, WAIT_TIMEOUT);
+}
+
+#[tokio::test]
+async fn retry_delay_and_slowdown_are_not_shortened_for_a_final_poll() {
+    for response in [
+        ResponseTemplate::new(429).insert_header("Retry-After", "60"),
+        ResponseTemplate::new(503),
+        ResponseTemplate::new(400).set_body_json(serde_json::json!({"error": "slow_down"})),
+    ] {
+        let server = MockServer::start().await;
+        let environment = environment(&server);
+        Mock::given(method("POST"))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let result = poll(
+            &native::http_client().unwrap(),
+            &environment,
+            &grant(&environment.issuer),
+            "private-verifier",
+            deadline,
+        )
+        .await;
+        assert!(matches!(result, Err(error) if error == EXPIRED));
+        assert!(Instant::now() >= deadline);
+    }
+}
+
+#[tokio::test]
+async fn server_expiry_is_terminal_even_when_local_wait_would_be_longer() {
+    let server = MockServer::start().await;
+    let environment = environment(&server);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "expired_token"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut value = grant(&environment.issuer);
+    value.expires_in = 900;
+    let result = poll(
+        &native::http_client().unwrap(),
+        &environment,
+        &value,
+        "private-verifier",
+        Instant::now() + Duration::from_secs(10),
     )
     .await;
     assert!(matches!(result, Err(error) if error == EXPIRED));

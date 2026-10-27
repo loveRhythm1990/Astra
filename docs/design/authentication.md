@@ -359,7 +359,11 @@ rollout are tracked in [Matrixflow #17972](https://github.com/matrixorigin/matri
 
 Polling obeys the issuer interval, increases it permanently for `slow_down`,
 backs off transient transport/availability failures, and stops at a bounded
-expiry. A successful but malformed token response is terminal and is not
+wait of `min(expires_in, 600)` seconds. Longer server lifetimes remain valid;
+the local wait limit is reported separately from server grant expiry. No final
+poll bypasses the issuer interval or retry delay. Authorization creation errors
+distinguish HTTP 429, HTTP 5xx and rejection without rendering upstream bodies.
+A successful but malformed token response is terminal and is not
 replayed. New credentials are published only after existing MOI and Astra
 preparation succeeds. No implicit browser/manual fallback is introduced.
 

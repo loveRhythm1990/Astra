@@ -8,6 +8,8 @@ use tokio::time::Instant;
 
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const EXPIRED: &str = "Device sign-in expired. Run `astra login --device-code` to start again.";
+const MAX_WAIT_SECS: u64 = 600;
+const WAIT_TIMEOUT: &str = "Stopped waiting for device sign-in after 600 seconds. No local session was changed; the pending request may remain valid until it expires. Run `astra login --device-code` to start again.";
 
 // Deliberately not Debug: the grant secret must never be rendered or logged.
 #[derive(Deserialize)]
@@ -48,7 +50,6 @@ impl DeviceAuthorization {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-')
             || self.expires_in == 0
-            || self.expires_in > 600
             || self.interval == 0
             || self.interval > self.expires_in
         {
@@ -56,6 +57,38 @@ impl DeviceAuthorization {
         }
         Ok(())
     }
+
+    fn wait_duration(&self) -> Duration {
+        Duration::from_secs(self.expires_in.min(MAX_WAIT_SECS))
+    }
+
+    fn deadline_error(&self) -> String {
+        if self.expires_in > MAX_WAIT_SECS {
+            WAIT_TIMEOUT.into()
+        } else {
+            EXPIRED.into()
+        }
+    }
+}
+
+async fn authorization_response(
+    response: reqwest::Response,
+    issuer: &str,
+) -> Result<DeviceAuthorization, String> {
+    let status = response.status();
+    if !status.is_success() {
+        let message = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            "Too many device sign-in requests. Wait before trying again; no local session was changed."
+        } else if status.is_server_error() {
+            "UC device authorization is temporarily unavailable. Try again later; no local session was changed."
+        } else {
+            "UC device authorization was rejected; no local session was changed."
+        };
+        return Err(message.into());
+    }
+    let grant: DeviceAuthorization = native::bounded_json(response).await?;
+    grant.validate(issuer)?;
+    Ok(grant)
 }
 
 #[derive(Deserialize)]
@@ -104,11 +137,14 @@ async fn poll(
 ) -> Result<TokenResponse, String> {
     let mut policy = PollPolicy::new(grant.interval);
     loop {
-        let wake = Instant::now() + policy.delay;
-        if wake >= deadline {
+        let now = Instant::now();
+        // Do not shorten an issuer interval or retry delay to fit a final poll.
+        // Compare before adding: an issuer can supply a very large interval.
+        if policy.delay >= deadline.saturating_duration_since(now) {
             tokio::time::sleep_until(deadline).await;
-            return Err(EXPIRED.into());
+            return Err(grant.deadline_error());
         }
+        let wake = now + policy.delay;
         tokio::time::sleep_until(wake).await;
         let response = tokio::time::timeout_at(
             deadline,
@@ -123,7 +159,7 @@ async fn poll(
                 .send(),
         )
         .await
-        .map_err(|_| EXPIRED.to_string())?;
+        .map_err(|_| grant.deadline_error())?;
         let response = match response {
             Ok(response) => response,
             Err(_) => {
@@ -140,7 +176,7 @@ async fn poll(
             // interrupted/invalid token body or a product bootstrap failure.
             return tokio::time::timeout_at(deadline, native::bounded_json(response))
                 .await
-                .map_err(|_| EXPIRED.to_string())?;
+                .map_err(|_| grant.deadline_error())?;
         }
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
             let retry_after = response
@@ -153,7 +189,7 @@ async fn poll(
         }
         let error: OAuthError = tokio::time::timeout_at(deadline, native::bounded_json(response))
             .await
-            .map_err(|_| EXPIRED.to_string())??;
+            .map_err(|_| grant.deadline_error())??;
         match error.error.as_str() {
             "authorization_pending" => policy.pending(),
             "slow_down" => policy.slow_down(),
@@ -204,23 +240,19 @@ pub(crate) async fn login_device_code(
             .send()
             .await
             .map_err(|_| "UC device authorization is unavailable; no local session was changed")?;
-        if !response.status().is_success() {
-            return Err(
-                "UC device authorization was rejected; no local session was changed".into(),
-            );
-        }
-        let grant: DeviceAuthorization = native::bounded_json(response).await?;
-        grant.validate(&environment.issuer)?;
+        let grant = authorization_response(response, &environment.issuer).await?;
         eprintln!(
             "Open this page in a browser on another device:\n{}\n\nEnter this code: {}\nCheck the account and permissions, then approve or deny access.\nWaiting for authorization (up to {} seconds). Press Ctrl+C to stop.",
-            grant.verification_uri, grant.user_code, grant.expires_in
+            grant.verification_uri,
+            grant.user_code,
+            grant.wait_duration().as_secs()
         );
         poll(
             &client,
             &environment,
             &grant,
             &verifier,
-            started + Duration::from_secs(grant.expires_in),
+            started + grant.wait_duration(),
         )
         .await
     };
@@ -233,7 +265,9 @@ pub(crate) async fn login_device_code(
     };
     // Once credentials have arrived, settle the bounded product bootstrap and
     // publication rather than cancelling across a possible local commit.
-    eprintln!("Authorization approved. Completing sign-in...");
+    eprintln!(
+        "Authorization approved. Completing sign-in; Ctrl+C will not cancel credential finalization. Please wait."
+    );
     let prepared = tokio::time::timeout(
         Duration::from_secs(60),
         super::prepare(&client, &environment, &tokens, &nonce),
