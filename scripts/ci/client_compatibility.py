@@ -665,6 +665,7 @@ def bootstrap(origin, provider, provider_host):
     request(origin, "/models", token, {"name": model, "provider": "openai", "api_key": "synthetic-only",
         "base_url": "http://" + provider_host + ":" + str(provider.server.server_port) + "/v1",
         "context_window": 128000, "max_completion_tokens": 1024, "supported_parameters": ["tools"],
+        "pricing": {"currency": "USD", "unit": "per_token", "prompt": 0.000001, "completion": 0.000002},
         "tags": ["chat", "code"], "quirks": {"thinking_protocol": "unknown"}})
     provider.expected_model = model
     return token, model, user, password
@@ -766,18 +767,35 @@ def run(args, report):
                 require(identity.returncode == 0 and version in identity.stdout.decode(), "client_version_mismatch")
                 begin_case(report, version, "profile_login")
                 authenticate_cli(binary, env, home, origin, username, password)
-                begin_case(report, version, "model_catalog")
+                begin_case(report, version, "unsupported_catalog" if version == "0.2.10" else "model_catalog")
                 listed = command(binary, env, home, [*cli_base(origin, model), "model", "list"])
-                require(listed.returncode == 0 and model in listed.stdout.decode(errors="replace"), "historical_catalog_unreadable")
-                report["cases"].append({"client": version, "case": "model_catalog", "status": "passed"})
-                provider.case = version + "-ordinary-chat"
-                begin_case(report, version, "unsupported_schema1_execution" if version == "0.2.10" else "ordinary_chat")
-                chat = command(binary, env, home, [*one_shot_chat_base(origin, model), "--json", "--no-resume", "-m", "Reply to the fixture: " + provider.marker])
                 if version == "0.2.10":
-                    detail = (chat.stdout + chat.stderr).decode(errors="replace")
-                    require(chat.returncode != 0 and "schema v1" in detail and "upgrade" in detail.lower(), "legacy_execution_not_explicitly_rejected")
-                    report["cases"].append({"client": version, "case": "unsupported_schema1_execution", "status": "passed"})
+                    # This installed strict decoder cannot negotiate v2. Keep
+                    # the known failure visible; never call it a supported
+                    # catalog or conversation. Its standalone Edge remains a
+                    # separate schema-v1 rejection case below.
+                    detail = (listed.stdout + listed.stderr).decode(errors="replace")
+                    require(listed.returncode != 0 and "unknown field" in detail
+                            and "thinking_protocol" in detail, "unsupported_catalog_boundary_changed")
+                    report["cases"].append({"client": version, "case": "unsupported_catalog",
+                        "status": "passed", "support": "unsupported", "action": "upgrade_to_0.2.12_or_later"})
                 else:
+                    require(listed.returncode == 0 and model in listed.stdout.decode(errors="replace"), "historical_catalog_unreadable")
+                    # Inspect output decoded and reserialized by the actual
+                    # published CLI. A legacy projection silently yields None
+                    # for these fields even though `model list` succeeds.
+                    catalog = result_json(listed)
+                    offerings = [item for item in catalog.get("items", []) if item.get("name") == model]
+                    require(len(offerings) == 1, "historical_catalog_offering_missing")
+                    require(offerings[0].get("thinking_protocol") == "unknown", "historical_protocol_metadata_lost")
+                    pricing = offerings[0].get("pricing")
+                    require(isinstance(pricing, dict) and pricing.get("currency") == "USD"
+                            and pricing.get("unit") == "per_token" and pricing.get("prompt") == 0.000001
+                            and pricing.get("completion") == 0.000002, "historical_pricing_metadata_lost")
+                    report["cases"].append({"client": version, "case": "model_catalog", "status": "passed"})
+                    provider.case = version + "-ordinary-chat"
+                    begin_case(report, version, "ordinary_chat")
+                    chat = command(binary, env, home, [*one_shot_chat_base(origin, model), "--json", "--no-resume", "-m", "Reply to the fixture: " + provider.marker])
                     completed(chat, provider.marker)
                     report["cases"].append({"client": version, "case": "ordinary_chat", "status": "passed"})
                     approvals(binary, env, home, origin, token, model, provider, report, version)
@@ -837,7 +855,7 @@ def main():
     parser.add_argument("--rollback-database")
     parser.add_argument("--disposable-server", action="store_true", required=True)
     args = parser.parse_args()
-    report = {"schema": 1, "platform": "linux-amd64", "baselines": baseline_document()["baselines"],
+    report = {"schema": 1, "minimum_executable_version": "0.2.12", "platform": "linux-amd64", "baselines": baseline_document()["baselines"],
               "server_source": os.environ.get("ASTRA_COMPAT_SERVER_SOURCE"),
               "server_image_digest": os.environ.get("ASTRA_COMPAT_SERVER_IMAGE_DIGEST"), "cases": [], "status": "failed"}
     started = time.monotonic()

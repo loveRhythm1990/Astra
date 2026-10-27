@@ -330,13 +330,14 @@ execute an installer or follow a moving channel. A missing artifact, wrong
 digest, unsupported architecture, or failed dependency is a failure, not a
 skipped test or an opportunity to substitute a different version.
 
-The initial test roles are deliberately distinct from a claim of full support:
+The executable support baseline is CLI/Edge **0.2.12**. The fixed samples have
+the following distinct roles; passing negative cases does not confer support:
 
 | Consumer | Required behavior against the candidate Server |
 | --- | --- |
-| Published CLI 0.2.12, source `70a5ee3e` | Legacy catalog, ordinary chat and authoritative final output, tool result return, approval allow/deny, cancellation and same-session reuse |
+| Published CLI 0.2.12, source `70a5ee3e` | Complete unversioned v2 catalog, ordinary chat and authoritative final output, tool result return, approval allow/deny, cancellation and same-session reuse |
 | Published Edge 0.2.12, source `70a5ee3e` | Schema v2 registration, connection, task execution and result return |
-| Published CLI 0.2.10, source `5aacae0d` | Strict historical catalog parsing; its schema v1 embedded executor remains unsupported and must produce a bounded upgrade failure |
+| Published CLI 0.2.10, source `5aacae0d` | Negative catalog sample: the installed strict decoder rejects v2; upgrade required, no positive execution claim |
 | Published Edge 0.2.10, source `5aacae0d` | Explicit schema v1 rejection and upgrade guidance; it is not a positive execution baseline |
 | Candidate CLI | Explicit v2 discovery and ordinary chat through the real candidate Server; rollback checks identify the exact historical Server source rather than calling it current Prod |
 
@@ -349,18 +350,27 @@ that turn's Context, so a Session with no committed history returns 404 from
 the hydration API and the historical CLI explicitly rejects cold resume. Raw
 transcript evidence is not promoted into invented canonical history.
 
-The CLI 0.2.10 sample matches the old response-field contract. This does not
-identify the original screenshot's client/server pair. Unversioned clients
-share the frozen v1 response and do not receive v2 pricing or protocol-aware
-picker metadata. New thinking controls require an upgraded client; unsupported
-explicit old controls must fail without model I/O or silent substitution.
+CLI/Edge 0.2.10 must be upgraded to 0.2.12 or later. The CLI negative case
+records its actual unknown-field failure; it does not pretend the installed
+binary can display a new Server upgrade message. The standalone Edge negative
+case checks its existing schema-v1 rejection and upgrade hint. These samples
+do not identify the original screenshot's exact client/server pair, and the
+original 0.2.10 conversation failure is not claimed as fixed.
 
-`user_models_http` exercises both real catalog routes with an independent
-published-field decoder, including null/non-null new metadata, explicit v2,
-invalid format versions, authentication denial, and unknown execution enums.
-CLI tests distinguish malformed JSON from a structurally unsupported response
-using stable `model_catalog_json_invalid` / `model_catalog_schema_mismatch`
-reason metadata; safe user messages never echo the received body.
+`user_models_http` exercises both real catalog routes with independent frozen
+0.2.10/0.2.12 decoders. Unversioned and explicit-v2 responses retain the complete
+0.2.12 shape, including null and non-null metadata; the 0.2.10 reader must reject
+it. Four reasoning protocols and non-null prices are checked without a version
+header. This protects the wire inputs used by the historical picker, not an
+actual TUI interaction. The real 0.2.12 `model list` journey also verifies
+that its decoded output retains the configured protocol value and non-null
+pricing, rather than accepting a successful exit alone. Invalid versions, authentication denial, unknown
+execution enums, and nested authority metadata remain covered. Current
+readers accept additive page/item metadata, while the strict 0.2.12 fixture
+rejects it: future additions require a new negotiated format, not changes to
+unversioned/v2 responses. CLI tests distinguish malformed JSON from unsupported
+schema using stable `model_catalog_json_invalid` / `model_catalog_schema_mismatch`
+reason metadata without echoing received bodies.
 
 The shared CLI CI execution runs `client_compatibility` with the dedicated
 `moi-compat-tests` feature and isolated MatrixOne/Memoria. It starts the real

@@ -57,8 +57,8 @@ pub const WORK_API_MAJOR: &str = "1";
 pub const AGENT_INTERACTION_API_MAJOR_HEADER: &str = "x-astra-agent-interaction-api-major";
 pub const AGENT_INTERACTION_API_MAJOR: &str = "3";
 
-/// Read-only model catalog response format. Unversioned clients receive the
-/// frozen v1 projection; v2 includes protocol-aware controls and pricing.
+/// Read-only model catalog response format. Unversioned clients retain the
+/// published 0.2.12 field set, including protocol-aware controls and pricing.
 /// This is not an execution or authorization capability.
 pub const MODEL_CATALOG_VERSION_HEADER: &str = "x-astra-model-catalog-version";
 pub const MODEL_CATALOG_VERSION: &str = "2";

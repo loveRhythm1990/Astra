@@ -148,42 +148,45 @@ the same purpose throughout a drain, as well as checking revision and total.
 
 #### Catalog response compatibility
 
-The two HTTP catalog endpoints negotiate only their read-only response shape
-through `x-astra-model-catalog-version`. A missing header or `1` selects the
-frozen published CLI 0.2.10 field set. `2` exposes `thinking_protocol` and
-`pricing`; current thin-client and TypeScript SDK requests explicitly select
-it on every page. Unknown, repeated, or malformed versions return
-`400 model_catalog_version_unsupported`, without retrying with a different
-format. The response identifies its format in the same header and is not cached.
+The executable support baseline is published CLI and Edge **0.2.12**. The two
+HTTP catalog endpoints retain that release's complete response field set,
+including `thinking_protocol` and `pricing`. A missing
+`x-astra-model-catalog-version` header and explicit `2` select the same format;
+current thin-client and TypeScript SDK requests send `2` on every page.
+Unknown, repeated, or malformed versions (including `1`) return
+`400 model_catalog_version_unsupported`. The response identifies its format
+in the same header and is not cached.
 
-This projection occurs after the existing authorized catalog read. It does not
-change Offering identity, capability, access policy, pagination, revision,
-default resolution, or execution admission. The v1 wire structs are frozen in
-the HTTP owner, independently of the current domain structs. They must not
-acquire optional fields merely because a newer producer knows them. Current `ModelListItemResponse`, `ModelListPageResponse`, and
-`ModelAccessProjectionResponse` readers tolerate unconsumed additive metadata
-at those object boundaries. Their nested access/status, default-resolution, and
-cursor contracts, required fields, and typed enum values remain strict. Authentication, execution requests, approvals, and Edge advertisements
-are not made permissive.
+Unversioned 0.2.10 and 0.2.12 catalog requests have no trustworthy distinction.
+The Server must not infer a version from identity or strip protocol metadata
+needed by the supported 0.2.12 picker. CLI 0.2.10's strict catalog decoder and
+its embedded schema-v1 executor are outside the support baseline, as is
+standalone Edge 0.2.10. Users of those binaries must upgrade to 0.2.12 or later.
+The installed CLI can still report an unknown-field/invalid-JSON error before
+execution; a new Server error code cannot repair that old diagnostic. This
+policy does not claim to repair the original 0.2.10 conversation failure.
 
-Unversioned 0.2.10 and 0.2.12 requests have no trustworthy version distinction.
-Consequently v1 guarantees the common catalog format, not preservation of
-0.2.12's protocol-aware picker or price display. Those features require a
-client that explicitly requests v2. An old explicit reasoning control that the
-admitted Offering cannot execute is still rejected, with an upgrade hint; it
-is never changed to a default, toggle, effort, or budget on the client's behalf.
-In particular, omitting a response field is not evidence that an old Adaptive
-request is supported. Old Edge schema v1 remains outside the executable
-support boundary, including when it is embedded in an old CLI.
+Version validation does not authorize access. The response uses the existing
+service-owned authorized catalog, Offering identity, capabilities, access
+policy, pagination, revision, defaults, and execution admission. Unsupported
+explicit reasoning controls are rejected with upgrade guidance; they are
+never silently translated to a default, toggle, effort, or budget.
 
-Future optional metadata may extend v2 only when an old reader can safely
-ignore it. Required-field removal, type changes, new execution semantics, or
-unknown enum/state values require an explicit reviewed format/capability
-boundary and an upgrade path. Historical fixtures and binary identities do
-not move with the producer. Support changes and removal of old baselines must
-be reviewed separately and documented with affected features and migration.
-See [client compatibility tests](../guides/testing.md#released-cli-and-edge-compatibility)
-for the reviewed artifact inventory and the behavior required before release.
+Current `ModelListItemResponse`, `ModelListPageResponse`, and
+`ModelAccessProjectionResponse` readers tolerate additive metadata at those
+object boundaries. Their nested access/status, default-resolution, cursor,
+required-field, and typed enum contracts remain strict. This reader tolerance
+is not permission to extend v2 responses: the published 0.2.12 decoder is
+strict, and an independent frozen fixture protects its complete response
+shape. New response fields, type changes, or enum/state values require a new
+explicitly negotiated format while unversioned responses retain the 0.2.12
+contract. Authentication, execution requests, approvals, and Edge
+advertisements are not made permissive.
+
+Historical fixtures and binary identities do not move with the producer.
+Support changes must be reviewed separately and document affected features
+and migration. See [client compatibility tests](../guides/testing.md#released-cli-and-edge-compatibility)
+for the fixed artifact inventory and required behavior.
 
 Explicit Offering IDs cannot bypass this policy. Primary chat admission and
 provider-boundary revalidation reject incompatible protocol-purpose pairs before

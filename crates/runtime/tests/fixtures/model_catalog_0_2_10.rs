@@ -1,6 +1,6 @@
 //! Frozen published Astra CLI 0.2.10 catalog decoder.
 //!
-//! Source: astra-services/src/models.rs at 5aacae0d399906958f0c93f605a8c68641ab9a7b.
+//! Source: crates/services/src/models.rs at 5aacae0d399906958f0c93f605a8c68641ab9a7b.
 //! Declarations below are copied without methods. Do not import current wire
 //! types or update this fixture to follow a newer producer.
 

@@ -22,23 +22,130 @@ use axum::{
 use tower::ServiceExt;
 
 #[path = "fixtures/model_catalog_0_2_10.rs"]
-mod published_catalog_v1;
+mod published_catalog_0_2_10;
 
-fn published_catalog_response(
+#[path = "fixtures/model_catalog_0_2_12.rs"]
+mod published_catalog_0_2_12;
+
+#[tokio::test]
+async fn published_0_2_12_keeps_reasoning_and_pricing_without_version_negotiation() {
+    use astra_core::model_wire::thinking::ThinkingProtocol;
+    use astra_services::models::ThinkingCapability;
+    use astra_services::{ModelAccessKind, ModelCatalogPricing, ModelExecutionPlacement};
+
+    for protocol in [
+        ThinkingProtocol::EnableThinking,
+        ThinkingProtocol::Moonshot,
+        ThinkingProtocol::ReasoningEffort,
+        ThinkingProtocol::ThinkingObject,
+    ] {
+        let service = TestModelService {
+            allows_deployment: true,
+            catalog: vec![ModelListItem {
+                thinking_protocol: Some(protocol),
+                offering_id: "published-reasoning-offering".into(),
+                access_id: "self-hosted".into(),
+                access_kind: ModelAccessKind::SelfHosted,
+                access_label: "Self-hosted".into(),
+                execution_placement: ModelExecutionPlacement::Server,
+                name: "published-reasoning-model".into(),
+                provider: "openai".into(),
+                description: None,
+                is_active: true,
+                context_window: 128_000,
+                max_completion_tokens: Some(4096),
+                architecture: None,
+                thinking_capability: Some(ThinkingCapability::Both),
+                pricing: Some(ModelCatalogPricing {
+                    currency: "USD".into(),
+                    unit: "per_token".into(),
+                    source: "configured".into(),
+                    prompt: 0.000001,
+                    completion: 0.000002,
+                    cache_read: None,
+                    cache_write: None,
+                    configuration_updated_at: "2026-10-01T00:00:00Z".into(),
+                }),
+            }],
+            ..Default::default()
+        };
+        for route in ["/models", "/model-access"] {
+            // Published 0.2.12 sends no catalog-version header. Decode using
+            // its frozen types, not the producer's permissive current DTOs.
+            let response = app(service.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(route)
+                        .header("authorization", "Bearer catalog-user")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let offerings = if route == "/models" {
+                serde_json::from_slice::<published_catalog_0_2_12::ModelListPageResponse>(&bytes)
+                    .unwrap()
+                    .items
+            } else {
+                serde_json::from_slice::<published_catalog_0_2_12::ModelAccessProjectionResponse>(
+                    &bytes,
+                )
+                .unwrap()
+                .offerings
+            };
+            assert_eq!(offerings.len(), 1);
+            let item = &offerings[0];
+            assert_eq!(
+                serde_json::to_value(item.thinking_protocol).unwrap(),
+                serde_json::to_value(protocol).unwrap(),
+                "removing the protocol makes the published picker filter out existing controls"
+            );
+            assert_eq!(
+                item.thinking_capability,
+                Some(published_catalog_0_2_12::ThinkingCapability::Both)
+            );
+            let pricing = item
+                .pricing
+                .as_ref()
+                .expect("published price remains visible");
+            assert_eq!(pricing.prompt, 0.000001);
+            assert_eq!(pricing.completion, 0.000002);
+        }
+    }
+}
+
+fn published_0_2_10_response(
     route: &str,
     body: serde_json::Value,
 ) -> serde_json::Result<serde_json::Value> {
     if route == "/models" {
-        serde_json::from_value::<published_catalog_v1::ModelListPageResponse>(body)
+        serde_json::from_value::<published_catalog_0_2_10::ModelListPageResponse>(body)
             .and_then(serde_json::to_value)
     } else {
-        serde_json::from_value::<published_catalog_v1::ModelAccessProjectionResponse>(body)
+        serde_json::from_value::<published_catalog_0_2_10::ModelAccessProjectionResponse>(body)
+            .and_then(serde_json::to_value)
+    }
+}
+
+fn published_0_2_12_response(
+    route: &str,
+    body: serde_json::Value,
+) -> serde_json::Result<serde_json::Value> {
+    if route == "/models" {
+        serde_json::from_value::<published_catalog_0_2_12::ModelListPageResponse>(body)
+            .and_then(serde_json::to_value)
+    } else {
+        serde_json::from_value::<published_catalog_0_2_12::ModelAccessProjectionResponse>(body)
             .and_then(serde_json::to_value)
     }
 }
 
 #[tokio::test]
-async fn published_catalog_reader_accepts_unversioned_models_and_model_access() {
+async fn catalog_formats_preserve_published_0_2_12_and_reject_0_2_10() {
     use astra_core::model_wire::thinking::ThinkingProtocol;
     use astra_server_types::MODEL_CATALOG_VERSION_HEADER;
     use astra_services::models::ThinkingCapability;
@@ -77,7 +184,7 @@ async fn published_catalog_reader_accepts_unversioned_models_and_model_access() 
             ..Default::default()
         };
         for (route, entries) in [("/models", "items"), ("/model-access", "offerings")] {
-            for version in [None, Some("1"), Some("2")] {
+            for version in [None, Some("2")] {
                 let mut request = Request::builder()
                     .uri(route)
                     .header("authorization", "Bearer catalog-user");
@@ -91,7 +198,7 @@ async fn published_catalog_reader_accepts_unversioned_models_and_model_access() 
                 assert_eq!(response.status(), StatusCode::OK);
                 assert_eq!(
                     response.headers()[MODEL_CATALOG_VERSION_HEADER],
-                    version.unwrap_or("1")
+                    version.unwrap_or("2")
                 );
                 let bytes = body::to_bytes(response.into_body(), usize::MAX)
                     .await
@@ -102,72 +209,69 @@ async fn published_catalog_reader_accepts_unversioned_models_and_model_access() 
                 assert_eq!(item["thinking_capability"], "both");
                 assert_eq!(page["total"], 1);
                 assert_eq!(page["next_cursor"], serde_json::Value::Null);
-                if version == Some("2") {
-                    // This is the original failure: even null additive fields
-                    // make the published strict reader reject a modern item.
-                    assert!(published_catalog_response(route, page.clone()).is_err());
-                    assert_eq!(
-                        item["thinking_protocol"],
-                        serde_json::to_value(protocol).unwrap()
-                    );
-                    assert!(item.get("pricing").is_some());
-                    let current: astra_services::ModelListItemResponse =
-                        serde_json::from_value(item).unwrap();
-                    assert_eq!(current.thinking_protocol, protocol);
-                    let mut additive = page.clone();
-                    additive["future_display_metadata"] = serde_json::json!({"label": "safe"});
-                    additive[entries][0]["future_display_metadata"] = serde_json::json!(true);
-                    if route == "/models" {
-                        serde_json::from_value::<astra_services::ModelListPageResponse>(
-                            additive.clone(),
-                        )
-                        .unwrap();
-                    } else {
-                        serde_json::from_value::<astra_services::ModelAccessProjectionResponse>(
-                            additive.clone(),
-                        )
-                        .unwrap();
-                    }
-                    additive[entries][0]["execution_placement"] =
-                        serde_json::json!("unknown-executor");
-                    if route == "/models" {
-                        assert!(
-                            serde_json::from_value::<astra_services::ModelListPageResponse>(
-                                additive
-                            )
-                            .is_err()
-                        );
-                    } else {
-                        assert!(serde_json::from_value::<astra_services::ModelAccessProjectionResponse>(additive).is_err());
-                    }
+                // This is the original failure: even null additive fields
+                // make the published strict reader reject a modern item.
+                assert!(published_0_2_10_response(route, page.clone()).is_err());
+                assert_eq!(
+                    item["thinking_protocol"],
+                    serde_json::to_value(protocol).unwrap()
+                );
+                assert!(item.get("pricing").is_some());
+                assert_eq!(
+                    published_0_2_12_response(route, page.clone()).unwrap(),
+                    page
+                );
+                let current: astra_services::ModelListItemResponse =
+                    serde_json::from_value(item).unwrap();
+                assert_eq!(current.thinking_protocol, protocol);
+                let mut additive = page.clone();
+                additive["future_display_metadata"] = serde_json::json!({"label": "safe"});
+                additive[entries][0]["future_display_metadata"] = serde_json::json!(true);
+                // Current readers are forward-tolerant, but the supported
+                // published reader is not: v2 cannot grow these wire fields.
+                assert!(published_0_2_12_response(route, additive.clone()).is_err());
+                if route == "/models" {
+                    serde_json::from_value::<astra_services::ModelListPageResponse>(
+                        additive.clone(),
+                    )
+                    .unwrap();
                 } else {
-                    assert_eq!(
-                        published_catalog_response(route, page.clone()).unwrap(),
-                        page
+                    serde_json::from_value::<astra_services::ModelAccessProjectionResponse>(
+                        additive.clone(),
+                    )
+                    .unwrap();
+                }
+                additive[entries][0]["execution_placement"] = serde_json::json!("unknown-executor");
+                if route == "/models" {
+                    assert!(
+                        serde_json::from_value::<astra_services::ModelListPageResponse>(additive)
+                            .is_err()
                     );
-                    for (field, value) in [
-                        ("access_kind", "future-access"),
-                        ("execution_placement", "future-executor"),
-                        ("thinking_capability", "future-control"),
-                    ] {
-                        let mut unsupported = page.clone();
-                        unsupported[entries][0][field] = serde_json::json!(value);
-                        assert!(published_catalog_response(route, unsupported).is_err());
+                } else {
+                    assert!(
+                        serde_json::from_value::<astra_services::ModelAccessProjectionResponse>(
+                            additive
+                        )
+                        .is_err()
+                    );
+                }
+                if route == "/model-access" {
+                    for field in ["future_view_metadata", "status"] {
+                        let mut expanded_view = page.clone();
+                        expanded_view["accesses"][0][field] = serde_json::json!("future");
+                        assert!(published_0_2_12_response(route, expanded_view.clone()).is_err());
+                        assert!(serde_json::from_value::<astra_services::ModelAccessProjectionResponse>(expanded_view).is_err());
                     }
-                    let mut expanded_page = page.clone();
-                    expanded_page["future_page_metadata"] = serde_json::json!(true);
-                    assert!(published_catalog_response(route, expanded_page).is_err());
-                    if route == "/model-access" {
-                        for field in ["future_view_metadata", "status"] {
-                            let mut expanded_view = page.clone();
-                            expanded_view["accesses"][0][field] = serde_json::json!("future");
-                            assert!(published_catalog_response(route, expanded_view).is_err());
-                        }
-                        let mut expanded_default = page.clone();
-                        expanded_default["default_resolution"]["future_default_metadata"] =
-                            serde_json::json!(true);
-                        assert!(published_catalog_response(route, expanded_default).is_err());
-                    }
+                    let mut expanded_default = page.clone();
+                    expanded_default["default_resolution"]["future_default_metadata"] =
+                        serde_json::json!(true);
+                    assert!(published_0_2_12_response(route, expanded_default.clone()).is_err());
+                    assert!(
+                        serde_json::from_value::<astra_services::ModelAccessProjectionResponse>(
+                            expanded_default
+                        )
+                        .is_err()
+                    );
                 }
             }
         }
@@ -178,20 +282,18 @@ async fn published_catalog_reader_accepts_unversioned_models_and_model_access() 
 async fn catalog_version_does_not_authorize_access_or_silently_accept_unknown_versions() {
     use astra_server_types::MODEL_CATALOG_VERSION_HEADER;
     for route in ["/models", "/model-access"] {
-        for version in ["1", "2"] {
+        for version in [None, Some("2")] {
+            let mut request = Request::builder().uri(route);
+            if let Some(version) = version {
+                request = request.header(MODEL_CATALOG_VERSION_HEADER, version);
+            }
             let response = app(TestModelService::default())
-                .oneshot(
-                    Request::builder()
-                        .uri(route)
-                        .header(MODEL_CATALOG_VERSION_HEADER, version)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
+                .oneshot(request.body(Body::empty()).unwrap())
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
-        for version in ["", "0", "3", "2,1", " 2"] {
+        for version in ["", "0", "1", "3", "2,1", " 2"] {
             let response = app(TestModelService::default())
                 .oneshot(
                     Request::builder()
@@ -527,7 +629,7 @@ async fn catalog_purpose_is_applied_before_pagination_and_shared_by_model_access
                 assert_eq!(status, StatusCode::OK, "{raw}");
                 let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
                 assert_eq!(
-                    published_catalog_response(route, body.clone()).unwrap(),
+                    published_0_2_12_response(route, body.clone()).unwrap(),
                     body
                 );
                 assert_eq!(body["total"], expected.len());
@@ -552,7 +654,7 @@ async fn catalog_purpose_is_applied_before_pagination_and_shared_by_model_access
                 }
                 let mut expanded_cursor = body.clone();
                 expanded_cursor["next_cursor"]["future_cursor_metadata"] = serde_json::json!(true);
-                assert!(published_catalog_response(route, expanded_cursor).is_err());
+                assert!(published_0_2_12_response(route, expanded_cursor).is_err());
                 assert!(found.len() < expected.len(), "cursor must terminate");
                 path = format!(
                     "{route}?purpose={purpose}&limit=1&after_provider={}&after_name={}&after_offering_id={}",
