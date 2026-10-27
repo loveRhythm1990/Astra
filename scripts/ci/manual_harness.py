@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-SCHEMA = "astra.harness_progress.v6"
+SCHEMA = "astra.harness_progress.v7"
 MAX_RECORD = 262_144
 MAX_FILE = 32 * 1024 * 1024
 STATUSES = ("passed", "failed", "cancelled", "unavailable")
@@ -78,6 +78,33 @@ semantic_progress actionable_output provider_work consuming_provider_stream wait
 sending_provider_request provider_attempt_admission provider_attempt_terminalization
 provider_attempt_persistence other
 """.split())
+LOOP_FINISH_REASONS = frozenset("""
+stop content_filter function_call length tool_calls continue interrupted superseded_by_runtime_input direct_child_completion_wait
+runtime_input_arrived_before_settlement textless_response_retry canonical_work_revalidation_unavailable
+paused_after_provider_response canonical_work_synthesis_revoked work_settlement_retry
+completion_action_no_tool_retry completion_action_incomplete workspace_completion_retry
+explicit_verification_retry round_slice_without_typed_completion completion_contract_incomplete token_budget_exceeded
+other not_reported
+""".split())
+CHILD_BOUNDARY_OUTCOMES = frozenset("""
+results_staged results_adopted wait_started cancelled readmission_failed synthesis_ready runtime_input_ready
+observation_timed_out synthesis_budget_exhausted deadline finalization_accepted finalization_incomplete
+finalization_interrupted other not_reported
+""".split())
+
+
+def safe_loop_boundaries(value):
+    if not isinstance(value, dict) or set(value) != {"llm_round", "child_barrier"}:
+        raise ValueError("invalid loop boundaries")
+    for kind, tags in (("llm_round", LOOP_FINISH_REASONS), ("child_barrier", CHILD_BOUNDARY_OUTCOMES)):
+        scopes = value[kind]
+        if not isinstance(scopes, dict) or not set(scopes) <= {"root", "other_run", "unattributed"}:
+            raise ValueError("invalid loop scope")
+        for counts in scopes.values():
+            if not isinstance(counts, dict) or not set(counts) <= tags:
+                raise ValueError("invalid loop codes")
+            for count in counts.values():
+                integer(count)
 
 
 def safe_execution_diagnostic(value):
@@ -102,6 +129,7 @@ def safe_execution_diagnostic(value):
         expected = fields | {"last_event", "event_counts"}
         if key == "journal":
             expected.add("last_provider_failure")
+            expected.add("loop_boundaries")
         if not isinstance(capture, dict) or set(capture) != expected:
             raise ValueError("invalid capture diagnostic")
         if key == "stream":
@@ -110,6 +138,7 @@ def safe_execution_diagnostic(value):
         else:
             for field in fields:
                 integer(capture[field])
+            safe_loop_boundaries(capture["loop_boundaries"])
         counts = capture["event_counts"]
         if not isinstance(counts, dict) or not set(counts) <= allowed:
             raise ValueError("invalid event counters")

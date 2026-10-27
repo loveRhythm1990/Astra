@@ -13,7 +13,7 @@ use std::sync::{
 };
 use tokio::sync::broadcast;
 
-pub const SCHEMA: &str = "astra.harness_progress.v6";
+pub const SCHEMA: &str = "astra.harness_progress.v7";
 pub const MAX_RECORD_BYTES: usize = 262_144;
 
 // Closed projections only: even machine-looking upstream tags can contain
@@ -62,6 +62,59 @@ fn error_code(value: &str) -> &'static str {
     }
 }
 
+fn loop_finish_reason(value: Option<&str>) -> &str {
+    match value {
+        Some(
+            code @ ("stop"
+            | "content_filter"
+            | "function_call"
+            | "length"
+            | "tool_calls"
+            | "continue"
+            | "interrupted"
+            | "superseded_by_runtime_input"
+            | "direct_child_completion_wait"
+            | "runtime_input_arrived_before_settlement"
+            | "textless_response_retry"
+            | "canonical_work_revalidation_unavailable"
+            | "paused_after_provider_response"
+            | "canonical_work_synthesis_revoked"
+            | "work_settlement_retry"
+            | "completion_action_no_tool_retry"
+            | "completion_action_incomplete"
+            | "workspace_completion_retry"
+            | "explicit_verification_retry"
+            | "round_slice_without_typed_completion"
+            | "completion_contract_incomplete"
+            | "token_budget_exceeded"),
+        ) => code,
+        Some(_) => "other",
+        None => "not_reported",
+    }
+}
+
+fn child_boundary_outcome(value: Option<&str>) -> &str {
+    match value {
+        Some(
+            code @ ("results_staged"
+            | "results_adopted"
+            | "wait_started"
+            | "cancelled"
+            | "readmission_failed"
+            | "synthesis_ready"
+            | "runtime_input_ready"
+            | "observation_timed_out"
+            | "synthesis_budget_exhausted"
+            | "deadline"
+            | "finalization_accepted"
+            | "finalization_incomplete"
+            | "finalization_interrupted"),
+        ) => code,
+        Some(_) => "other",
+        None => "not_reported",
+    }
+}
+
 fn execution_diagnostic(
     outcome: &RunOutcome,
     session: Option<&crate::session_capture::SessionCapture>,
@@ -106,7 +159,26 @@ fn execution_diagnostic(
         let mut counts = BTreeMap::<&str, u64>::new();
         let mut last_event = None;
         let mut last_provider_failure = None;
+        let mut loop_reasons = BTreeMap::<&str, BTreeMap<&str, u64>>::new();
+        let mut child_boundaries = BTreeMap::<&str, BTreeMap<&str, u64>>::new();
         for event in &session.events {
+            let logical = crate::session_capture::logical_event(&event.raw);
+            let run = logical.pointer("/producer_scope/run_id").and_then(Value::as_str)
+                .or_else(|| logical["run_id"].as_str());
+            let scope = match (run, outcome.run_id.as_deref()) {
+                (Some(run), Some(root)) if run == root => "root",
+                (Some(_), Some(_)) => "other_run",
+                _ => "unattributed",
+            };
+            if event.event_type == "llm_round" {
+                let code = loop_finish_reason(logical.pointer("/metadata/finish_reason").and_then(Value::as_str));
+                *loop_reasons.entry(scope).or_default().entry(code).or_default() += 1;
+            }
+            if event.event_type == "trace_span" && logical.pointer("/metadata/name")
+                .and_then(Value::as_str) == Some("agent_dependency_boundary") {
+                let code = child_boundary_outcome(logical.pointer("/metadata/attrs/outcome").and_then(Value::as_str));
+                *child_boundaries.entry(scope).or_default().entry(code).or_default() += 1;
+            }
             let tag = match event.event_type.as_str() {
                 "llm_round" => "llm_round",
                 "turn" => "turn",
@@ -166,7 +238,8 @@ fn execution_diagnostic(
         json!({"skipped_lines":session.skipped_lines, "dropped_lines":session.dropped_lines,
             "integrity_errors":session.integrity_errors,
             "last_event":last_event, "event_counts":counts,
-            "last_provider_failure":last_provider_failure})
+            "last_provider_failure":last_provider_failure,
+            "loop_boundaries":{"llm_round":loop_reasons, "child_barrier":child_boundaries}})
     });
     json!({
         "final_state":outcome.final_state.as_deref().map(|state| match state {
@@ -406,6 +479,65 @@ pub async fn observe(
 mod tests {
     use super::*;
     use crate::{report::StepResult, runner::RunOutcome};
+
+    #[test]
+    fn loop_boundaries_preserve_scoped_reasons_without_private_trace_attributes() {
+        use crate::session_capture::{JournalEvent, SessionCapture};
+        let mut events = Vec::new();
+        for (run, reason) in [
+            (Some("root-private-sentinel"), "textless_response_retry"),
+            (Some("root-private-sentinel"), "stop"),
+            (Some("child-private-sentinel"), "tool_calls"),
+            (None, "private-sentinel"),
+        ] {
+            events.push(JournalEvent {
+                event_type: "llm_round".into(),
+                raw: json!({
+                    "type":"llm_round", "producer_scope":{"run_id":run},
+                    "metadata":{"finish_reason":reason, "private-sentinel":"private-sentinel"}
+                }),
+            });
+        }
+        let attrs = std::collections::HashMap::from([
+            ("outcome".into(), "results_adopted".into()),
+            ("children".into(), "private-sentinel".into()),
+        ]);
+        let trace = astra_services::session_journal::JournalEvent::trace_span(
+            Some("private-sentinel"),
+            Some(1),
+            "private-sentinel",
+            None,
+            "agent_dependency_boundary",
+            1,
+            2,
+            Some(&attrs),
+            Some("private-sentinel"),
+        )
+        .with_producer_scope(Some("root-private-sentinel"));
+        events.push(JournalEvent {
+            event_type: "trace_span".into(),
+            raw: serde_json::to_value(trace).unwrap(),
+        });
+        let session = SessionCapture {
+            events,
+            ..Default::default()
+        };
+        let outcome = RunOutcome {
+            run_id: Some("root-private-sentinel".into()),
+            ..RunOutcome::new("model")
+        };
+        let diagnostic = execution_diagnostic(&outcome, Some(&session));
+        let boundaries = &diagnostic["journal"]["loop_boundaries"];
+        assert_eq!(
+            boundaries["llm_round"]["root"]["textless_response_retry"],
+            1
+        );
+        assert_eq!(boundaries["llm_round"]["root"]["stop"], 1);
+        assert_eq!(boundaries["llm_round"]["other_run"]["tool_calls"], 1);
+        assert_eq!(boundaries["llm_round"]["unattributed"]["other"], 1);
+        assert_eq!(boundaries["child_barrier"]["root"]["results_adopted"], 1);
+        assert!(!diagnostic.to_string().contains("private-sentinel"));
+    }
 
     #[test]
     fn execution_diagnostics_keep_typed_failure_and_missing_evidence_distinct() {

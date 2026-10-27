@@ -77,6 +77,7 @@ class ManualHarnessProgressTests(unittest.TestCase):
                                     "event_counts":{"run_started":1, "terminated_completed":1}}
             diagnostic["journal"] = {"skipped_lines":0, "dropped_lines":0, "integrity_errors":0,
                                      "last_event":"turn_error", "event_counts":{"turn_error":1},
+                                     "loop_boundaries":{"llm_round":{"root":{"textless_response_retry":1}}, "child_barrier":{"root":{"results_adopted":1}}},
                                      "last_provider_failure":{
                                          "event":"llm_round_failed", "run_scope":"root",
                                          "error_kind":"provider_deadline", "failure_stage":"provider",
@@ -94,6 +95,7 @@ class ManualHarnessProgressTests(unittest.TestCase):
             self.assertIn("contract_violation", (root / "job-summary").read_text())
             self.assertIn("terminated_completed", (root / "job-summary").read_text())
             self.assertIn("waiting_provider_response", (root / "job-summary").read_text())
+            self.assertIn("results_adopted", (root / "job-summary").read_text())
             self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
 
     def test_execution_diagnostics_reject_private_tags_and_extra_payload(self):
@@ -117,11 +119,23 @@ class ManualHarnessProgressTests(unittest.TestCase):
                    "dispatch_started":True, "provider_completed":False}
         journal = {"skipped_lines":0, "dropped_lines":0, "integrity_errors":0,
                    "last_event":"llm_round_failed", "event_counts":{"llm_round_failed":1},
-                   "last_provider_failure":failure}
+                   "last_provider_failure":failure, "loop_boundaries":{"llm_round":{}, "child_barrier":{}}}
         for key in ("run_scope", "error_kind", "failure_stage", "deadline_phase", "message"):
             with self.subTest(provider_field=key), self.assertRaises(ValueError):
                 h.safe_execution_diagnostic({**execution_diagnostic(), "journal":{
                     **journal, "last_provider_failure":{**failure, key:"private-sentinel"}}})
+
+    def test_loop_boundaries_reject_private_scopes_reasons_and_invalid_counts(self):
+        valid = {"llm_round":{"root":{"textless_response_retry":1}},
+                 "child_barrier":{"other_run":{"results_adopted":1}}}
+        h.safe_loop_boundaries(valid)
+        for changes in ({"llm_round":{"private-sentinel":{"stop":1}}},
+                        {"llm_round":{"root":{"private-sentinel":1}}},
+                        {"child_barrier":{"root":{"results_adopted":True}}},
+                        {"child_barrier":{"root":{"results_adopted":-1}}},
+                        {"detail":"private-sentinel"}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                h.safe_loop_boundaries({**valid, **changes})
 
     def test_cache_scope_evidence_survives_summary_without_regrading(self):
         diagnostic = {"kind":"cache_scope", "scope":"conversation_turns",

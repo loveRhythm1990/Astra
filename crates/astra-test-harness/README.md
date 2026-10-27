@@ -405,7 +405,7 @@ loss or file-write failure cancels via the existing runner and fails closed.
 Selected custom source revisions must support this option and the repository
 helper; unsupported sources fail explicitly, without an old-log fallback.
 
-Progress uses `astra.harness_progress.v6`. Unavailable judges report the canonical
+Progress uses `astra.harness_progress.v7`. Unavailable judges report the canonical
 error kind and a fixed failure stage; unknown causes remain `unknown`. Required
 quorum failures retain the first typed cause and still fail closed. Raw errors
 and individual vote diagnostics remain private. Argument failures include bounded
@@ -1085,7 +1085,7 @@ harness scheduling pressure, a heartbeat without new typed evidence is an
 efficiency/non-convergence signal, and a terminal report with incomplete
 evidence is never promoted to success merely because the process stayed alive.
 
-The CI safe progress stream (`astra.harness_progress.v6`) includes an
+The CI safe progress stream (`astra.harness_progress.v7`) includes an
 `execution_diagnostic` on each terminal row and step. Failed rows print it in
 the job log and summary, and retain it in `summary.json` and
 `progress.safe.jsonl`. It preserves recognized terminal state, interruption,
@@ -1098,6 +1098,12 @@ captured observation, not a root-cause verdict. No stderr, response bodies,
 event text, identities, or tool arguments are published. Live termination counters count observed events,
 not unique children or verified adoption, and captured events may be partial.
 These diagnostics do not change verdicts, retries, timeouts, or cleanup.
+The journal also projects `loop_boundaries`: counts of recognized model-round
+finish reasons and direct-child dependency outcomes, grouped as root, another
+run, or unattributed. This distinguishes recovery loops, superseded responses,
+and result staging/adoption without publishing trace attributes or identities.
+Missing entries mean no such observation was captured, not proof that the
+underlying transition did not happen.
 In particular, a cancellation observed after an outer timeout is not proof of
 the original failure cause. Push a new commit to exercise new diagnostics;
 rerunning an older workflow run still checks out that run's original PR SHA.
