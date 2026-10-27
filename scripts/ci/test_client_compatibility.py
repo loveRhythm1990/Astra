@@ -2,7 +2,7 @@
 
 import unittest
 
-from client_compatibility import safe_error_summary
+from client_compatibility import paired_tool_result, safe_error_summary
 
 
 class CompatibilityDiagnosticsTests(unittest.TestCase):
@@ -27,6 +27,26 @@ class CompatibilityDiagnosticsTests(unittest.TestCase):
     def test_summary_is_bounded_and_does_not_accept_structured_raw_responses(self):
         self.assertIsNone(safe_error_summary({"error": "untrusted body"}))
         self.assertLessEqual(len(safe_error_summary("safe diagnostic " * 300)), 1024)
+
+
+class CompatibilityToolHistoryTests(unittest.TestCase):
+    def test_runtime_user_suffix_does_not_hide_the_current_tool_result(self):
+        call_id = "compat-operation-current-case"
+        declaration = {"role": "assistant", "tool_calls": [
+            {"id": call_id, "function": {"name": "write_file", "arguments": "{}"}}]}
+        result = {"role": "tool", "tool_call_id": call_id, "content": "synthetic result"}
+        history = [{"role": "user", "content": "synthetic task"},
+                   {"role": "assistant", "content": "synthetic prelude", "tool_calls": None}, declaration, result,
+                   {"role": "user", "content": "runtime context suffix"}]
+        self.assertEqual(paired_tool_result(history, call_id, "write_file"), result)
+        self.assertIsNone(paired_tool_result(history, "compat-operation-other-case", "write_file"))
+        self.assertIsNone(paired_tool_result(history, call_id, "read_file"))
+        self.assertIsNone(paired_tool_result([result], call_id, "write_file"))
+        self.assertIsNone(paired_tool_result([declaration, result, result], call_id, "write_file"))
+        self.assertIsNone(paired_tool_result([result, declaration], call_id, "write_file"))
+        conflicting = {"role": "assistant", "tool_calls": [
+            {"id": call_id, "function": {"name": "read_file", "arguments": "{}"}}]}
+        self.assertIsNone(paired_tool_result([declaration, conflicting, result], call_id, "write_file"))
 
 
 if __name__ == "__main__":

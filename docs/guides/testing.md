@@ -368,6 +368,11 @@ or approval channel; stdio approval journeys retain `prompt` mode and its real
 approval channel. The special performance/capture-SHA
 baseline is not loosened to accept historical clients.
 
+Tool journeys pair their own case-specific call IDs with a unique preceding
+assistant declaration and tool result in the complete provider request. A
+runtime context suffix may legitimately appear as `role=user` after a tool
+result, so the fixture never treats the last user-role message as a turn boundary.
+
 Both IDC and public candidate-image smoke jobs invoke the same driver after
 the existing candidate digest/revision and stack health checks. They reuse
 that image rather than rebuilding a Server for each consumer. The existing

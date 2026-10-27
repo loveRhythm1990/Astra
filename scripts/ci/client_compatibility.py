@@ -156,6 +156,31 @@ def completed(result, expected):
     return body
 
 
+def paired_tool_result(messages, call_id, tool_name):
+    """Match a real declaration/result pair despite later runtime user messages."""
+    declarations = []
+    for index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        calls = message.get("tool_calls")
+        if calls is None:
+            continue
+        if not isinstance(calls, list) or any(not isinstance(call, dict) for call in calls):
+            return None
+        declarations.extend((index, call) for call in calls if call.get("id") == call_id)
+    results = [(index, message) for index, message in enumerate(messages)
+               if message.get("role") == "tool" and message.get("tool_call_id") == call_id]
+    if len(declarations) != 1 or len(results) != 1:
+        return None
+    declaration_index, declaration = declarations[0]
+    result_index, result = results[0]
+    function = declaration.get("function")
+    if (not isinstance(function, dict) or function.get("name") != tool_name
+            or declaration_index >= result_index):
+        return None
+    return result
+
+
 def identify_current(binary, env, home, report):
     build = command(binary, env, home, ["--build-info-json"])
     require(build.returncode == 0, "candidate_cli_identity_unavailable")
@@ -211,24 +236,27 @@ class Provider:
                     owner.arrived.set()
                     owner.release.wait(30)
                 messages = body.get("messages", [])
-                latest_user = max((index for index, item in enumerate(messages)
-                                   if item.get("role") == "user"), default=-1)
-                turn_messages = messages[latest_user + 1:]
-                tool_result = any(item.get("role") == "tool" and item.get("tool_call_id") == "compat-operation"
-                                  for item in turn_messages)
+                operation_id = "compat-operation-" + str(case)
+                search_id = "compat-search-" + str(case)
+                with owner.lock:
+                    issued_operation = (case, operation_id) in owner.claimed
+                    issued_search = (case, search_id) in owner.claimed
+                tool_result = (paired_tool_result(messages, operation_id, owner.tool_name)
+                               if issued_operation else None)
                 if mode == "tool" and not tool_result:
                     names = {tool.get("function", {}).get("name") for tool in body.get("tools", [])}
                     tool = owner.tool_name if owner.tool_name in names else None
                     arguments = {"path": owner.target}
                     if tool == "write_file":
                         arguments["content"] = owner.marker + "\n"
-                    call_id = "compat-operation"
-                    if not tool and "tool_search" in names and not any(
-                            item.get("tool_call_id") == "compat-search" for item in turn_messages):
+                    call_id = operation_id
+                    search_result = (paired_tool_result(messages, search_id, "tool_search")
+                                     if issued_search else None)
+                    if not tool and "tool_search" in names and search_result is None:
                         # Discover through the real admission owner, never inject a hidden tool.
                         tool = "tool_search"
                         arguments = {"query": "select:" + owner.tool_name}
-                        call_id = "compat-search"
+                        call_id = search_id
                     if not tool:
                         owner.errors.append("tool_not_admitted")
                         return mock.write_json(self, mock.HTTPStatus.BAD_REQUEST,
@@ -257,10 +285,9 @@ class Provider:
                                                                  "tool_calls": [call]}, "finish_reason": "tool_calls"})
                     return mock.write_json(self, mock.HTTPStatus.OK, response)
                 if mode == "tool":
-                    owner.tool_result_seen = tool_result
-                    if owner.tool_name == "read_file" and not any(
-                            item.get("tool_call_id") == "compat-operation"
-                            and owner.marker in json.dumps(item.get("content")) for item in turn_messages):
+                    owner.tool_result_seen = tool_result is not None
+                    if owner.tool_name == "read_file" and (
+                            tool_result is None or owner.marker not in json.dumps(tool_result.get("content"))):
                         return mock.write_json(self, mock.HTTPStatus.BAD_REQUEST,
                                                {"error": {"code": "fixture_edge_read_content_missing"}})
                 if not owner.claim(case, "answer"):
