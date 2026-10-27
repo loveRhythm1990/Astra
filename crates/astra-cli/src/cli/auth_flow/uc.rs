@@ -3,15 +3,13 @@ use astra_services::auth::uc::UcDiscovery;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-pub(crate) async fn login_with_observer(
+mod device_code;
+pub(crate) use device_code::login_device_code;
+
+async fn discover_environment(
     api: &astra_thin_client::ThinClient,
-    discovery: UcDiscovery,
-    observer: super::LoginObserver,
-    terminal_workspace_prompt: bool,
-    launch: impl AsyncFnOnce(String) -> Result<(), String>,
-) -> Result<(), String> {
-    let store = NativeStore::new()?;
-    store.prepare_for_login()?;
+    discovery: &UcDiscovery,
+) -> Result<(reqwest::Client, Environment, Option<serde_json::Value>), String> {
     native::secure_url(&api.api_origin())?;
     native::secure_url(&discovery.issuer)?;
     native::secure_url(&discovery.moi_api_url)?;
@@ -40,21 +38,37 @@ pub(crate) async fn login_with_observer(
         token_endpoint: String,
         revocation_endpoint: String,
         jwks_uri: String,
+        #[serde(default)]
+        device_authorization_endpoint: Option<serde_json::Value>,
     }
     let metadata: Metadata = native::bounded_json(response).await?;
     if metadata.issuer != discovery.issuer {
         return Err("UC discovery issuer mismatch".into());
     }
+    let device_endpoint = metadata.device_authorization_endpoint;
     let environment = Environment {
         issuer: metadata.issuer,
         astra_url: api.api_origin(),
-        moi_url: discovery.moi_api_url,
+        moi_url: discovery.moi_api_url.clone(),
         authorization_endpoint: metadata.authorization_endpoint,
         token_endpoint: metadata.token_endpoint,
         revocation_endpoint: metadata.revocation_endpoint,
         jwks_uri: metadata.jwks_uri,
     };
     environment.validate()?;
+    Ok((client, environment, device_endpoint))
+}
+
+pub(crate) async fn login_with_observer(
+    api: &astra_thin_client::ThinClient,
+    discovery: UcDiscovery,
+    observer: super::LoginObserver,
+    terminal_workspace_prompt: bool,
+    launch: impl AsyncFnOnce(String) -> Result<(), String>,
+) -> Result<(), String> {
+    let store = NativeStore::new()?;
+    store.prepare_for_login()?;
+    let (client, environment, _) = discover_environment(api, &discovery).await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|_| "cannot start login callback")?;

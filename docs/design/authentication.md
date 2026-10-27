@@ -341,6 +341,28 @@ make test-memoria-auth-online-contract
 
 The test issues and revokes upstream keys; never point it at a production service.
 
+## MOI device authorization
+
+`astra login --device-code` is an explicit native UC alternative for terminals
+without a browser. It shares discovery/environment validation, nonce-verified
+ID tokens, product preparation, atomic login publication, refresh and logout
+with the existing UC browser login. It has no new local credential schema.
+Discovery's device endpoint is optional; its absence leaves browser login
+unchanged and rejects only the explicit device command.
+
+UC admits the fixed `astra-cli` scope set and S256 PKCE request. The CLI prints
+the manual verification URI and user code, never the grant secret or a complete
+verification URI. Keycloak owns grant state and the final consent. UC's typed
+identity continuation must return to the original Keycloak device session,
+without opening a fresh authorization-code flow. The UC implementation and
+rollout are tracked in [Matrixflow #17972](https://github.com/matrixorigin/matrixflow/issues/17972).
+
+Polling obeys the issuer interval, increases it permanently for `slow_down`,
+backs off transient transport/availability failures, and stops at a bounded
+expiry. A successful but malformed token response is terminal and is not
+replayed. New credentials are published only after existing MOI and Astra
+preparation succeeds. No implicit browser/manual fallback is introduced.
+
 ## CLI in-flight credential ownership
 
 A CLI turn captures its admitted credential owner once, including when

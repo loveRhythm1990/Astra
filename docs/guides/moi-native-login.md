@@ -41,6 +41,36 @@ selection and the normal server-side IAM decision. Login does not perform a paid
 model request or require a positive balance. Invalid default-model configuration
 does reject login preparation, without replacing an existing local session.
 
+## Sign in from a headless terminal
+
+On a server, container, remote shell or other machine without a browser, select
+the trusted MOI deployment and run:
+
+```sh
+astra login --device-code
+```
+
+This opt-in command requires device authorization to be enabled by that UC
+deployment. It prints a verification URL and a short code. Open the URL in a
+browser on another device, enter the code, check the account and permissions,
+and explicitly approve or deny access. Only approve a request that you started.
+The terminal polls UC; it does not expose a callback port or launch a browser.
+There is no automatic fallback from ordinary browser login or `--manual`.
+
+Device login uses a fresh nonce and S256 PKCE and validates the same issuer,
+ID token and MOI/Astra bootstraps as browser login. The grant secret is held only
+in memory. Pending, denial, expiry, cancellation and failed preparation preserve
+the previous local sign-in. Ctrl+C stops waiting; the pending server-side request
+expires on its own. Once tokens arrive, wait for bounded sign-in preparation and
+publication to settle. An uncertain token response requires starting a new
+request, rather than treating the terminal as authenticated.
+
+UC binds the browser identity to the original device session; Keycloak owns the
+single final approval/denial and the resulting grant. Existing browser SSO does
+not approve a device automatically. Each approved terminal gets an independent
+native session and then uses the existing refresh, logout and moi-cli credential
+helper. This feature does not extend the deployment's session lifetimes.
+
 ## Credential ownership
 
 The canonical store is `~/.moi/auth.json`; `MOI_AUTH_DIR` selects an isolated

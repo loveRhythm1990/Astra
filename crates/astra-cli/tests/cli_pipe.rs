@@ -1434,3 +1434,39 @@ async fn no_color_chat_preserves_plain_progress_and_answer() {
     }
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn device_login_does_not_fall_back_on_an_older_server() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/auth/methods"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "password": true
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let home = tempfile::tempdir().unwrap();
+    let auth = home.path().join("native-auth");
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_astra"));
+    command
+        .current_dir(home.path())
+        .env_clear()
+        .env("HOME", home.path())
+        .env("MOI_AUTH_DIR", &auth)
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("XDG_CACHE_HOME", home.path().join(".cache"))
+        .env("XDG_DATA_HOME", home.path().join(".local/share"))
+        .args(["--api-url", &server.uri(), "login", "--device-code"])
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(15), command.output())
+        .await
+        .expect("unsupported device login must stop without a browser or password prompt")
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not support MOI device code"));
+    assert!(!auth.join("auth.json").exists());
+}
