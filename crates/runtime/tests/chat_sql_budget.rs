@@ -14,8 +14,10 @@ use tracing_subscriber::prelude::*;
 
 /// The run drain does not own the detached observer. Its completion counter is
 /// published only after the production worker has finished all of its SQL.
-async fn wait_for_chat_observers(state: &astra_runtime::AppState, expected_observers: u64) {
-    let registry = state.metrics_registry();
+async fn wait_for_chat_observers(
+    registry: Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>,
+    expected_observers: u64,
+) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let metrics = registry.render_prometheus();
@@ -29,13 +31,19 @@ async fn wait_for_chat_observers(state: &astra_runtime::AppState, expected_obser
                 if value == 0 {
                     continue;
                 }
-                assert!(
-                    !series.contains("outcome=\"error\"")
-                        && !series.contains("outcome=\"dropped_full\""),
-                    "observer must finish without errors or dropped work: {line}"
-                );
                 if series.starts_with("astra_turn_observer_runs_total{") {
+                    assert_eq!(
+                        series,
+                        "astra_turn_observer_runs_total{mode=\"async\",outcome=\"success\"}",
+                        "authorized SQL budget requires successful observation, not skipped or failed work: {line}"
+                    );
                     completed += value;
+                } else {
+                    assert_eq!(
+                        series,
+                        "astra_turn_observer_dispatches_total{mode=\"async\",outcome=\"scheduled\"}",
+                        "authorized SQL budget requires scheduled observation: {line}"
+                    );
                 }
             }
             assert!(completed <= expected_observers, "unexpected extra observer");
@@ -47,6 +55,47 @@ async fn wait_for_chat_observers(state: &astra_runtime::AppState, expected_obser
     })
     .await
     .expect("each chat must finish its detached observer before ending SQL capture");
+}
+
+#[tokio::test]
+async fn sql_budget_requires_the_expected_successful_observations() {
+    let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+    registry.register_counter("astra_turn_observer_runs_total", "observer test");
+    registry.increment_counter(
+        "astra_turn_observer_runs_total",
+        &[("mode", "async"), ("outcome", "success")],
+        2,
+    );
+    wait_for_chat_observers(registry, 2).await;
+}
+
+#[tokio::test]
+async fn sql_budget_rejects_skipped_failed_or_dropped_observations() {
+    for (metric, outcome) in [
+        ("astra_turn_observer_runs_total", "not_configured"),
+        ("astra_turn_observer_runs_total", "access_disabled"),
+        ("astra_turn_observer_runs_total", "empty"),
+        ("astra_turn_observer_runs_total", "error"),
+        ("astra_turn_observer_dispatches_total", "dropped_full"),
+        ("astra_turn_observer_dispatches_total", "skipped_empty"),
+    ] {
+        for successes in [0, 1] {
+            let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+            registry.register_counter(metric, "observer test");
+            registry.register_counter("astra_turn_observer_runs_total", "observer test");
+            registry.increment_counter(
+                "astra_turn_observer_runs_total",
+                &[("mode", "async"), ("outcome", "success")],
+                successes,
+            );
+            registry.increment_counter(metric, &[("mode", "async"), ("outcome", outcome)], 1);
+            let result = tokio::spawn(wait_for_chat_observers(registry, 1)).await;
+            assert!(
+                result.is_err_and(|error| error.is_panic()),
+                "{outcome} must fail the authorized probe, including with {successes} successful observations"
+            );
+        }
+    }
 }
 
 /// Measure request SQL on an initialized pool, not timing-dependent SQLx
@@ -500,7 +549,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             assert!(body.contains("Warm context ready."), "{body}");
             // Shutdown drain would reject the measured turn. The complete SSE
             // response settles the warm-up turn; separately await its observer.
-            wait_for_chat_observers(&b.ctx.app_state, 1).await;
+            wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
         }
         prime_chat_pool(&b.ctx).await;
         let message = if executes_agent {
@@ -595,7 +644,11 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                 .drain_background_runs(std::time::Duration::from_secs(5))
                 .await
         );
-        wait_for_chat_observers(&b.ctx.app_state, 1 + u64::from(warm_context)).await;
+        wait_for_chat_observers(
+            b.ctx.app_state.metrics_registry(),
+            1 + u64::from(warm_context),
+        )
+        .await;
         let samples = capture.0.lock().unwrap().take().unwrap();
         let execution_ms = execution_started.elapsed().as_secs_f64() * 1000.0;
         // Explicit cold-replay verification follows the ordinary request's

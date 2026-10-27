@@ -82,8 +82,15 @@ Astra owner, checks write admission, and resolves fresh write transport before
 sending `/v1/observe`. The transport supplies the Memoria owner and authentication
 scheme, with exactly one `X-User-Id` header; the worker must not derive them from
 the request user ID or fall back to a deployment master key. Denied/read-only access skips observation; authority
-lookup failures and grants revoked after admission fail closed. Observer run
-metrics distinguish `success` (backend accepted the request), `not_configured`
+lookup failures and grants revoked after admission fail closed.
+
+Transport resolution performs fresh authority lookup without allocating an HTTP
+client. HTTP memory operations construct their client from the resolved transport;
+the observer keeps its own 10-second connect / 30-second request timeout and
+no-redirect policy. Admission and the fresh send-time authority check remain
+separate.
+
+Observer run metrics distinguish `success` (backend accepted the request), `not_configured`
 (no authority template), `access_disabled` (write admission denied), `empty`, and
 `error`; success alone does not prove recall or prompt injection. Existing
 success-rate dashboards must exclude skipped outcomes from attempted-request

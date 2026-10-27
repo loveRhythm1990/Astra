@@ -514,8 +514,11 @@ response and waits for observer completion before the next request starts;
 it must not use shutdown drain, which closes admission for that next request.
 Capture ends only after
 both the measured run and its observer finish: the detached observer is not
-owned by `drain_background_runs`. Observer errors, dropped work or a missing
-completion fail the probe instead of silently undercounting SQL.
+owned by `drain_background_runs`. The authorized probe requires the exact number
+of `success` outcomes. Errors, dropped work, missing completions, and skipped
+outcomes (`not_configured`, `access_disabled`, `empty`) fail the probe even when
+successful observations are also present. Disabled access is covered separately;
+it cannot satisfy this HTTP-path SQL measurement.
 The readonly-round comparison accounts for exact periodic control reads and
 at most one account/session authentication snapshot when its 30-second cache
 expires. Those statements still count toward the raw 20-statement limit;
