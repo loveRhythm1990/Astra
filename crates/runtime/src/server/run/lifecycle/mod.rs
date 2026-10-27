@@ -8431,7 +8431,13 @@ impl AgenticRunLifecycleService {
             crate::server::model_execution_admission::validate_reasoning_control(
                 execution, &thinking,
             )
-            .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+            .map_err(|detail| {
+                error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    detail,
+                    "model_reasoning_unsupported",
+                )
+            })?;
         }
         let provider_model_descriptor = Self::provider_model_descriptor(request)?;
         if provider_model_descriptor.is_some() {

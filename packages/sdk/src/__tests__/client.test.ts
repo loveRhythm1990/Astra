@@ -998,6 +998,10 @@ describe("AstraClient — Models", () => {
     expect(
       (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
     ).toContain("/models?limit=200");
+    expect(
+      new Headers((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].headers)
+        .get("x-astra-model-catalog-version"),
+    ).toBe("2");
   });
 
   test("listModels follows seek cursors and rejects a repeated page", async () => {
@@ -1085,6 +1089,10 @@ describe("AstraClient — Models", () => {
     expect(
       (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
     ).toContain("/model-access");
+    expect(
+      new Headers((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].headers)
+        .get("x-astra-model-catalog-version"),
+    ).toBe("2");
   });
 
   test("getModelAccess drains pages while preserving first-page default", async () => {

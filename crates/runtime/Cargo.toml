@@ -35,6 +35,10 @@ path = "src/main.rs"
 name = "moi_fresh_astra"
 required-features = ["moi-compat-tests"]
 
+[[test]]
+name = "client_compatibility"
+required-features = ["moi-compat-tests"]
+
 [dependencies]
 crc32fast = "1.4"
 dirs = "6.0.0"

@@ -668,6 +668,10 @@ impl ThinClient {
             .http
             .get(url.clone())
             .headers(self.auth_headers_for(Some(token)).await?)
+            .header(
+                astra_server_types::MODEL_CATALOG_VERSION_HEADER,
+                astra_server_types::MODEL_CATALOG_VERSION,
+            )
             .timeout(timeout)
             .query(&[("purpose", purpose.as_str())]);
         if let Some((provider, model_name, model_id)) = cursor {
@@ -715,6 +719,10 @@ impl ThinClient {
             .http
             .get(url)
             .headers(self.auth_headers_for(Some(token)).await?)
+            .header(
+                astra_server_types::MODEL_CATALOG_VERSION_HEADER,
+                astra_server_types::MODEL_CATALOG_VERSION,
+            )
             .timeout(timeout);
         if let Some((provider, model_name, model_id)) = cursor {
             request = request.query(&[
@@ -4862,6 +4870,10 @@ mod tests {
             .and(query_param("after_name", "model two"))
             .and(query_param("after_offering_id", "offer/2"))
             .and(query_param("purpose", "typed_judgment"))
+            .and(header(
+                astra_server_types::MODEL_CATALOG_VERSION_HEADER,
+                astra_server_types::MODEL_CATALOG_VERSION,
+            ))
             .and(header("authorization", "Bearer t"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "items": [],
@@ -4880,6 +4892,32 @@ mod tests {
                 Duration::from_secs(1),
                 Some(("bedrock/openai", "model two", "offer/2")),
                 astra_core::model_wire::purpose::ModelCatalogPurpose::TypedJudgment,
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn wiremock_model_access_negotiates_catalog_format_on_every_page() {
+        let srv = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/model-access"))
+            .and(header(
+                astra_server_types::MODEL_CATALOG_VERSION_HEADER,
+                astra_server_types::MODEL_CATALOG_VERSION,
+            ))
+            .and(query_param("after_offering_id", "offer/2"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&srv)
+            .await;
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let response = client
+            .get_model_access_page_response_timeout(
+                "t",
+                Duration::from_secs(1),
+                Some(("openai", "model two", "offer/2")),
             )
             .await
             .unwrap();

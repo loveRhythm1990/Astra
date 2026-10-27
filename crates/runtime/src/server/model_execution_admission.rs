@@ -292,7 +292,7 @@ pub(crate) fn validate_reasoning_control(
         Ok(())
     } else {
         Err(format!(
-            "Offering '{}' cannot execute requested reasoning control '{}' (capability: {}, protocol: {:?}). If the task permits the Offering default instead of this explicit control, retry /chat with {{\"context\":{{\"thinking\":{{\"mode\":\"model_default\"}}}}}}; for agent use {{\"reasoning\":{{\"mode\":\"model_default\"}}}}; for agent_fanout use {{\"defaults\":{{\"reasoning\":{{\"mode\":\"model_default\"}}}}}}. If slots[i].reasoning is explicitly set, replace that slot's reasoning with {{\"mode\":\"model_default\"}} instead: defaults does not override explicit slot controls. These explicit model_default controls suppress parent reasoning inheritance. The requested control was not changed or executed.",
+            "Offering '{}' cannot execute requested reasoning control '{}' (capability: {}, protocol: {:?}). If the task permits the Offering default instead of this explicit control, retry /chat with {{\"context\":{{\"thinking\":{{\"mode\":\"model_default\"}}}}}}; for agent use {{\"reasoning\":{{\"mode\":\"model_default\"}}}}; for agent_fanout use {{\"defaults\":{{\"reasoning\":{{\"mode\":\"model_default\"}}}}}}. If slots[i].reasoning is explicitly set, replace that slot's reasoning with {{\"mode\":\"model_default\"}} instead: defaults does not override explicit slot controls. These explicit model_default controls suppress parent reasoning inheritance. The requested control was not changed or executed. If this client cannot represent the supported reasoning control, run `astra update` before selecting that control.",
             execution.offering_id,
             thinking,
             capability.map_or("unknown", |capability| capability.as_str()),
@@ -472,6 +472,56 @@ mod tests {
             "outside the admission test contract",
             "test_operation_unsupported",
         ))
+    }
+
+    #[test]
+    fn published_reasoning_controls_are_admitted_without_silent_translation() {
+        use astra_core::model_wire::thinking::ThinkingProtocol;
+        use astra_services::models::ThinkingCapability;
+        use astra_turn_core::thinking_config::ThinkingConfig;
+
+        // Actual 0.2.10 context.thinking representation, not a current picker.
+        let old_request: astra_server_types::ChatRequest =
+            serde_json::from_value(serde_json::json!({
+                "message": "compatibility",
+                "model_selection": {"offering_id": "offering"},
+                "context": {"thinking": {"mode": "adaptive", "effort": "high"}}
+            }))
+            .unwrap();
+        let old_control: ThinkingConfig =
+            serde_json::from_value(old_request.context.unwrap()["thinking"].clone()).unwrap();
+        let mut execution = AdmittedModelExecution::from_endpoint(
+            "offering".into(),
+            "model".into(),
+            "openai".into(),
+            "http://127.0.0.1:1/chat/completions".into(),
+            "Bearer fixture".into(),
+            None,
+            128_000,
+        );
+        execution.thinking_capability = Some(ThinkingCapability::Both);
+        for protocol in [ThinkingProtocol::EnableThinking, ThinkingProtocol::Moonshot] {
+            execution.thinking_protocol = Some(protocol);
+            let error = validate_reasoning_control(&execution, &old_control).unwrap_err();
+            assert!(error.contains("astra update"));
+            assert!(validate_reasoning_control(&execution, &ThinkingConfig::On {}).is_ok());
+            let mut wire = serde_json::json!({});
+            ThinkingConfig::On {}.apply_openai_protocol(&mut wire, protocol);
+            match protocol {
+                ThinkingProtocol::EnableThinking => {
+                    assert_eq!(wire, serde_json::json!({"enable_thinking": true}))
+                }
+                ThinkingProtocol::Moonshot => {
+                    assert_eq!(wire, serde_json::json!({"thinking": {"type": "enabled"}}))
+                }
+                _ => unreachable!(),
+            }
+        }
+        execution.thinking_protocol = Some(ThinkingProtocol::ReasoningEffort);
+        validate_reasoning_control(&execution, &old_control).unwrap();
+        let mut wire = serde_json::json!({});
+        old_control.apply_openai_protocol(&mut wire, ThinkingProtocol::ReasoningEffort);
+        assert_eq!(wire, serde_json::json!({"reasoning_effort": "high"}));
     }
 
     #[test]

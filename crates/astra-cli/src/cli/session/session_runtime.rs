@@ -309,12 +309,44 @@ pub(crate) enum ModelCatalogError {
     NotAuthenticated,
     #[error(transparent)]
     Request(#[from] astra_thin_client::ThinClientError),
-    #[error("invalid model catalog JSON: {0}")]
-    InvalidJson(#[from] serde_json::Error),
+    #[error("Model catalog response is not valid JSON. Check the model service and try again.")]
+    InvalidJson(#[source] serde_json::Error),
+    #[error(
+        "Model catalog response does not match this client's supported schema. Run `astra update`, or ask the server administrator to restore a supported client/server combination."
+    )]
+    UnsupportedSchema(#[source] serde_json::Error),
     #[error("invalid model catalog protocol: {0}")]
     Protocol(String),
     #[error("Model catalog request timed out")]
     TimedOut,
+}
+
+impl From<serde_json::Error> for ModelCatalogError {
+    fn from(error: serde_json::Error) -> Self {
+        if error.is_data() {
+            Self::UnsupportedSchema(error)
+        } else {
+            Self::InvalidJson(error)
+        }
+    }
+}
+
+impl ModelCatalogError {
+    fn into_classified(self) -> astra_core::ClassifiedError {
+        match self {
+            Self::InvalidJson(error) | Self::UnsupportedSchema(error) => {
+                model_catalog_decode_error(error)
+            }
+            Self::Request(astra_thin_client::ThinClientError::Api { status, .. }) => {
+                model_catalog_http_error(status)
+            }
+            Self::NotAuthenticated => astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Auth,
+                "Sign in before reading the model catalog.",
+            ),
+            other => astra_core::ClassifiedError::from(other.to_string()),
+        }
+    }
 }
 
 /// Fetch the exact public model catalog. Only active Offerings reach the
@@ -551,6 +583,22 @@ fn model_catalog_contract_error(message: impl Into<String>) -> astra_core::Class
     astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
 }
 
+fn model_catalog_decode_error(error: serde_json::Error) -> astra_core::ClassifiedError {
+    let schema_mismatch = error.is_data();
+    let message = ModelCatalogError::from(error).to_string();
+    astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
+        .with_details_json(
+            serde_json::json!({
+                "reason": if schema_mismatch {
+                    "model_catalog_schema_mismatch"
+                } else {
+                    "model_catalog_json_invalid"
+                }
+            })
+            .to_string(),
+        )
+}
+
 /// Keep the catalog owner and HTTP status through the string-based turn boundary.
 /// Auth also covers forbidden access and provider credentials; only a catalog
 /// session 401 can authorize the existing session refresh retry.
@@ -634,8 +682,8 @@ async fn load_server_model_access(
         if !response.status().is_success() {
             return Err(model_catalog_http_error(response.status()));
         }
-        let page: ModelAccessProjectionResponse = response
-            .json()
+        let bytes = response
+            .bytes()
             .await
             .map_err(|error| {
                 tracing::warn!(
@@ -645,13 +693,13 @@ async fn load_server_model_access(
                 );
                 let (kind, message) = if error.is_timeout() {
                     (astra_core::ErrorKind::Network, "Model catalog response timed out. Try again.")
-                } else if error.is_decode() {
-                    (astra_core::ErrorKind::ContractViolation, "Model catalog response was not valid JSON. Check the model service and try again.")
                 } else {
                     (astra_core::ErrorKind::Network, "Model catalog response could not be read. Check your connection and try again.")
                 };
                 astra_core::ClassifiedError::new(kind, message)
             })?;
+        let page: ModelAccessProjectionResponse =
+            serde_json::from_slice(&bytes).map_err(model_catalog_decode_error)?;
         if page.limit == 0 || page.limit > 200 {
             return Err(model_catalog_contract_error(
                 "Model Access projection returned an invalid page limit",
@@ -817,12 +865,7 @@ pub(crate) async fn resolve_server_model_selection(
 ) -> Result<ServerModelSelection, astra_core::ClassifiedError> {
     let (catalog, _) = fetch_server_model_catalog(api, Some(token), purpose)
         .await
-        .map_err(|error| match error {
-            ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
-                status, ..
-            }) => model_catalog_http_error(status),
-            other => astra_core::ClassifiedError::from(other.to_string()),
-        })?;
+        .map_err(ModelCatalogError::into_classified)?;
     resolve_server_model_selection_from_catalog(model, &catalog).map_err(|error| {
         astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
     })
@@ -2680,8 +2723,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_catalog_fetch_rejects_non_catalog_json_at_the_shared_boundary() {
-        for body in ["not-json", r#"{"models":[]}"#, "[]"] {
+    async fn model_catalog_fetch_distinguishes_json_syntax_from_unsupported_schema() {
+        for (body, expected_reason) in [
+            ("not-json", "model_catalog_json_invalid"),
+            (r#"{"models":[]}"#, "model_catalog_schema_mismatch"),
+            ("[]", "model_catalog_schema_mismatch"),
+        ] {
             let mock = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/models"))
@@ -2697,9 +2744,45 @@ mod tests {
             )
             .await
             .expect_err("obsolete or malformed catalog shapes must fail at the shared boundary");
+            let classified = error.into_classified();
+            assert_eq!(classified.kind, astra_core::ErrorKind::ContractViolation);
+            let details: serde_json::Value =
+                serde_json::from_str(classified.details_json.as_deref().unwrap()).unwrap();
+            assert_eq!(details["reason"], expected_reason);
+            if expected_reason == "model_catalog_schema_mismatch" {
+                assert!(classified.message.contains("astra update"));
+                assert!(!classified.message.contains("not valid JSON"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn model_access_decode_errors_preserve_safe_machine_classification() {
+        for (body, expected_reason) in [
+            ("{", "model_catalog_json_invalid"),
+            (
+                r#"{"private":"synthetic-response-must-not-be-displayed"}"#,
+                "model_catalog_schema_mismatch",
+            ),
+        ] {
+            let mock = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/model-access"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&mock)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+            let error = super::load_server_model_access(&api, "token")
+                .await
+                .expect_err("malformed or unsupported projections cannot select a model");
+            assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+            let details: serde_json::Value =
+                serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+            assert_eq!(details["reason"], expected_reason);
             assert!(
-                matches!(error, ModelCatalogError::InvalidJson(_)),
-                "{error}"
+                !error
+                    .message
+                    .contains("synthetic-response-must-not-be-displayed")
             );
         }
     }

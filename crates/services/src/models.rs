@@ -708,8 +708,9 @@ pub struct ModelListPage {
 /// Wire envelope shared by every model-catalog consumer. The catalog is a
 /// seek-paginated projection; clients must follow `next_cursor` until it is
 /// absent instead of treating one response as the complete registry.
+// Read-only observation: additive metadata does not authorize execution.
+// Required fields and typed enum values remain strictly decoded.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ModelListPageResponse {
     pub items: Vec<ModelListItemResponse>,
     pub next_cursor: Option<ModelListCursor>,
@@ -5864,8 +5865,9 @@ pub struct ModelResponse {
     pub thinking_probe: Option<ThinkingProbeResult>,
 }
 
+// This public observation may acquire optional metadata. Execution requests,
+// admission decisions, and their enum values retain their strict contracts.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct ModelListItemResponse {
     pub thinking_protocol: Option<ThinkingProtocol>,
     pub offering_id: String,
@@ -6043,8 +6045,8 @@ pub struct ModelAccessViewResponse {
     pub actions: Vec<ModelAccessAction>,
 }
 
+// Like ModelListPageResponse, this is a read-only catalog projection.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct ModelAccessProjectionResponse {
     pub accesses: Vec<ModelAccessViewResponse>,
     pub offerings: Vec<ModelListItemResponse>,

@@ -316,6 +316,66 @@ behind; CI disposes of the entire isolated dependency stack. The dedicated
 feature keeps this test out of generic offline/online lanes, avoiding duplicate
 full-stack execution.
 
+## Released CLI and Edge compatibility
+
+Matrixflow [#19966](https://github.com/matrixorigin/matrixflow/issues/19966)
+tracks the independent client/server rollout contract. The frozen MOI test
+above remains unchanged: it is not a historical Astra CLI or Edge test.
+
+`scripts/ci/historical-clients.json` is the reviewed, immutable linux/amd64
+artifact inventory. It pins component version, source commit, original bundle,
+archive URL, size, and SHA256. `historical_clients.py` checks the downloaded or
+cached bytes on every use and safely extracts the exact binary; it does not
+execute an installer or follow a moving channel. A missing artifact, wrong
+digest, unsupported architecture, or failed dependency is a failure, not a
+skipped test or an opportunity to substitute a different version.
+
+The initial test roles are deliberately distinct from a claim of full support:
+
+| Consumer | Required behavior against the candidate Server |
+| --- | --- |
+| Published CLI 0.2.12, source `70a5ee3e` | Legacy catalog, ordinary chat and authoritative final output, tool result return, approval allow/deny, cancellation and same-session reuse |
+| Published Edge 0.2.12, source `70a5ee3e` | Schema v2 registration, connection, task execution and result return |
+| Published CLI 0.2.10, source `5aacae0d` | Strict historical catalog parsing; its schema v1 embedded executor remains unsupported and must produce a bounded upgrade failure |
+| Published Edge 0.2.10, source `5aacae0d` | Explicit schema v1 rejection and upgrade guidance; it is not a positive execution baseline |
+| Candidate CLI | Explicit v2 discovery and ordinary chat through the real candidate Server; rollback checks identify the exact historical Server source rather than calling it current Prod |
+
+The CLI 0.2.10 sample matches the old response-field contract. This does not
+identify the original screenshot's client/server pair. Unversioned clients
+share the frozen v1 response and do not receive v2 pricing or protocol-aware
+picker metadata. New thinking controls require an upgraded client; unsupported
+explicit old controls must fail without model I/O or silent substitution.
+
+`user_models_http` exercises both real catalog routes with an independent
+published-field decoder, including null/non-null new metadata, explicit v2,
+invalid format versions, authentication denial, and unknown execution enums.
+CLI tests distinguish malformed JSON from a structurally unsupported response
+using stable `model_catalog_json_invalid` / `model_catalog_schema_mismatch`
+reason metadata; safe user messages never echo the received body.
+
+The shared CLI CI execution runs `client_compatibility` with the dedicated
+`moi-compat-tests` feature and isolated MatrixOne/Memoria. It starts the real
+production router with fresh storage, then invokes
+`scripts/ci/client_compatibility.py` using downloaded historical executables
+and the already-built candidate CLI. The provider is a finite, controlled
+OpenAI wire fixture. Client state is isolated in temporary HOME/XDG/workspace
+directories, and authorization, tool admission, approvals, and persistence
+still cross their production owners. The special performance/capture-SHA
+baseline is not loosened to accept historical clients.
+
+Both IDC and public candidate-image smoke jobs invoke the same driver after
+the existing candidate digest/revision and stack health checks. They reuse
+that image rather than rebuilding a Server for each consumer. The existing
+required job results include these failures; no skip, retry, or larger timeout
+is used to turn a failure into success.
+
+Reports record exact artifact/source identities, scenario outcomes, failure
+categories, and elapsed time. They do not contain tokens, raw client output,
+provider responses, or user data. Passing a catalog parser test is not a full
+conversation result. Support is advertised only for the exact successful
+combinations and feature scopes recorded by CI; testing two versions does not
+prove every intervening version or all-platform installation behavior.
+
 ## Where Tests Live
 
 - `crates/runtime/tests/` — HTTP integration tests for `astra-runtime` (including `*_contract.rs`, `system_matrix_http_e2e/`, bridge E2E).

@@ -21,6 +21,199 @@ use axum::{
 };
 use tower::ServiceExt;
 
+#[path = "fixtures/model_catalog_0_2_10.rs"]
+mod published_catalog_v1;
+
+fn published_catalog_response(
+    route: &str,
+    body: serde_json::Value,
+) -> serde_json::Result<serde_json::Value> {
+    if route == "/models" {
+        serde_json::from_value::<published_catalog_v1::ModelListPageResponse>(body)
+            .and_then(serde_json::to_value)
+    } else {
+        serde_json::from_value::<published_catalog_v1::ModelAccessProjectionResponse>(body)
+            .and_then(serde_json::to_value)
+    }
+}
+
+#[tokio::test]
+async fn published_catalog_reader_accepts_unversioned_models_and_model_access() {
+    use astra_core::model_wire::thinking::ThinkingProtocol;
+    use astra_server_types::MODEL_CATALOG_VERSION_HEADER;
+    use astra_services::{
+        ModelAccessKind, ModelCatalogPricing, ModelExecutionPlacement, ThinkingCapability,
+    };
+
+    for protocol in [None, Some(ThinkingProtocol::EnableThinking)] {
+        let offering = ModelListItem {
+            thinking_protocol: protocol,
+            offering_id: "offer-public".into(),
+            access_id: "self-hosted".into(),
+            access_kind: ModelAccessKind::SelfHosted,
+            access_label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
+            name: "public-model".into(),
+            provider: "openai".into(),
+            description: None,
+            is_active: true,
+            context_window: 128_000,
+            max_completion_tokens: Some(4096),
+            architecture: None,
+            thinking_capability: Some(ThinkingCapability::Both),
+            pricing: protocol.map(|_| ModelCatalogPricing {
+                currency: "USD".into(),
+                unit: "per_token".into(),
+                source: "deployment".into(),
+                prompt: 0.000001,
+                completion: 0.000002,
+                cache_read: None,
+                cache_write: None,
+                configuration_updated_at: "2026-10-01T00:00:00Z".into(),
+            }),
+        };
+        let service = TestModelService {
+            allows_deployment: true,
+            catalog: vec![offering],
+            ..Default::default()
+        };
+        for (route, entries) in [("/models", "items"), ("/model-access", "offerings")] {
+            for version in [None, Some("1"), Some("2")] {
+                let mut request = Request::builder()
+                    .uri(route)
+                    .header("authorization", "Bearer catalog-user");
+                if let Some(version) = version {
+                    request = request.header(MODEL_CATALOG_VERSION_HEADER, version);
+                }
+                let response = app(service.clone())
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response.headers()[MODEL_CATALOG_VERSION_HEADER],
+                    version.unwrap_or("1")
+                );
+                let bytes = body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let page: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let item = page[entries][0].clone();
+                assert_eq!(item["offering_id"], "offer-public");
+                assert_eq!(item["thinking_capability"], "both");
+                assert_eq!(page["total"], 1);
+                assert_eq!(page["next_cursor"], serde_json::Value::Null);
+                if version == Some("2") {
+                    // This is the original failure: even null additive fields
+                    // make the published strict reader reject a modern item.
+                    assert!(published_catalog_response(route, page.clone()).is_err());
+                    assert_eq!(
+                        item["thinking_protocol"],
+                        serde_json::to_value(protocol).unwrap()
+                    );
+                    assert!(item.get("pricing").is_some());
+                    let current: astra_services::ModelListItemResponse =
+                        serde_json::from_value(item).unwrap();
+                    assert_eq!(current.thinking_protocol, protocol);
+                    let mut additive = page.clone();
+                    additive["future_display_metadata"] = serde_json::json!({"label": "safe"});
+                    additive[entries][0]["future_display_metadata"] = serde_json::json!(true);
+                    if route == "/models" {
+                        serde_json::from_value::<astra_services::ModelListPageResponse>(
+                            additive.clone(),
+                        )
+                        .unwrap();
+                    } else {
+                        serde_json::from_value::<astra_services::ModelAccessProjectionResponse>(
+                            additive.clone(),
+                        )
+                        .unwrap();
+                    }
+                    additive[entries][0]["execution_placement"] =
+                        serde_json::json!("unknown-executor");
+                    if route == "/models" {
+                        assert!(
+                            serde_json::from_value::<astra_services::ModelListPageResponse>(
+                                additive
+                            )
+                            .is_err()
+                        );
+                    } else {
+                        assert!(serde_json::from_value::<astra_services::ModelAccessProjectionResponse>(additive).is_err());
+                    }
+                } else {
+                    assert_eq!(
+                        published_catalog_response(route, page.clone()).unwrap(),
+                        page
+                    );
+                    for (field, value) in [
+                        ("access_kind", "future-access"),
+                        ("execution_placement", "future-executor"),
+                        ("thinking_capability", "future-control"),
+                    ] {
+                        let mut unsupported = page.clone();
+                        unsupported[entries][0][field] = serde_json::json!(value);
+                        assert!(published_catalog_response(route, unsupported).is_err());
+                    }
+                    let mut expanded_page = page.clone();
+                    expanded_page["future_page_metadata"] = serde_json::json!(true);
+                    assert!(published_catalog_response(route, expanded_page).is_err());
+                    if route == "/model-access" {
+                        for field in ["future_view_metadata", "status"] {
+                            let mut expanded_view = page.clone();
+                            expanded_view["accesses"][0][field] = serde_json::json!("future");
+                            assert!(published_catalog_response(route, expanded_view).is_err());
+                        }
+                        let mut expanded_default = page.clone();
+                        expanded_default["default_resolution"]["future_default_metadata"] =
+                            serde_json::json!(true);
+                        assert!(published_catalog_response(route, expanded_default).is_err());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn catalog_version_does_not_authorize_access_or_silently_accept_unknown_versions() {
+    use astra_server_types::MODEL_CATALOG_VERSION_HEADER;
+    for route in ["/models", "/model-access"] {
+        for version in ["1", "2"] {
+            let response = app(TestModelService::default())
+                .oneshot(
+                    Request::builder()
+                        .uri(route)
+                        .header(MODEL_CATALOG_VERSION_HEADER, version)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        for version in ["", "0", "3", "2,1", " 2"] {
+            let response = app(TestModelService::default())
+                .oneshot(
+                    Request::builder()
+                        .uri(route)
+                        .header("authorization", "Bearer catalog-user")
+                        .header(MODEL_CATALOG_VERSION_HEADER, version)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(error["error_code"], "model_catalog_version_unsupported");
+        }
+    }
+}
+
 type HttpError = (StatusCode, Json<ErrorResponse>);
 
 #[derive(Clone, Default)]
@@ -316,6 +509,10 @@ async fn catalog_purpose_is_applied_before_pagination_and_shared_by_model_access
                 .await;
                 assert_eq!(status, StatusCode::OK, "{raw}");
                 let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(
+                    published_catalog_response(route, body.clone()).unwrap(),
+                    body
+                );
                 assert_eq!(body["total"], expected.len());
                 assert_eq!(
                     shared_revision.get_or_insert(body["catalog_revision"].clone()),
@@ -336,6 +533,9 @@ async fn catalog_purpose_is_applied_before_pagination_and_shared_by_model_access
                 if cursor.is_null() {
                     break;
                 }
+                let mut expanded_cursor = body.clone();
+                expanded_cursor["next_cursor"]["future_cursor_metadata"] = serde_json::json!(true);
+                assert!(published_catalog_response(route, expanded_cursor).is_err());
                 assert!(found.len() < expected.len(), "cursor must terminate");
                 path = format!(
                     "{route}?purpose={purpose}&limit=1&after_provider={}&after_name={}&after_offering_id={}",

@@ -4,12 +4,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use crate::AppState;
+mod catalog_transport;
 use astra_core::{ErrorResponse, error_response, error_response_coded, internal_error};
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
+use catalog_transport::CatalogVersion;
 
 const DEFAULT_MODEL_CATALOG_LIMIT: u32 = 50;
 
@@ -210,9 +212,10 @@ pub async fn list_models_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<ModelCatalogQuery>,
-) -> Result<Json<ModelListPageResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
+    let version = CatalogVersion::from_headers(&headers)?;
     let catalog = effective_model_catalog(&state, &headers, &query, false).await?;
-    Ok(Json(ModelListPageResponse {
+    Ok(version.models(ModelListPageResponse {
         items: catalog
             .offerings
             .into_iter()
@@ -440,7 +443,8 @@ pub async fn get_model_access_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<ModelCatalogQuery>,
-) -> Result<Json<ModelAccessProjectionResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
+    let version = CatalogVersion::from_headers(&headers)?;
     if query.purpose == astra_core::model_wire::purpose::ModelCatalogPurpose::All {
         return Err(astra_core::error_response_coded(
             StatusCode::BAD_REQUEST,
@@ -476,7 +480,7 @@ pub async fn get_model_access_handler(
         projection.default_offering_id = None;
         projection.default_resolution = None;
     }
-    Ok(Json(projection))
+    Ok(version.access(projection))
 }
 
 /// Check all requested child Offerings before a CLI fanout launches any slot.

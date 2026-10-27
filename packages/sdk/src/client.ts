@@ -135,6 +135,8 @@ import type {
 } from "./types";
 import {
   ASTRA_EDGE_ID_HEADER,
+  ASTRA_MODEL_CATALOG_VERSION,
+  ASTRA_MODEL_CATALOG_VERSION_HEADER,
   ASTRA_WORK_API_MAJOR,
   ASTRA_WORK_API_MAJOR_HEADER,
   PATH_AGENT_BINDINGS,
@@ -3197,6 +3199,7 @@ export class AstraClient {
       }
       const page = await this.fetch<RuntimeModelListPageResponse>(
         `${PATH_MODELS}?${query.toString()}`,
+        { headers: { [ASTRA_MODEL_CATALOG_VERSION_HEADER]: ASTRA_MODEL_CATALOG_VERSION } },
       );
       if (page.limit <= 0 || page.limit > 200) {
         throw new Error("Invalid model catalog page limit");
@@ -3247,6 +3250,7 @@ export class AstraClient {
       }
       const page = await this.fetch<RuntimeModelAccessProjection>(
         `${PATH_MODEL_ACCESS}?${query.toString()}`,
+        { headers: { [ASTRA_MODEL_CATALOG_VERSION_HEADER]: ASTRA_MODEL_CATALOG_VERSION } },
       );
       if (page.limit <= 0 || page.limit > 200) {
         throw new Error("Invalid Model Access page limit");

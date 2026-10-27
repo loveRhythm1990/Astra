@@ -5105,7 +5105,7 @@ mod model_catalog_loading_tests {
         let error = fetch_owner_model_catalog(&api, &cli_owner_auth_snapshot())
             .await
             .expect_err("invalid catalog shape must fail visibly");
-        assert!(matches!(error, ModelCatalogError::InvalidJson(_)));
+        assert!(matches!(error, ModelCatalogError::UnsupportedSchema(_)));
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
         assert_eq!(
             load_credentials()

@@ -17,6 +17,9 @@ export const PATH_CHAT_STREAM = "/chat/stream";
 
 export const PATH_MODELS = "/models";
 export const PATH_MODEL_ACCESS = "/model-access";
+/** Model catalog response format; keep aligned with astra-server-types. */
+export const ASTRA_MODEL_CATALOG_VERSION_HEADER = "x-astra-model-catalog-version";
+export const ASTRA_MODEL_CATALOG_VERSION = "2";
 export const PATH_AGENT_BINDINGS = "/agent-bindings";
 
 export const PATH_MEMORY_STORE = "/memory/store";
