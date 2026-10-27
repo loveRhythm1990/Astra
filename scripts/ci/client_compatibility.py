@@ -113,6 +113,20 @@ def result_json(result):
     return body
 
 
+def safe_error_summary(value):
+    """Bound synthetic-journey errors without retaining credentials or locations."""
+    if not isinstance(value, str):
+        return None
+    value = re.sub(r"(?i)\b(?:bearer|basic)\s+[^\s,;\"']+", "<credential>", value)
+    value = re.sub(r"(?i)\b(?:access[_ -]?token|refresh[_ -]?token|api[_ -]?key|password|secret)"
+                   r"[\"']?\s*[:=]\s*[\"']?[^\s,;\"']+", "<credential>", value)
+    value = re.sub(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+", "<url>", value)
+    value = re.sub(r"(?:[A-Za-z]:)?[/\\][^\s\"'<>]+", "<path>", value)
+    value = re.sub(r"\b[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b", "<token>", value)
+    value = re.sub(r"[A-Za-z0-9_-]{24,}", "<opaque>", value)
+    return re.sub(r"[\x00-\x1f\x7f]", " ", value)[:1024]
+
+
 def completed(result, expected):
     body = result_json(result)
     if result.returncode != 0 or body.get("success") is not True:
@@ -124,6 +138,9 @@ def completed(result, expected):
             value = body.get(field)
             if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,79}", value):
                 diagnostics[field] = value
+        summary = safe_error_summary(body.get("error"))
+        if summary:
+            diagnostics["error_summary"] = summary
         raise Failure("client_chat_failed", diagnostics)
     require(body.get("final_state") == "completed", "client_terminal_not_completed")
     require(body.get("text") == expected, "client_answer_mismatch")
