@@ -1362,7 +1362,7 @@ fn session_artifact_paths_for_owners(
 /// `{artifact_kind: "step_event", payload: {event_type, payload}}`. Consumers
 /// reason about the logical event in both cases, so unwrap only the explicit
 /// artifact envelope and leave all legacy journal records unchanged.
-fn logical_event(value: &serde_json::Value) -> &serde_json::Value {
+pub(crate) fn logical_event(value: &serde_json::Value) -> &serde_json::Value {
     if value.get("artifact_kind").and_then(|kind| kind.as_str()) == Some("step_event") {
         value.get("payload").unwrap_or(value)
     } else {

@@ -1091,8 +1091,11 @@ the job log and summary, and retain it in `summary.json` and
 `progress.safe.jsonl`. It preserves recognized terminal state, interruption,
 error kind/code, admission status, and available journal/live-stream event
 counts and last event type. Unknown tags become `other`; missing capture
-remains `null`. No stderr, response bodies, event text, identities, or tool
-arguments are published. Live termination counters count observed events,
+remains `null`. The journal's last provider failure retains its typed error,
+admission/provider/settlement stage, deadline phase, dispatch/completion flags,
+and whether its reported run matches the root or another run. This is a
+captured observation, not a root-cause verdict. No stderr, response bodies,
+event text, identities, or tool arguments are published. Live termination counters count observed events,
 not unique children or verified adoption, and captured events may be partial.
 These diagnostics do not change verdicts, retries, timeouts, or cleanup.
 In particular, a cancellation observed after an outer timeout is not proof of

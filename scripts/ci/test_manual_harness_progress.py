@@ -76,7 +76,12 @@ class ManualHarnessProgressTests(unittest.TestCase):
             diagnostic["stream"] = {"identity_verified":True, "has_diagnostics":False, "last_event":"terminated_completed",
                                     "event_counts":{"run_started":1, "terminated_completed":1}}
             diagnostic["journal"] = {"skipped_lines":0, "dropped_lines":0, "integrity_errors":0,
-                                     "last_event":"turn_error", "event_counts":{"turn_error":1}}
+                                     "last_event":"turn_error", "event_counts":{"turn_error":1},
+                                     "last_provider_failure":{
+                                         "event":"llm_round_failed", "run_scope":"root",
+                                         "error_kind":"provider_deadline", "failure_stage":"provider",
+                                         "deadline_phase":"waiting_provider_response",
+                                         "dispatch_started":True, "provider_completed":False}}
             write_events(root, data)
             (root / "report.json").write_text("private-sentinel")
             (root / "execution.json").write_text(json.dumps({"exit_code":1, "termination":"finished"}))
@@ -88,6 +93,7 @@ class ManualHarnessProgressTests(unittest.TestCase):
             self.assertEqual(summary["runs"][0]["exit_code"], 1)
             self.assertIn("contract_violation", (root / "job-summary").read_text())
             self.assertIn("terminated_completed", (root / "job-summary").read_text())
+            self.assertIn("waiting_provider_response", (root / "job-summary").read_text())
             self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
 
     def test_execution_diagnostics_reject_private_tags_and_extra_payload(self):
@@ -106,6 +112,16 @@ class ManualHarnessProgressTests(unittest.TestCase):
         result["steps"][0]["execution_diagnostic"]["error_code"] = "private-sentinel"
         with self.assertRaises(ValueError):
             h.safe_row(result)
+        failure = {"event":"llm_round_failed", "run_scope":"root", "error_kind":"provider_deadline",
+                   "failure_stage":"provider", "deadline_phase":"waiting_provider_response",
+                   "dispatch_started":True, "provider_completed":False}
+        journal = {"skipped_lines":0, "dropped_lines":0, "integrity_errors":0,
+                   "last_event":"llm_round_failed", "event_counts":{"llm_round_failed":1},
+                   "last_provider_failure":failure}
+        for key in ("run_scope", "error_kind", "failure_stage", "deadline_phase", "message"):
+            with self.subTest(provider_field=key), self.assertRaises(ValueError):
+                h.safe_execution_diagnostic({**execution_diagnostic(), "journal":{
+                    **journal, "last_provider_failure":{**failure, key:"private-sentinel"}}})
 
     def test_cache_scope_evidence_survives_summary_without_regrading(self):
         diagnostic = {"kind":"cache_scope", "scope":"conversation_turns",

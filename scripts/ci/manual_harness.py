@@ -59,7 +59,9 @@ user_cancelled context_overflow auth_failure critical_verdict approval_rejected 
 stream_transport stream_idle provider_deadline harness_blocked harness_paused interrupted
 execution_incomplete executor_dropped timeout cancelled other
 """.split())
-ERROR_CODES = ERROR_KINDS | INTERRUPTION_KINDS | {
+TERMINAL_ERROR_KINDS = ERROR_KINDS | {"api_error", "tool_failure", "persistence_error",
+    "partial", "unfinished", "session_cancellation_pending", "other"}
+ERROR_CODES = TERMINAL_ERROR_KINDS | INTERRUPTION_KINDS | {
     "canonical_persistence_failed", "crash_recovery", "genesis_unavailable",
     "terminal_handoff_window_closed", "internal_error", "tool_error", "api_error"}
 STREAM_EVENTS = frozenset("""
@@ -71,6 +73,11 @@ llm_round turn turn_error tool_invocation llm_round_started llm_round_completed 
  tool_call_started tool_call_completed tool_call_failed tool_call_skipped
 step_started step_completed step_incomplete step_failed other
 """.split())
+DEADLINE_PHASES = frozenset("""
+semantic_progress actionable_output provider_work consuming_provider_stream waiting_provider_response
+sending_provider_request provider_attempt_admission provider_attempt_terminalization
+provider_attempt_persistence other
+""".split())
 
 
 def safe_execution_diagnostic(value):
@@ -80,7 +87,7 @@ def safe_execution_diagnostic(value):
         raise ValueError("invalid execution diagnostic")
     for key, allowed in (("final_state", {"completed", "failed", "interrupted", "other"}),
                          ("interruption_kind", INTERRUPTION_KINDS),
-                         ("error_kind", ERROR_KINDS | {"other"}), ("error_code", ERROR_CODES)):
+                         ("error_kind", TERMINAL_ERROR_KINDS), ("error_code", ERROR_CODES)):
         tag = value[key]
         if tag is not None and (not isinstance(tag, str) or tag not in allowed):
             raise ValueError("invalid execution tag")
@@ -92,7 +99,10 @@ def safe_execution_diagnostic(value):
         capture = value[key]
         if capture is None:
             continue
-        if not isinstance(capture, dict) or set(capture) != fields | {"last_event", "event_counts"}:
+        expected = fields | {"last_event", "event_counts"}
+        if key == "journal":
+            expected.add("last_provider_failure")
+        if not isinstance(capture, dict) or set(capture) != expected:
             raise ValueError("invalid capture diagnostic")
         if key == "stream":
             if any(type(capture[field]) is not bool for field in fields):
@@ -108,6 +118,22 @@ def safe_execution_diagnostic(value):
         last = capture["last_event"]
         if last is not None and (not isinstance(last, str) or last not in allowed):
             raise ValueError("invalid last event")
+        if key == "journal" and capture["last_provider_failure"] is not None:
+            failure = capture["last_provider_failure"]
+            if not isinstance(failure, dict) or set(failure) != {
+                "event", "run_scope", "error_kind", "failure_stage", "deadline_phase", "dispatch_started", "provider_completed"}:
+                raise ValueError("invalid provider failure diagnostic")
+            for field, tags in (("event", {"llm_round_failed", "llm_round_completed"}),
+                                ("run_scope", {"root", "other_run", "unattributed"}),
+                                ("error_kind", TERMINAL_ERROR_KINDS),
+                                ("failure_stage", {"admission", "provider", "settlement", "other"}),
+                                ("deadline_phase", DEADLINE_PHASES)):
+                tag = failure[field]
+                if tag is not None and (not isinstance(tag, str) or tag not in tags):
+                    raise ValueError("invalid provider failure tag")
+            for field in ("dispatch_started", "provider_completed"):
+                if failure[field] is not None and type(failure[field]) is not bool:
+                    raise ValueError("invalid provider failure flag")
 
 VALIDATION_CODES = frozenset("""
 required type const enum min_length max_length minimum maximum unique_items

@@ -19,8 +19,17 @@ pub const MAX_RECORD_BYTES: usize = 262_144;
 // Closed projections only: even machine-looking upstream tags can contain
 // private input. Never publish stderr, arbitrary codes, or live event bodies.
 fn error_kind(value: &str) -> &'static str {
-    serde_json::from_value::<astra_core::ErrorKind>(json!(value))
-        .map_or("other", astra_core::ErrorKind::as_str)
+    match value {
+        // CLI terminal categories are distinct from provider ErrorKind tags.
+        "api_error" => "api_error",
+        "tool_failure" => "tool_failure",
+        "persistence_error" => "persistence_error",
+        "partial" => "partial",
+        "unfinished" => "unfinished",
+        "session_cancellation_pending" => "session_cancellation_pending",
+        _ => serde_json::from_value::<astra_core::ErrorKind>(json!(value))
+            .map_or("other", astra_core::ErrorKind::as_str),
+    }
 }
 
 fn interruption(value: &str) -> &'static str {
@@ -96,6 +105,7 @@ fn execution_diagnostic(
     let journal = session.map(|session| {
         let mut counts = BTreeMap::<&str, u64>::new();
         let mut last_event = None;
+        let mut last_provider_failure = None;
         for event in &session.events {
             let tag = match event.event_type.as_str() {
                 "llm_round" => "llm_round",
@@ -117,10 +127,46 @@ fn execution_diagnostic(
             };
             *counts.entry(tag).or_default() += 1;
             last_event = Some(tag);
+            if matches!(tag, "llm_round_failed" | "llm_round_completed") {
+                let logical = crate::session_capture::logical_event(&event.raw);
+                let payload = &logical["payload"];
+                if payload.get("error_kind").is_some() {
+                    let scope = match (logical["run_id"].as_str(), outcome.run_id.as_deref()) {
+                        (Some(run), Some(root)) if run == root => "root",
+                        (Some(_), Some(_)) => "other_run",
+                        _ => "unattributed",
+                    };
+                    let phase = payload["deadline_phase"].as_str().map(|phase| match phase {
+                        "semantic_progress" => "semantic_progress",
+                        "actionable_output" => "actionable_output",
+                        "provider_work" => "provider_work",
+                        "consuming the provider stream" => "consuming_provider_stream",
+                        "waiting for provider response" => "waiting_provider_response",
+                        "sending the non-stream provider request" => "sending_provider_request",
+                        "provider_attempt_admission" => "provider_attempt_admission",
+                        "provider_attempt_terminalization" => "provider_attempt_terminalization",
+                        "provider_attempt_persistence" => "provider_attempt_persistence",
+                        _ => "other",
+                    });
+                    last_provider_failure = Some(json!({
+                        "event":tag,
+                        "run_scope":scope,
+                        "error_kind":payload["error_kind"].as_str().map(error_kind),
+                        "failure_stage":payload["failure_stage"].as_str().map(|stage| match stage {
+                            "admission" => "admission", "provider" => "provider", "settlement" => "settlement",
+                            _ => "other",
+                        }),
+                        "deadline_phase":phase,
+                        "dispatch_started":payload["dispatch_started"].as_bool(),
+                        "provider_completed":payload["provider_completed"].as_bool(),
+                    }));
+                }
+            }
         }
         json!({"skipped_lines":session.skipped_lines, "dropped_lines":session.dropped_lines,
             "integrity_errors":session.integrity_errors,
-            "last_event":last_event, "event_counts":counts})
+            "last_event":last_event, "event_counts":counts,
+            "last_provider_failure":last_provider_failure})
     });
     json!({
         "final_state":outcome.final_state.as_deref().map(|state| match state {
@@ -460,6 +506,76 @@ mod tests {
         assert_eq!(diagnostic["journal"]["last_event"], "other");
         assert_eq!(diagnostic["journal"]["dropped_lines"], 2);
         assert!(!diagnostic.to_string().contains("private-sentinel"));
+    }
+
+    #[test]
+    fn provider_failure_projection_uses_existing_logical_event_and_closed_tags() {
+        use crate::session_capture::{JournalEvent, SessionCapture};
+        let outcome = RunOutcome {
+            run_id: Some("root".into()),
+            ..RunOutcome::new("model")
+        };
+        for (wrapped, kind, stage, phase, expected_scope) in [
+            (
+                false,
+                "provider_deadline",
+                "provider",
+                "waiting for provider response",
+                "root",
+            ),
+            (
+                true,
+                "contract_violation",
+                "settlement",
+                "provider_attempt_persistence",
+                "other_run",
+            ),
+            (
+                true,
+                "private-sentinel",
+                "private-sentinel",
+                "private-sentinel",
+                "other_run",
+            ),
+        ] {
+            let logical = json!({"run_id":if wrapped {"private-sentinel"} else {"root"},
+            "event_type":"LlmRoundFailed", "payload":{
+                "error_kind":kind, "failure_stage":stage, "deadline_phase":phase,
+                "dispatch_started":true, "provider_completed":false, "message":"private-sentinel"
+            }});
+            let session = SessionCapture {
+                events: vec![JournalEvent {
+                    event_type: "LlmRoundFailed".into(),
+                    raw: if wrapped {
+                        json!({"artifact_kind":"step_event", "payload":logical})
+                    } else {
+                        logical
+                    },
+                }],
+                ..Default::default()
+            };
+            let diagnostic = execution_diagnostic(&outcome, Some(&session));
+            let failure = &diagnostic["journal"]["last_provider_failure"];
+            assert_eq!(failure["run_scope"], expected_scope);
+            assert_eq!(
+                failure["error_kind"],
+                if kind == "private-sentinel" {
+                    "other"
+                } else {
+                    kind
+                }
+            );
+            assert_eq!(
+                failure["deadline_phase"],
+                match phase {
+                    "waiting for provider response" => "waiting_provider_response",
+                    "provider_attempt_persistence" => "provider_attempt_persistence",
+                    _ => "other",
+                }
+            );
+            assert_eq!(failure["dispatch_started"], true);
+            assert!(!diagnostic.to_string().contains("private-sentinel"));
+        }
     }
 
     fn fixture_evaluate(criteria: &[Criterion], outcome: &RunOutcome) -> Vec<CriterionResult> {
