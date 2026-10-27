@@ -205,7 +205,9 @@ pub(crate) async fn login_device_code(
             .await
             .map_err(|_| "UC device authorization is unavailable; no local session was changed")?;
         if !response.status().is_success() {
-            return Err("UC device authorization was rejected; no local session was changed".into());
+            return Err(
+                "UC device authorization was rejected; no local session was changed".into(),
+            );
         }
         let grant: DeviceAuthorization = native::bounded_json(response).await?;
         grant.validate(&environment.issuer)?;

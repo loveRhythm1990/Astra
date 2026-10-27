@@ -1934,7 +1934,9 @@ async fn execute_cli_command_impl(
             );
             if args.device_code {
                 if profile.is_some() {
-                    return Err("Device code sign-in requires MOI UC login without --profile".into());
+                    return Err(
+                        "Device code sign-in requires MOI UC login without --profile".into(),
+                    );
                 }
                 let method = crate::cli::auth_flow::discover_login_method(api, None).await?;
                 let crate::cli::auth_flow::LoginMethod::Uc(discovery) = method else {

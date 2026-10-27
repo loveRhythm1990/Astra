@@ -50,7 +50,13 @@ fn invalid_device_codes_and_unbounded_lifetimes_are_rejected() {
         value.expires_in = lifetime;
         assert!(value.validate(issuer).is_err());
     }
-    for code in ["", "short", "ABCD\nEFGH", "\u{1b}[31mABCD", "https://other.example"] {
+    for code in [
+        "",
+        "short",
+        "ABCD\nEFGH",
+        "\u{1b}[31mABCD",
+        "https://other.example",
+    ] {
         let mut value = grant(issuer);
         value.user_code = code.into();
         assert!(value.validate(issuer).is_err());
@@ -132,7 +138,9 @@ async fn denial_does_not_expose_upstream_text_or_retry() {
         Instant::now() + Duration::from_secs(10),
     )
     .await;
-    assert!(matches!(result, Err(error) if error.contains("denied") && !error.contains("DO_NOT_RENDER")));
+    assert!(
+        matches!(result, Err(error) if error.contains("denied") && !error.contains("DO_NOT_RENDER"))
+    );
 }
 
 #[tokio::test]
@@ -196,7 +204,11 @@ async fn pending_then_success_submits_the_same_grant_and_verifier() {
 
 #[tokio::test]
 async fn optional_device_metadata_does_not_break_existing_browser_discovery() {
-    for extra in [None, Some(serde_json::json!(false)), Some(serde_json::json!("https://other.example.test/device"))] {
+    for extra in [
+        None,
+        Some(serde_json::json!(false)),
+        Some(serde_json::json!("https://other.example.test/device")),
+    ] {
         let server = MockServer::start().await;
         let environment = environment(&server);
         let discovery = UcDiscovery {
@@ -222,9 +234,18 @@ async fn optional_device_metadata_does_not_break_existing_browser_discovery() {
             .mount(&server)
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let (_, _, device) = super::super::discover_environment(&api, &discovery).await.unwrap();
-        assert!(device.is_none_or(|value| value.as_str().is_none_or(|value| {
-            issuer_endpoint(value, &discovery.issuer, "/protocol/openid-connect/auth/device").is_err()
-        })));
+        let (_, _, device) = super::super::discover_environment(&api, &discovery)
+            .await
+            .unwrap();
+        assert!(
+            device.is_none_or(|value| value.as_str().is_none_or(|value| {
+                issuer_endpoint(
+                    value,
+                    &discovery.issuer,
+                    "/protocol/openid-connect/auth/device",
+                )
+                .is_err()
+            }))
+        );
     }
 }
