@@ -203,6 +203,11 @@ retain the canonical identity files alongside any isolated cache. A writable
 existing identity preflight reports this prerequisite before turn admission;
 do not delete identity files or login credentials as a repair step.
 
+`ASTRA_LOCAL_STATE_ROOT` relocates user-level state, including the user
+configuration, permissions and workspace trust, so it must be set in the
+launching shell. The CLI exits with an error when a workspace `.env` supplies it,
+as it does for `MOI_AUTH_DIR`.
+
 The configuration editor saves user defaults under `ASTRA_LOCAL_STATE_ROOT/config/runtime.toml`
 when that root is set, otherwise under `~/.astra/config/runtime.toml`; local versions
 live in the adjacent `versions` directory. Saving defaults retains invocation CLI settings
@@ -301,19 +306,30 @@ doh_resolvers = ["https://1.12.12.12/dns-query"] # required, tried in order
 # fake_ip_ranges = ["198.18.0.0/16"]             # optional, within 198.18.0.0/15
 ```
 
-When every address from the local DNS lies in a fake range, Astra asks the
-resolvers (RFC 8484) for the hostname's real A and AAAA records and admits the
-fetch only if all of them are public. The connection still goes to the fake
-address so the VPN can route it. Mixed answers, literal fake addresses, empty
-answers and unreachable resolvers stay blocked. There is no built-in resolver:
-pick one your network does not block, because many networks that use fake-IP
-DNS also block well-known DoH endpoints.
+When every address from the local DNS lies in an IPv4 fake range, Astra asks
+the resolvers (RFC 8484) for the hostname's real A and AAAA records and admits
+the fetch only if all of them are public. The connection still goes to the fake
+address so the VPN can route it. Literal fake addresses, empty answers and
+unreachable resolvers stay blocked, and a private address reported for either
+record type blocks the fetch even if the other query failed. There is no
+built-in resolver: pick one your network does not block, because many networks
+that use fake-IP DNS also block well-known DoH endpoints. Resolver URLs must
+not contain credentials; errors name a resolver only by its position and host.
+
+Only IPv4 fake answers are supported. IPv6 fake-IP ranges (for example
+`2001:2::/48`, used in sing-box's documented configuration) and answers that mix
+fake addresses with real ones, such as an IPv4 fake address next to a public
+IPv6 address, are rejected with an "unsupported" error whether or not the option
+is enabled. Configure the VPN to answer with IPv4 fake addresses only if you
+need this option.
 
 Only the user-level file and an explicit `--settings` overlay can set this
 section. A project `.astra/config/runtime.toml` cannot; the section is ignored
 with a warning. There is intentionally no environment variable, because the CLI
-loads `.env` from the working directory. Server `web_fetch` never reads it, and
-an invalid section leaves the default block in place with a warning.
+loads `.env` from the working directory. For the same reason a workspace `.env`
+cannot set `ASTRA_LOCAL_STATE_ROOT`, which relocates the user-level file. Server
+`web_fetch` never reads the section, and an invalid section leaves the default
+block in place with a warning.
 
 Enabling it trusts the VPN to connect to the destination the resolver reported.
 A domain that answers the resolver and the VPN differently (for example by DNS

@@ -84,6 +84,8 @@ beyond a development machine, review the
   `ASTRA_RUNTIME_ROOT_SECRET`, and `MEMORIA_MASTER_KEY`. Never ship the
   template values.
 - Keep `.env`, `.env.production`, and `.models.yaml` out of version control.
+  The CLI loads `.env` from the working directory but refuses one that sets
+  `ASTRA_LOCAL_STATE_ROOT` or `MOI_AUTH_DIR`; set those in the shell.
 - Bind development services to loopback. `ASTRA_BIND_ADDRESS` defaults to
   `127.0.0.1` for a reason.
 - Leave Edge/CLI `[web_fetch] fake_ip_validation` off unless a fake-IP VPN

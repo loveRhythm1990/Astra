@@ -3,10 +3,11 @@
 //! Fetches URLs and transforms raw HTML into model-friendly Markdown with
 //! metadata extraction, link discovery, and content-aware routing.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use ipnet::Ipv6Net;
 use reqwest::header;
 use serde::Serialize;
 use serde_json::Value;
@@ -127,6 +128,9 @@ enum SsrfBlockReason {
     PrivateAddress,
     /// Every address is in the fake-IP range and the user has not opted in.
     FakeIpNotEnabled,
+    /// The answer looks like fake-IP DNS but is not purely IPv4 fake
+    /// addresses (an IPv6 fake range, or fake mixed with real addresses).
+    FakeIpUnsupportedAnswer,
     FakeIpDohUnavailable(String),
     FakeIpUnverified,
     FakeIpRealAddressPrivate(Vec<IpAddr>),
@@ -158,6 +162,16 @@ impl std::fmt::Display for SsrfBlock {
                  See docs/reference/configuration.md. Tell the user about this option; \
                  do not change their configuration on their behalf.",
                 range = fake_ip::FAKE_IP_RANGE,
+            ),
+            SsrfBlockReason::FakeIpUnsupportedAnswer => write!(
+                f,
+                "SSRF blocked: {host} resolves to {addrs}, which looks like fake-IP DNS from \
+                 a local VPN/proxy. Astra can verify only answers made entirely of IPv4 fake \
+                 addresses in {v4}; IPv6 fake-IP ranges such as {v6} and answers mixing fake \
+                 and real addresses are not supported, so the real destination cannot be \
+                 verified. Tell the user; do not change their configuration on their behalf.",
+                v4 = fake_ip::FAKE_IP_RANGE,
+                v6 = fake_ip::FAKE_IPV6_RANGE,
             ),
             SsrfBlockReason::FakeIpDohUnavailable(detail) => write!(
                 f,
@@ -619,8 +633,8 @@ async fn resolve_and_validate_host(
 }
 
 /// Admit public answers. Private answers are blocked unless every one lies in
-/// the user's fake-IP range and DoH reports public real addresses; the pinned
-/// connection still uses the fake addresses the local VPN can route.
+/// the user's IPv4 fake-IP range and DoH reports public real addresses; the
+/// pinned connection still uses the fake addresses the local VPN can route.
 async fn validate_resolved_addrs(
     host: &str,
     addrs: Vec<SocketAddr>,
@@ -630,21 +644,26 @@ async fn validate_resolved_addrs(
     if !ips.iter().copied().any(is_private_ip) {
         return Ok(addrs);
     }
-    let reason = match fake_ip {
-        Some(policy) if ips.iter().all(|ip| policy.contains(*ip)) => {
-            match policy.verify(host).await {
+    let ipv4_fake = |ip: &IpAddr| match (ip, fake_ip) {
+        (IpAddr::V4(_), Some(policy)) => policy.contains(*ip),
+        (IpAddr::V4(v4), None) => fake_ip::FAKE_IP_RANGE.contains(v4),
+        (IpAddr::V6(_), _) => false,
+    };
+    let reason = if ips.iter().all(ipv4_fake) {
+        match fake_ip {
+            Some(policy) => match policy.verify(host).await {
                 Ok(()) => return Ok(addrs),
                 Err(reason) => reason,
-            }
+            },
+            None => SsrfBlockReason::FakeIpNotEnabled,
         }
-        None if ips.iter().all(|ip| match ip {
-            IpAddr::V4(v4) => fake_ip::FAKE_IP_RANGE.contains(v4),
-            IpAddr::V6(_) => false,
-        }) =>
-        {
-            SsrfBlockReason::FakeIpNotEnabled
-        }
-        _ => SsrfBlockReason::PrivateAddress,
+    } else if ips
+        .iter()
+        .all(|ip| ipv4_fake(ip) || fake_ip::is_ipv6_fake_candidate(*ip) || !is_private_ip(*ip))
+    {
+        SsrfBlockReason::FakeIpUnsupportedAnswer
+    } else {
+        SsrfBlockReason::PrivateAddress
     };
     Err(FetchError::ssrf(host, ips, reason))
 }
@@ -701,9 +720,26 @@ fn is_private_ip(ip: IpAddr) -> bool {
                         (v6.segments()[7] >> 8) as u8,
                         v6.segments()[7] as u8,
                     )))
+                || NOT_GLOBALLY_REACHABLE_IPV6
+                    .iter()
+                    .any(|range| range.contains(&v6))
         }
     }
 }
+
+/// IANA IPv6 special-purpose blocks marked not globally reachable that the
+/// checks above do not already cover. `2001:2::/48` is also the IPv6 fake-IP
+/// range in sing-box's documented configuration.
+const NOT_GLOBALLY_REACHABLE_IPV6: [Ipv6Net; 8] = [
+    Ipv6Net::new_assert(Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0, 0), 48), // local-use NAT64 (RFC 8215)
+    Ipv6Net::new_assert(Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 0), 64), // discard-only (RFC 6666)
+    Ipv6Net::new_assert(Ipv6Addr::new(0x0100, 0, 0, 1, 0, 0, 0, 0), 64), // dummy prefix (RFC 9780)
+    fake_ip::FAKE_IPV6_RANGE,                                            // benchmarking (RFC 5180)
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0), 32), // documentation (RFC 3849)
+    Ipv6Net::new_assert(Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20), // documentation (RFC 9637)
+    Ipv6Net::new_assert(Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16), // SRv6 SIDs (RFC 9602)
+    Ipv6Net::new_assert(Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0), 10), // deprecated site-local (RFC 3879)
+];
 
 fn is_private_ipv4(v4: Ipv4Addr) -> bool {
     let octets = v4.octets();
@@ -1651,6 +1687,32 @@ mod tests {
         assert!(validate_url("http://[64:ff9b::10.0.0.1]/").is_err());
         // NAT64 wrapping a public IP should pass
         assert!(validate_url("http://[64:ff9b::93.184.216.34]/").is_ok());
+    }
+
+    #[test]
+    fn blocks_ipv6_special_purpose_ranges_that_are_not_globally_reachable() {
+        for literal in [
+            "64:ff9b:1::1",
+            "100::1",
+            "100:0:0:1::1",
+            "2001:2::1",
+            "2001:db8::1",
+            "3fff::1",
+            "5f00::1",
+            "fec0::1",
+        ] {
+            assert!(
+                validate_url(&format!("http://[{literal}]/")).is_err(),
+                "{literal}"
+            );
+        }
+        // Neighbouring globally reachable blocks stay allowed.
+        for literal in ["2001:3::1", "2001:4860::8888", "2606:4700::1111"] {
+            assert!(
+                validate_url(&format!("http://[{literal}]/")).is_ok(),
+                "{literal}"
+            );
+        }
     }
 
     #[test]
