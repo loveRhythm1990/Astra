@@ -176,7 +176,7 @@ class Provider:
                     tool = owner.tool_name if owner.tool_name in names else None
                     arguments = {"path": owner.target}
                     if tool == "write_file":
-                        arguments["content"] = owner.marker
+                        arguments["content"] = owner.marker + "\n"
                     call_id = "compat-operation"
                     if not tool and "tool_search" in names and not any(
                             item.get("tool_call_id") == "compat-search" for item in turn_messages):
@@ -313,14 +313,48 @@ class Rpc:
         self.reader.join(timeout=5)
 
 
-def approvals(binary, env, home, origin, model, provider, report, client):
+def session_runs(origin, token, session):
+    snapshot = request(origin, "/sessions/" + session + "/runs", token)
+    require(snapshot.get("session_id") == session and snapshot.get("truncated") is False,
+            "server_run_snapshot_incomplete")
+    require(isinstance(snapshot.get("runs"), list), "server_run_snapshot_invalid")
+    return snapshot["runs"]
+
+
+def session_root(origin, token, session, model):
+    roots = [run for run in session_runs(origin, token, session)
+             if run.get("depth") == 0 and run.get("parent_run_id") is None]
+    require(len(roots) == 1, "server_run_ambiguous")
+    root = roots[0]
+    require(bool(root.get("run_id")), "server_run_identity_missing")
+    require(root.get("runtime", {}).get("model_name") == model, "server_model_mismatch")
+    return root
+
+
+def settled_session_run(origin, token, session, model, expected_status, run_id=None):
+    # Each journey has a fresh session; no other turn can supply its terminal.
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        root = session_root(origin, token, session, model)
+        require(run_id is None or run_id == root["run_id"], "server_run_identity_changed")
+        run_id = root["run_id"]
+        if root.get("status") == expected_status:
+            return run_id
+        require(root.get("status") not in ("completed", "failed", "cancelled", "interrupted", "delegated"),
+                "server_run_terminal_mismatch")
+        time.sleep(0.1)
+    raise Failure("server_terminal_timeout")
+
+
+def approvals(binary, env, home, origin, token, model, provider, report, client):
     begin_case(report, client, "approval_stdio_start")
     rpc = Rpc(binary, env, home, origin, model)
     try:
         rpc.send("initialize", {})
-        thread = rpc.send("thread/start", {})["thread"]["id"]
         for decision in ("allow_once", "deny"):
             begin_case(report, client, "tool_approval_" + decision)
+            thread = rpc.send("thread/start", {})["thread"]["id"]
+            require(not session_runs(origin, token, thread), "approval_session_not_fresh")
             provider.case = "approval-" + decision
             provider.mode = "tool"
             provider.tool_name = "write_file"
@@ -337,9 +371,14 @@ def approvals(binary, env, home, origin, model, provider, report, client):
             terminal = rpc.wait(lambda event: event.get("method") == "turn/completed"
                                 and event.get("params", {}).get("turn", {}).get("id") == turn)
             require(terminal["params"]["status"] == "completed", "approved_turn_failed")
+            answer = rpc.wait(lambda event: event.get("method") == "item/completed"
+                              and event.get("params", {}).get("item", {}).get("type") == "agentMessage")
+            require(answer["params"]["item"].get("text") == provider.marker, "approval_answer_mismatch")
+            settled_session_run(origin, token, thread, model, "completed")
             require(provider.tool_result_seen, "tool_result_not_returned_to_model")
             if decision == "allow_once":
-                require(target.is_file() and target.read_text() == provider.marker, "approved_write_missing")
+                require(target.is_file() and target.read_bytes() == (provider.marker + "\n").encode(),
+                        "approved_write_missing")
             else:
                 require(not target.exists(), "denied_write_executed")
     finally:
@@ -347,31 +386,34 @@ def approvals(binary, env, home, origin, model, provider, report, client):
         rpc.close()
 
 
-def cancellation(binary, env, home, origin, model, provider):
+def cancellation(binary, env, home, origin, token, model, provider):
     provider.case = "cancellation"
     provider.mode = "cancel"
     provider.arrived.clear()
     provider.release.clear()
-    process = subprocess.Popen([str(binary), *cli_base(origin, model), "chat", "--json", "--no-resume",
-                                "-m", "Wait until cancelled: " + provider.marker], env=env, cwd=home,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    rpc = Rpc(binary, env, home, origin, model)
     try:
+        rpc.send("initialize", {})
+        thread = rpc.send("thread/start", {})["thread"]["id"]
+        require(not session_runs(origin, token, thread), "cancel_session_not_fresh")
+        turn = rpc.send("turn/start", {"threadId": thread,
+            "input": [{"type": "text", "text": "Wait until cancelled: " + provider.marker}]})["turn"]["id"]
         require(provider.arrived.wait(60), "cancel_run_not_admitted")
-        process.send_signal(signal.SIGINT)
-        try:
-            stdout, _ = process.communicate(timeout=45)
-        except subprocess.TimeoutExpired:
-            raise Failure("cancel_did_not_settle") from None
-        body = result_json(subprocess.CompletedProcess([], process.returncode, stdout))
-        require(process.returncode != 0 and body.get("final_state") == "interrupted", "cancel_terminal_invalid")
-        require(body.get("server_terminal_authoritative") is True, "cancel_settlement_unverified")
-        return body["session_id"]
+        run_id = session_root(origin, token, thread, model)["run_id"]
+        interrupted = rpc.send("turn/interrupt", {"threadId": thread, "turnId": turn})
+        require(interrupted.get("ok") is True, "cancel_not_acknowledged")
+        terminal = rpc.wait(lambda event: event.get("method") == "turn/completed"
+                            and event.get("params", {}).get("threadId") == thread
+                            and event.get("params", {}).get("turn", {}).get("id") == turn)
+        # 0.2.12 reports cancellation as a failed local turn. Durable Server
+        # status, rather than that display label, proves cancellation settled.
+        require(terminal["params"].get("status") == "failed", "cancel_client_terminal_mismatch")
+        settled_session_run(origin, token, thread, model, "cancelled", run_id)
+        return thread, run_id
     finally:
         provider.mode = "text"
         provider.release.set()
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
+        rpc.close()
 
 
 def edge_execution(home, origin, token, edge_id, model, provider, report, client):
@@ -399,14 +441,33 @@ def edge_execution(home, origin, token, edge_id, model, provider, report, client
         wire = urllib.request.Request(origin + "/chat/stream", data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json", "Authorization": "Bearer " + token})
         events = []
+        done = False
         with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(wire, timeout=90) as response:
             for raw in response:
                 if raw.startswith(b"data: "):
                     data = raw[6:].strip()
-                    if data != b"[DONE]":
+                    require(not done, "edge_events_after_done")
+                    if data == b"[DONE]":
+                        require(events and events[-1].get("type") == "turn_complete", "edge_done_before_terminal")
+                        done = True
+                    else:
                         events.append(json.loads(data))
-        terminal = next((event for event in reversed(events) if event.get("type") == "run_finished"), None)
-        require(terminal is not None and terminal.get("status") == "completed", "edge_execution_not_completed")
+        terminals = [(index, event) for index, event in enumerate(events) if event.get("type") == "run_finished"]
+        require(len(terminals) == 1, "edge_terminal_not_unique")
+        terminal_index, terminal = terminals[0]
+        require(terminal.get("status") == "completed" and terminal.get("run_id"), "edge_execution_not_completed")
+        starts = [event for event in events if event.get("type") == "session_info"]
+        require(len(starts) == 1 and starts[0].get("session_id") == session
+                and starts[0].get("run_id") == terminal["run_id"], "edge_run_identity_mismatch")
+        require(not any(event.get("type") in ("error", "run_error") for event in events), "edge_run_error")
+        require(all(event.get("type") in ("turn_complete", "ping") for event in events[terminal_index + 1:]),
+                "edge_work_after_terminal")
+        require(events[-1].get("type") == "turn_complete"
+                and events[-1].get("continuation_owner") == "server"
+                and events[-1].get("assistant_text") == provider.marker, "edge_authoritative_answer_mismatch")
+        persisted = request(origin, "/chat/runs/" + terminal["run_id"], token)
+        require(persisted.get("run_id") == terminal["run_id"] and persisted.get("session_id") == session
+                and persisted.get("status") == "completed", "edge_persisted_terminal_mismatch")
         require(provider.tool_result_seen, "edge_tool_result_not_returned")
         require(any(event.get("type") == "turn_complete" for event in events), "edge_authoritative_turn_missing")
     finally:
@@ -567,13 +628,15 @@ def run(args, report):
                 else:
                     completed(chat, provider.marker)
                     report["cases"].append({"client": version, "case": "ordinary_chat", "status": "passed"})
-                    approvals(binary, env, home, origin, model, provider, report, version)
+                    approvals(binary, env, home, origin, token, model, provider, report, version)
                     report["cases"].append({"client": version, "case": "tool_approval_allow_and_deny", "status": "passed"})
                     begin_case(report, version, "cancel_authoritative_settlement")
-                    session = cancellation(binary, env, home, origin, model, provider)
+                    session, cancelled_run = cancellation(binary, env, home, origin, token, model, provider)
                     provider.case = "resume-after-cancellation"
                     begin_case(report, version, "resume_after_cancellation")
-                    completed(command(binary, env, home, [*cli_base(origin, model), "chat", "--json", "--session-id", session, "-m", "Continue after cancellation: " + provider.marker]), provider.marker)
+                    resumed = completed(command(binary, env, home, [*cli_base(origin, model), "chat", "--json", "--session-id", session, "-m", "Continue after cancellation: " + provider.marker]), provider.marker)
+                    require(resumed["session_id"] == session and resumed["run_id"] != cancelled_run,
+                            "resume_run_identity_mismatch")
                     report["cases"].append({"client": version, "case": "cancel_and_resume", "status": "passed"})
                 edge_case(artifacts / version / "astra-edge", env, home, origin, token, version, model, provider, report)
                 report["cases"].append({"client": version, "case": "edge_handshake_and_tool_execution" if version == "0.2.12" else "edge_schema1_rejection", "status": "passed"})

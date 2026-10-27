@@ -41,9 +41,8 @@ fn published_catalog_response(
 async fn published_catalog_reader_accepts_unversioned_models_and_model_access() {
     use astra_core::model_wire::thinking::ThinkingProtocol;
     use astra_server_types::MODEL_CATALOG_VERSION_HEADER;
-    use astra_services::{
-        ModelAccessKind, ModelCatalogPricing, ModelExecutionPlacement, ThinkingCapability,
-    };
+    use astra_services::models::ThinkingCapability;
+    use astra_services::{ModelAccessKind, ModelCatalogPricing, ModelExecutionPlacement};
 
     for protocol in [None, Some(ThinkingProtocol::EnableThinking)] {
         let offering = ModelListItem {
@@ -211,6 +210,24 @@ async fn catalog_version_does_not_authorize_access_or_silently_accept_unknown_ve
             let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(error["error_code"], "model_catalog_version_unsupported");
         }
+        let response = app(TestModelService::default())
+            .oneshot(
+                Request::builder()
+                    .uri(route)
+                    .header("authorization", "Bearer catalog-user")
+                    .header(MODEL_CATALOG_VERSION_HEADER, "1")
+                    .header(MODEL_CATALOG_VERSION_HEADER, "2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error_code"], "model_catalog_version_unsupported");
     }
 }
 
