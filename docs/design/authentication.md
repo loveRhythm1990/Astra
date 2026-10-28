@@ -358,23 +358,21 @@ without opening a fresh authorization-code flow. The UC implementation and
 rollout are tracked in [Matrixflow #17972](https://github.com/matrixorigin/matrixflow/issues/17972).
 
 Polling obeys the issuer interval, increases it permanently for `slow_down`,
-backs off connection-establishment and explicit availability failures, and stops at a bounded
-wait of `min(expires_in, 600)` seconds. Longer server lifetimes remain valid;
+backs off proven connection failures, and
+stops at a bounded wait of `min(expires_in, 600)` seconds. Longer server lifetimes remain valid;
 the local wait limit is reported separately from server grant expiry. No final
 poll bypasses the issuer interval or retry delay. Authorization creation errors
 distinguish HTTP 429, HTTP 5xx and rejection without rendering upstream bodies.
-A successful but malformed token response is terminal and is not
-replayed. New credentials are published only after existing MOI and Astra
-preparation succeeds. No implicit browser/manual fallback is introduced.
+A token request with an unconfirmed outcome is terminal and is not replayed,
+including ambiguous transport failures, HTTP 429/5xx, and
+`temporarily_unavailable` responses. New credentials are
+published only after existing MOI and Astra preparation succeeds. No implicit
+browser/manual fallback is introduced.
 
-The authorization deadline stops new token requests. A dispatched request uses
-an independent 15-second settlement budget, including headers and body, even
-when authorization waiting expires or the user presses Ctrl+C. Cancellation
-prevents another poll, settles the in-flight request, and attempts revocation
-if it returns new credentials. A timeout or transport failure after dispatch
-reports an unconfirmed outcome without replaying the grant; it does not claim
-that the grant expired or that UC certainly accepted it. The shared native credential owner arbitrates
-cancellation against rename admission, polls contended publication locks for up
+An in-flight token request gets an independent bounded settlement period after
+the local deadline or cancellation. An unconfirmed response is reported as such,
+rather than claiming the grant expired. The shared native credential owner
+arbitrates cancellation against rename admission, polls contended publication locks for up
 to ten seconds, and distinguishes pre-rename failure from visible publication
 whose directory durability is unconfirmed. Callers join the writer after
 cancellation, revoke new credentials only on definite pre-commit failure, and
@@ -382,19 +380,9 @@ attempt old-session revocation for both durable and visible-but-unconfirmed
 publication. Filesystem operations themselves cannot be forcibly interrupted;
 no caller timeout may leave a detached writer behind. This publication contract
 is shared by browser and device login; there is no device-only auth.json writer.
-
-Refresh intent is stricter than login publication: directory fsync must succeed
-before sending the one-time refresh token. If saving the newly rotated token
-succeeds at rename but fails directory fsync, report unconfirmed durability and
-retain the visible new credentials without revoking them. The previously
-synced pending intent protects crash recovery. Ordinary credential transactions
-must not silently discard the directory-sync result.
-
-Optional workspace selection uses the same credential owner and commit control,
-with a ten-second lock wait and SIGINT cancellation before rename. It joins the
-writer before returning and keeps the completed login on selection failure.
-Device login retains its signal receiver through this phase. The same bounded
-selection path serves browser login and `astra auth workspace`.
+Optional workspace selection uses the same bounded publication owner after login.
+Refresh sends the one-time token only after its pending intent is durably synced;
+a visible replacement with unconfirmed directory durability is never revoked.
 
 ## CLI in-flight credential ownership
 

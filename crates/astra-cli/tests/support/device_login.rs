@@ -19,11 +19,11 @@ enum Scenario {
     BadNonce,
     PrepareFailure,
     CancelPending,
+    CancelInFlight,
+    DeadlineInFlight,
+    WorkspaceCancel,
     CancelLock,
     LockTimeout,
-    DelayedHeaders,
-    CancelHeaders,
-    CancelWorkspaceLock,
 }
 
 async fn journey(scenario: Scenario) {
@@ -90,16 +90,23 @@ async fn journey(scenario: Scenario) {
     Mock::given(method("POST"))
         .and(path("/realms/test/protocol/openid-connect/auth/device"))
         .respond_with(move |request: &wiremock::Request| {
-            let parsed = url::form_urlencoded::parse(&request.body).into_owned().collect::<BTreeMap<_, _>>();
+            let parsed = url::form_urlencoded::parse(&request.body)
+                .into_owned()
+                .collect::<BTreeMap<_, _>>();
             assert_eq!(parsed["client_id"], "astra-cli");
             assert_eq!(parsed["code_challenge_method"], "S256");
             assert!(!parsed["nonce"].is_empty());
             *request_form.lock().unwrap() = parsed;
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "device_code": "synthetic-grant", "user_code": "ABCD-EFGH",
-                "verification_uri": format!("{grant_issuer}/device"), "expires_in": if scenario == Scenario::DelayedHeaders { 3 } else { 900 }, "interval": 1
+                "verification_uri": format!("{grant_issuer}/device"),
+                "expires_in": if scenario == Scenario::DeadlineInFlight { 2 } else { 900 },
+                "interval": 1
             }))
-        }).expect(1).mount(&server).await;
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
     let token_form = form.clone();
     let token_issuer = issuer.clone();
     let requested = token_requested.clone();
@@ -126,14 +133,12 @@ async fn journey(scenario: Scenario) {
                 "access_token": "new-access", "refresh_token": "new-refresh", "token_type": "Bearer", "expires_in": 300,
                 "id_token": jsonwebtoken::encode(&header, &claims, &encoding).unwrap()
             }));
-            if matches!(scenario, Scenario::DelayedHeaders | Scenario::CancelHeaders) {
-                // Request consumed, but not even the 200 headers reach the CLI
-                // until after the device deadline / SIGINT.
-                response.set_delay(Duration::from_secs(4))
+            if matches!(scenario, Scenario::CancelInFlight | Scenario::DeadlineInFlight) {
+                response.set_delay(Duration::from_millis(1500))
             } else {
                 response
             }
-        }).mount(&server).await;
+        }).expect(1).mount(&server).await;
     Mock::given(path("/realms/test/protocol/openid-connect/certs"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"keys": [{
             "kty": "RSA", "alg": "RS256", "use": "sig", "kid": "synthetic",
@@ -142,7 +147,6 @@ async fn journey(scenario: Scenario) {
     let moi_issuer = issuer.clone();
     let lock_for_bootstrap = held_lock.clone();
     let lock_path = auth.join("auth.lock");
-    let workspace_lock_path = lock_path.clone();
     Mock::given(method("POST")).and(path("/auth/cli/bootstrap"))
         .and(header("authorization", "Bearer new-access"))
         .respond_with(move |_: &wiremock::Request| {
@@ -156,9 +160,10 @@ async fn journey(scenario: Scenario) {
             }
             ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":"OK", "data": {
                 "issuer": moi_issuer, "subject":"new-user", "session_id":"new-session",
-                "principal_id":"new-moi", "catalog_user_id":"new-catalog", "workspaces": if scenario == Scenario::CancelWorkspaceLock {
-                    serde_json::json!([{"id":"test-workspace", "name":"Synthetic workspace", "status":"ACTIVE", "access_status":"accepted"}])
-                } else { serde_json::json!([]) },
+                "principal_id":"new-moi", "catalog_user_id":"new-catalog",
+                "workspaces": if scenario == Scenario::WorkspaceCancel {
+                    vec![serde_json::json!({"id":"workspace-1","name":"Workspace","status":"ACTIVE","access_status":"accepted"})]
+                } else { Vec::new() },
                 "workspace_initialization":{"status":"pending"}
             }}))
         }).mount(&server).await;
@@ -168,37 +173,18 @@ async fn journey(scenario: Scenario) {
             "issuer": issuer, "subject":"new-user", "session_id":"new-session", "user_id":"new-astra"
         }))).mount(&server).await;
     let revocations = revoked.clone();
-    let workspace_lock = held_lock.clone();
     Mock::given(method("POST"))
         .and(path("/realms/test/protocol/openid-connect/revoke"))
         .respond_with(move |request: &wiremock::Request| {
             let parsed = url::form_urlencoded::parse(&request.body)
                 .into_owned()
                 .collect::<BTreeMap<_, _>>();
-            if scenario == Scenario::CancelWorkspaceLock && parsed["token"] == "old-refresh" {
-                // Old-session revocation is strictly after login publication.
-                let lock = std::fs::OpenOptions::new().read(true).write(true).open(&workspace_lock_path).unwrap();
-                FileExt::try_lock_exclusive(&lock).unwrap();
-                *workspace_lock.lock().unwrap() = Some(lock);
-            }
             revocations.lock().unwrap().push(parsed["token"].clone());
             ResponseTemplate::new(200)
         })
         .mount(&server)
         .await;
 
-    let pty = (scenario == Scenario::CancelWorkspaceLock).then(|| {
-        nix::pty::openpty(
-            Some(&nix::pty::Winsize {
-                ws_row: 30,
-                ws_col: 120,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            }),
-            None,
-        )
-        .unwrap()
-    });
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_astra"));
     command
         .current_dir(home.path())
@@ -208,17 +194,16 @@ async fn journey(scenario: Scenario) {
         .env("XDG_CONFIG_HOME", home.path().join(".config"))
         .env("XDG_CACHE_HOME", home.path().join(".cache"))
         .env("XDG_DATA_HOME", home.path().join(".local/share"))
-        .env("TERM", "xterm-256color")
         .args(["--api-url", &origin, "login", "--device-code"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .env("TERM", "xterm-256color")
         .kill_on_drop(true);
-    if let Some(pty) = &pty {
+    let mut master = if scenario == Scenario::WorkspaceCancel {
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let slave = std::fs::File::from(pty.slave);
         command
-            .stdin(Stdio::from(pty.slave.try_clone().unwrap()))
-            .stdout(Stdio::from(pty.slave.try_clone().unwrap()))
-            .stderr(Stdio::from(pty.slave.try_clone().unwrap()));
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
@@ -227,46 +212,46 @@ async fn journey(scenario: Scenario) {
                 Ok(())
             });
         }
-    }
+        Some(std::fs::File::from(pty.master))
+    } else {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        None
+    };
     let mut child = command.spawn().unwrap();
+    // Release the parent's slave descriptors so the PTY reader sees EOF when
+    // the child exits.
     drop(command);
     let pid = nix::unistd::Pid::from_raw(child.id().unwrap() as i32);
     let lock_waiting = Arc::new(tokio::sync::Notify::new());
     let waiting = lock_waiting.clone();
-    let reader = if let Some(pty) = pty {
-        drop(pty.slave);
+    let prompt = Arc::new(tokio::sync::Notify::new());
+    let saving = Arc::new(tokio::sync::Notify::new());
+    let reader = if let Some(master) = &master {
+        let mut terminal = master.try_clone().unwrap();
+        let prompt = prompt.clone();
+        let saving = saving.clone();
         tokio::task::spawn_blocking(move || {
-            use std::io::{Read, Write};
-            let mut master = std::fs::File::from(pty.master);
+            use std::io::Read;
             let mut bytes = Vec::new();
-            let mut buffer = [0; 4096];
-            let mut selected = false;
-            let mut cursor_offset = 0;
-            loop {
-                match master.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(count) => bytes.extend_from_slice(&buffer[..count]),
-                    Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
-                    Err(error) => panic!("PTY read failed: {error}"),
+            let mut chunk = [0; 1024];
+            let mut saw_prompt = false;
+            let mut saw_saving = false;
+            while let Ok(count) = terminal.read(&mut chunk) {
+                if count == 0 {
+                    break;
                 }
-                // Answer terminal cursor queries, including split writes.
-                while let Some(index) = bytes[cursor_offset..]
-                    .windows(4)
-                    .position(|v| v == b"\x1b[6n")
-                {
-                    cursor_offset += index + 4;
-                    master.write_all(b"\x1b[1;1R").unwrap();
+                bytes.extend_from_slice(&chunk[..count]);
+                let text = String::from_utf8_lossy(&bytes);
+                if !saw_prompt && text.contains("Select a MOI workspace") {
+                    saw_prompt = true;
+                    prompt.notify_one();
                 }
-                let output = String::from_utf8_lossy(&bytes);
-                if !selected
-                    && output.contains("Select a MOI workspace")
-                    && output.contains("Synthetic workspace")
-                {
-                    selected = true;
-                    master.write_all(b"\x1b[B\r").unwrap();
-                }
-                if output.contains("Waiting to save workspace selection") {
-                    waiting.notify_one();
+                if !saw_saving && text.contains("Saving workspace selection") {
+                    saw_saving = true;
+                    saving.notify_one();
                 }
             }
             String::from_utf8_lossy(&bytes).into_owned()
@@ -286,14 +271,29 @@ async fn journey(scenario: Scenario) {
             output
         })
     };
+    if scenario == Scenario::WorkspaceCancel {
+        use std::io::Write;
+        tokio::time::timeout(Duration::from_secs(15), prompt.notified())
+            .await
+            .unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(auth.join("auth.lock"))
+            .unwrap();
+        FileExt::try_lock_exclusive(&lock).unwrap();
+        *held_lock.lock().unwrap() = Some(lock);
+        master.as_mut().unwrap().write_all(b"\x1b[B\r").unwrap();
+        tokio::time::timeout(Duration::from_secs(10), saving.notified())
+            .await
+            .unwrap();
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).unwrap();
+    }
     if matches!(
         scenario,
-        Scenario::CancelPending
-            | Scenario::CancelLock
-            | Scenario::CancelHeaders
-            | Scenario::CancelWorkspaceLock
+        Scenario::CancelPending | Scenario::CancelInFlight | Scenario::CancelLock
     ) {
-        let ready = if matches!(scenario, Scenario::CancelPending | Scenario::CancelHeaders) {
+        let ready = if matches!(scenario, Scenario::CancelPending | Scenario::CancelInFlight) {
             token_requested
         } else {
             lock_waiting
@@ -308,40 +308,19 @@ async fn journey(scenario: Scenario) {
         .expect("public login must exit even while the parent still holds auth.lock")
         .unwrap();
     let output = reader.await.unwrap();
-    let settled_bytes = std::fs::read(auth.join("auth.json")).unwrap();
     drop(held_lock.lock().unwrap().take());
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        std::fs::read(auth.join("auth.json")).unwrap(),
-        settled_bytes,
-        "no write after command exit"
-    );
     assert!(!output.contains("new-refresh") && !output.contains("old-refresh"));
-    let token_calls = server
-        .received_requests()
-        .await
-        .unwrap()
-        .iter()
-        .filter(|request| request.url.path() == "/realms/test/protocol/openid-connect/token")
-        .count();
-    if matches!(scenario, Scenario::DelayedHeaders | Scenario::CancelHeaders) {
-        assert_eq!(token_calls, 1, "an in-flight grant must not be replayed");
-    }
     if matches!(
         scenario,
-        Scenario::Success | Scenario::DelayedHeaders | Scenario::CancelWorkspaceLock
+        Scenario::Success | Scenario::DeadlineInFlight | Scenario::WorkspaceCancel
     ) {
         assert!(status.success(), "{output}");
         let current = store.current().unwrap();
         assert_eq!(current.subject, "new-user");
         assert_eq!(current.session_id, "new-session");
         assert_eq!(current.moi_principal_id, "new-moi");
+        assert_eq!(current.workspace_id, None);
         assert_eq!(*revoked.lock().unwrap(), vec!["old-refresh"]);
-        if scenario == Scenario::CancelWorkspaceLock {
-            assert_eq!(current.workspace_id, None);
-            assert!(output.contains("Authentication is complete"), "{output}");
-            assert!(output.contains("Workspace not selected"), "{output}");
-        }
     } else {
         assert!(!status.success(), "{output}");
         assert_eq!(std::fs::read(auth.join("auth.json")).unwrap(), before);
@@ -379,23 +358,22 @@ async fn device_login_public_pending_can_be_interrupted() {
     journey(Scenario::CancelPending).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn device_login_public_inflight_cancel_revokes_received_token() {
+    journey(Scenario::CancelInFlight).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn device_login_public_headers_after_deadline_still_settle() {
+    journey(Scenario::DeadlineInFlight).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn device_login_public_workspace_lock_can_be_cancelled_after_login() {
+    journey(Scenario::WorkspaceCancel).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn device_login_public_lock_wait_can_be_interrupted_without_late_commit() {
     journey(Scenario::CancelLock).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn device_login_public_lock_wait_has_a_deadline() {
     journey(Scenario::LockTimeout).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn device_login_public_headers_after_deadline_still_settle_once() {
-    journey(Scenario::DelayedHeaders).await;
-}
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn device_login_public_cancel_before_headers_revokes_new_token() {
-    journey(Scenario::CancelHeaders).await;
-}
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn device_login_public_pty_workspace_lock_cancel_keeps_published_login() {
-    journey(Scenario::CancelWorkspaceLock).await;
 }

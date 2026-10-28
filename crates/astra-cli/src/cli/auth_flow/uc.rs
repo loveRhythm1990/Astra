@@ -8,13 +8,13 @@ pub(crate) use device_code::login_device_code;
 
 // Keep one registered receiver across device-login phase changes. Recreating
 // ctrl_c() futures can lose SIGINT between dropping one and polling the next.
-struct LoginInterrupt {
+pub(crate) struct LoginInterrupt {
     #[cfg(unix)]
     signal: tokio::signal::unix::Signal,
 }
 
 impl LoginInterrupt {
-    fn new() -> Result<Self, String> {
+    pub(crate) fn new() -> Result<Self, String> {
         #[cfg(unix)]
         {
             Ok(Self {
@@ -176,12 +176,14 @@ pub(crate) async fn login_with_observer(
         .await
         .map_err(|_| "UC login timed out".to_string())
         .and_then(|result| result);
-        let result = match result {
+        let (mut interrupt, result) = match result {
             Ok((session, bootstrap)) => {
                 let mut interrupt = LoginInterrupt::new()?;
-                publish_prepared_login(&store, session, bootstrap, &mut interrupt).await
+                let result =
+                    publish_prepared_login(&store, session, bootstrap, &mut interrupt).await;
+                (Some(interrupt), result)
             }
-            Err(error) => Err(error),
+            Err(error) => (None, Err(error)),
         };
         super::browser_code::write_result(
             &mut stream,
@@ -193,9 +195,20 @@ pub(crate) async fn login_with_observer(
         // Login is already committed. Workspace selection is optional, and a
         // queue/list/prompt failure cannot undo authentication success.
         if terminal_workspace_prompt
-            && let Err(error) = choose_workspace(&store, &session, bootstrap, None).await
+            && let Err(error) = choose_workspace(
+                &store,
+                &session,
+                bootstrap,
+                None,
+                interrupt
+                    .as_mut()
+                    .expect("successful publication has an interrupt receiver"),
+            )
+            .await
         {
-            eprintln!("Workspace not selected: {error}. Use `astra auth workspace` later.");
+            eprintln!(
+                "Workspace selection: {error}. Sign-in remains active; use `astra auth workspace` later."
+            );
         }
         return Ok(());
     }
@@ -280,10 +293,26 @@ async fn complete(
     }
     let tokens: TokenResponse = native::bounded_json(response).await?;
     let result = prepare(client, environment, &tokens, nonce).await;
-    if result.is_err() && !tokens.refresh_token.is_empty() {
-        let _ = native::revoke(environment, &tokens.refresh_token).await;
+    if result.is_err() {
+        revoke_new_session(environment, &tokens.refresh_token).await;
     }
     result
+}
+
+async fn revoke_new_session(environment: &Environment, refresh_token: &str) {
+    if refresh_token.is_empty() {
+        return;
+    }
+    if !matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            native::revoke(environment, refresh_token),
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        eprintln!("The new remote session could not be confirmed revoked.");
+    }
 }
 
 async fn prepare(
@@ -327,6 +356,25 @@ async fn prepare(
     Ok((session, moi))
 }
 
+async fn controlled_write<T: Send + 'static>(
+    interrupt: &mut LoginInterrupt,
+    write: impl FnOnce(&native::PublicationControl) -> Result<T, String> + Send + 'static,
+) -> Result<Result<T, String>, tokio::task::JoinError> {
+    let control = native::PublicationControl::new(std::time::Duration::from_secs(10));
+    let writer_control = control.clone();
+    let mut writer = tokio::task::spawn_blocking(move || write(&writer_control));
+    tokio::select! {
+        biased;
+        result = &mut writer => result,
+        _ = interrupt.recv() => {
+            if !control.cancel() {
+                eprintln!("Credential commit has started. Waiting for it to settle.");
+            }
+            writer.await
+        }
+    }
+}
+
 async fn publish_prepared_login(
     store: &NativeStore,
     session: NativeSession,
@@ -335,35 +383,19 @@ async fn publish_prepared_login(
 ) -> Result<(NativeSession, MoiBootstrap), String> {
     // The browser deadline has ended. Publication is the success boundary;
     // neither revocation nor result-page delivery may reverse it.
-    let control = native::PublicationControl::new(std::time::Duration::from_secs(10));
-    let writer_control = control.clone();
     let writer_store = store.clone();
     let candidate = session.clone();
     eprintln!(
         "Waiting to save sign-in credentials (up to 10 seconds); Ctrl+C cancels before commit."
     );
-    let mut writer = tokio::task::spawn_blocking(move || {
-        writer_store.publish_controlled(candidate, &writer_control)
-    });
-    let result = tokio::select! {
-        biased;
-        result = &mut writer => result,
-        _ = interrupt.recv() => {
-            if !control.cancel() {
-                eprintln!("Credential commit has started. Waiting for sign-in to settle.");
-            }
-            // Do not detach a write that could subsequently replace auth.json.
-            writer.await
-        }
-    };
+    let result = controlled_write(interrupt, move |control| {
+        writer_store.publish_controlled(candidate, control)
+    })
+    .await;
     let committed = match result {
         Ok(Ok(committed)) => committed,
         Ok(Err(error)) => {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                native::revoke(&session.environment, &session.refresh_token),
-            )
-            .await;
+            revoke_new_session(&session.environment, &session.refresh_token).await;
             return Err(error);
         }
         Err(_) => {
@@ -524,57 +556,8 @@ pub(crate) async fn choose_workspace(
     session: &NativeSession,
     bootstrap: MoiBootstrap,
     selected: Option<&str>,
-) -> Result<(), String> {
-    let mut interrupt = LoginInterrupt::new()?;
-    choose_workspace_with_interrupt(store, session, bootstrap, selected, &mut interrupt).await
-}
-
-async fn choose_workspace_with_interrupt(
-    store: &NativeStore,
-    session: &NativeSession,
-    bootstrap: MoiBootstrap,
-    selected: Option<&str>,
     interrupt: &mut LoginInterrupt,
 ) -> Result<(), String> {
-    let Some(workspace) = prompt_workspace(bootstrap, selected)? else {
-        return Ok(());
-    };
-    let control = native::PublicationControl::new(std::time::Duration::from_secs(10));
-    let writer_control = control.clone();
-    let writer_store = store.clone();
-    let expected = session.clone();
-    let selected_workspace = workspace.clone();
-    eprintln!("Authentication is complete. Waiting to save workspace selection (up to 10 seconds); Ctrl+C cancels the selection.");
-    let mut writer = tokio::task::spawn_blocking(move || {
-        writer_store.select_workspace_controlled(&expected, Some(&selected_workspace), &writer_control)
-    });
-    let result = tokio::select! {
-        biased;
-        result = &mut writer => result,
-        _ = interrupt.recv() => {
-            let cancelled = control.cancel();
-            // Join even after cancellation: a late workspace write must never
-            // escape the command that owns it.
-            let result = writer.await;
-            if cancelled && matches!(result, Ok(Err(_))) {
-                return Err("Workspace selection stopped. Authentication is complete.".into());
-            }
-            result
-        }
-    };
-    let directory_synced = result
-        .map_err(|_| "Workspace selection could not be confirmed; authentication remains complete")??;
-    if !directory_synced {
-        eprintln!("Workspace selection was saved, but its crash durability could not be confirmed.");
-    }
-    eprintln!("MOI workspace selected: {}", terminal_text(&workspace));
-    Ok(())
-}
-
-fn prompt_workspace(
-    bootstrap: MoiBootstrap,
-    selected: Option<&str>,
-) -> Result<Option<String>, String> {
     use std::io::IsTerminal;
     let choices: Vec<_> = bootstrap
         .workspaces
@@ -582,13 +565,12 @@ fn prompt_workspace(
         .filter(|v| v.status == "ACTIVE" && v.access_status == "accepted")
         .collect();
     let initialization = bootstrap.workspace_initialization;
-    if let Some(id) = selected {
+    let selected = if let Some(id) = selected {
         if !choices.iter().any(|v| v.id == id) {
             return Err("workspace is not an active membership of this MOI account".into());
         }
-        return Ok(Some(id.to_owned()));
-    }
-    if choices.is_empty() {
+        Some(id.to_string())
+    } else if choices.is_empty() {
         eprintln!(
             "Workspace initialization: {}. {} {}",
             terminal_text(&initialization.status),
@@ -598,33 +580,50 @@ fn prompt_workspace(
         eprintln!(
             "Authentication is complete; use `astra auth workspace` when a workspace is ready."
         );
-        return Ok(None);
-    }
-    if !std::io::stdin().is_terminal() {
-        return Ok(None);
-    }
-    let mut labels = vec!["Skip for now".to_string()];
-    labels.extend(
-        choices
-            .iter()
-            .map(|v| format!("{} ({})", terminal_text(&v.name), terminal_text(&v.id))),
-    );
-    match inquire::Select::new("Select a MOI workspace", labels.clone()).prompt() {
-        Ok(label) => {
-            let index = labels
+        None
+    } else if !std::io::stdin().is_terminal() {
+        None
+    } else {
+        let mut labels = vec!["Skip for now".to_string()];
+        labels.extend(
+            choices
                 .iter()
-                .position(|v| v == &label)
-                .ok_or("invalid workspace choice")?;
-            if index > 0 {
-                return Ok(Some(choices[index - 1].id.clone()));
+                .map(|v| format!("{} ({})", terminal_text(&v.name), terminal_text(&v.id))),
+        );
+        match inquire::Select::new("Select a MOI workspace", labels.clone()).prompt() {
+            Ok(label) => {
+                let index = labels
+                    .iter()
+                    .position(|v| v == &label)
+                    .ok_or("invalid workspace choice")?;
+                (index > 0).then(|| choices[index - 1].id.clone())
             }
-            Ok(None)
+            Err(
+                inquire::InquireError::OperationCanceled
+                | inquire::InquireError::OperationInterrupted,
+            ) => None,
+            Err(_) => return Err("workspace selection prompt unavailable".into()),
         }
-        Err(
-            inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted,
-        ) => Ok(None),
-        Err(_) => Err("workspace selection prompt unavailable".into()),
+    };
+    let Some(id) = selected else { return Ok(()) };
+    let writer_store = store.clone();
+    let expected = session.clone();
+    let workspace = id.clone();
+    eprintln!("Saving workspace selection; Ctrl+C can stop before the commit.");
+    let result = controlled_write(interrupt, move |control| {
+        writer_store.select_workspace_controlled(&expected, Some(&workspace), control)
+    })
+    .await;
+    let committed = result.map_err(|_| {
+        "Workspace selection could not be confirmed; sign-in remains active".to_string()
+    })??;
+    if !committed.directory_synced {
+        eprintln!(
+            "Workspace selection is visible, but its durability after a crash is unconfirmed."
+        );
     }
+    eprintln!("MOI workspace selected: {}", terminal_text(&id));
+    Ok(())
 }
 
 #[cfg(test)]

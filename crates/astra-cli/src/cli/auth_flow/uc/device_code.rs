@@ -3,6 +3,8 @@ use astra_services::auth::uc::UcDiscovery;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -10,16 +12,8 @@ use tokio::time::Instant;
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const EXPIRED: &str = "Device sign-in expired. Run `astra login --device-code` to start again.";
 const MAX_WAIT_SECS: u64 = 600;
-const WAIT_TIMEOUT: &str = "Stopped waiting for device sign-in after 600 seconds. No local session was changed; the pending request may remain valid until it expires. Run `astra login --device-code` to start again.";
-const TOKEN_UNCONFIRMED: &str = "The result of the device token request could not be confirmed. No local session was changed. Start a new sign-in request; the previous grant will not be retried.";
-
+const TOKEN_UNCONFIRMED: &str = "The device sign-in outcome could not be confirmed. No local session was changed. Start a new sign-in request; the previous grant will not be retried.";
 const STOPPED: &str = "Device sign-in stopped. No local session was changed.";
-
-#[derive(Default)]
-struct PollControl {
-    in_flight: AtomicBool,
-    cancelled: AtomicBool,
-}
 
 // Deliberately not Debug: the grant secret must never be rendered or logged.
 #[derive(Deserialize)]
@@ -73,11 +67,10 @@ impl DeviceAuthorization {
     }
 
     fn deadline_error(&self) -> String {
-        if self.expires_in > MAX_WAIT_SECS {
-            WAIT_TIMEOUT.into()
-        } else {
-            EXPIRED.into()
-        }
+        format!(
+            "Stopped waiting for device sign-in after {} seconds. No local session was changed; the request may remain valid until it expires. Run `astra login --device-code` to start again.",
+            self.wait_duration().as_secs()
+        )
     }
 }
 
@@ -129,13 +122,89 @@ impl PollPolicy {
         self.delay = self.interval;
     }
 
-    fn unavailable(&mut self, retry_after: Option<u64>) {
+    fn unavailable(&mut self) {
         self.delay = self.delay.saturating_mul(2).min(Duration::from_secs(60));
         self.delay = self.delay.max(self.interval);
-        if let Some(retry_after) = retry_after {
-            self.delay = self.delay.max(Duration::from_secs(retry_after.min(600)));
-        }
     }
+}
+
+enum PollResponse {
+    Tokens(TokenResponse),
+    Pending,
+    SlowDown,
+    ConnectFailed,
+}
+
+async fn exchange(
+    client: &reqwest::Client,
+    environment: &Environment,
+    grant: &DeviceAuthorization,
+    verifier: &str,
+) -> Result<PollResponse, String> {
+    let response = match client
+        .post(&environment.token_endpoint)
+        .form(&[
+            ("grant_type", DEVICE_GRANT),
+            ("client_id", "astra-cli"),
+            ("device_code", grant.device_code.as_str()),
+            ("code_verifier", verifier),
+        ])
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) if error.is_connect() => return Ok(PollResponse::ConnectFailed),
+        Err(_) => return Err(TOKEN_UNCONFIRMED.into()),
+    };
+    let status = response.status();
+    if status.is_success() {
+        return native::bounded_json(response)
+            .await
+            .map(PollResponse::Tokens)
+            .map_err(|_| TOKEN_UNCONFIRMED.into());
+    }
+    // A proxy or issuer can fail after consuming the grant. A status alone
+    // cannot prove that it is safe to send the same grant again.
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        return Err(TOKEN_UNCONFIRMED.into());
+    }
+    let error: OAuthError = native::bounded_json(response)
+        .await
+        .map_err(|_| TOKEN_UNCONFIRMED.to_string())?;
+    match error.error.as_str() {
+        "authorization_pending" => Ok(PollResponse::Pending),
+        "slow_down" => Ok(PollResponse::SlowDown),
+        "temporarily_unavailable" => Err(TOKEN_UNCONFIRMED.into()),
+        "access_denied" => Err("Device sign-in was denied. No local session was changed.".into()),
+        "expired_token" => Err(EXPIRED.into()),
+        _ => Err("UC rejected device sign-in. Start again; no local session was changed.".into()),
+    }
+}
+
+async fn settle_in_flight<F>(
+    mut request: Pin<&mut F>,
+    interrupt: &mut super::LoginInterrupt,
+    mut stopped: bool,
+) -> (bool, Result<PollResponse, String>)
+where
+    F: Future<Output = Result<PollResponse, String>>,
+{
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let result = if stopped {
+        tokio::time::timeout_at(deadline, &mut request).await
+    } else {
+        tokio::select! {
+            result = tokio::time::timeout_at(deadline, &mut request) => result,
+            _ = interrupt.recv() => {
+                stopped = true;
+                tokio::time::timeout_at(deadline, &mut request).await
+            }
+        }
+    };
+    (
+        stopped,
+        result.unwrap_or_else(|_| Err(TOKEN_UNCONFIRMED.into())),
+    )
 }
 
 async fn poll(
@@ -143,91 +212,61 @@ async fn poll(
     environment: &Environment,
     grant: &DeviceAuthorization,
     verifier: &str,
-    control: &PollControl,
+    interrupt: &mut super::LoginInterrupt,
     deadline: Instant,
 ) -> Result<TokenResponse, String> {
     let mut policy = PollPolicy::new(grant.interval);
     loop {
-        control.in_flight.store(false, Ordering::SeqCst);
-        if control.cancelled.load(Ordering::SeqCst) {
-            return Err(STOPPED.into());
-        }
         let now = Instant::now();
         // Do not shorten an issuer interval or retry delay to fit a final poll.
         // Compare before adding: an issuer can supply a very large interval.
         if policy.delay >= deadline.saturating_duration_since(now) {
-            tokio::time::sleep_until(deadline).await;
-            return Err(grant.deadline_error());
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => return Err(grant.deadline_error()),
+                _ = interrupt.recv() => return Err(STOPPED.into()),
+            }
         }
         let wake = now + policy.delay;
-        tokio::time::sleep_until(wake).await;
-        // The deadline stops new polls, never an already dispatched grant.
-        // No await separates this check, the in-flight flag, and dispatch.
-        if Instant::now() >= deadline {
-            return Err(grant.deadline_error());
+        tokio::select! {
+            _ = tokio::time::sleep_until(wake) => {}
+            _ = interrupt.recv() => return Err(STOPPED.into()),
         }
-        control.in_flight.store(true, Ordering::SeqCst);
-        let settlement_deadline = Instant::now() + Duration::from_secs(15);
-        let response = tokio::time::timeout_at(
-            settlement_deadline,
-            client
-                .post(&environment.token_endpoint)
-                .form(&[
-                    ("grant_type", DEVICE_GRANT),
-                    ("client_id", "astra-cli"),
-                    ("device_code", grant.device_code.as_str()),
-                    ("code_verifier", verifier),
-                ])
-                .send(),
-        )
-        .await
-        .map_err(|_| TOKEN_UNCONFIRMED.to_string())?;
-        let response = match response {
-            Ok(response) => response,
-            Err(error) if error.is_connect() => {
-                policy.unavailable(None);
-                continue;
+        // A ready deadline or interrupt must not start a new exchange. Once
+        // polled, however, the request may have reached the issuer and must
+        // be settled rather than dropped.
+        let started = AtomicBool::new(false);
+        let request = async {
+            if Instant::now() >= deadline {
+                return Err(grant.deadline_error());
             }
-            // A timeout or lost response can follow consumption of the grant.
-            // Never replay it or claim expiry without an issuer response.
-            Err(_) => return Err(TOKEN_UNCONFIRMED.into()),
+            started.store(true, Ordering::SeqCst);
+            exchange(client, environment, grant, verifier).await
         };
-        let status = response.status();
-        if status.is_success() {
-            // A 2xx may have consumed the grant. Do not replay it after an
-            // interrupted/invalid token body or a product bootstrap failure.
-            return tokio::time::timeout_at(settlement_deadline, native::bounded_json(response))
-                .await
-                .map_err(|_| TOKEN_UNCONFIRMED.to_string())?
-                .map_err(|_| TOKEN_UNCONFIRMED.to_string());
-        }
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-            let retry_after = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse().ok());
-            policy.unavailable(retry_after);
-            continue;
-        }
-        let error: OAuthError =
-            tokio::time::timeout_at(settlement_deadline, native::bounded_json(response))
-                .await
-                .map_err(|_| TOKEN_UNCONFIRMED.to_string())?
-                .map_err(|_| TOKEN_UNCONFIRMED.to_string())?;
-        match error.error.as_str() {
-            "authorization_pending" => policy.pending(),
-            "slow_down" => policy.slow_down(),
-            "temporarily_unavailable" => policy.unavailable(None),
-            "access_denied" => {
-                return Err("Device sign-in was denied. No local session was changed.".into());
+        tokio::pin!(request);
+        let (stopped, response) = tokio::select! {
+            biased;
+            _ = interrupt.recv() => {
+                if !started.load(Ordering::SeqCst) { return Err(STOPPED.into()); }
+                settle_in_flight(request.as_mut(), interrupt, true).await
+            },
+            _ = tokio::time::sleep_until(deadline) => {
+                if !started.load(Ordering::SeqCst) { return Err(grant.deadline_error()); }
+                settle_in_flight(request.as_mut(), interrupt, false).await
+            },
+            result = &mut request => (false, result),
+        };
+        let response = response?;
+        if stopped {
+            if let PollResponse::Tokens(tokens) = response {
+                super::revoke_new_session(environment, &tokens.refresh_token).await;
             }
-            "expired_token" => return Err(EXPIRED.into()),
-            _ => {
-                return Err(
-                    "UC rejected device sign-in. Start again; no local session was changed.".into(),
-                );
-            }
+            return Err(STOPPED.into());
+        }
+        match response {
+            PollResponse::Tokens(tokens) => return Ok(tokens),
+            PollResponse::Pending => policy.pending(),
+            PollResponse::SlowDown => policy.slow_down(),
+            PollResponse::ConnectFailed => policy.unavailable(),
         }
     }
 }
@@ -258,8 +297,7 @@ pub(crate) async fn login_device_code(
     let verifier = super::super::browser_code::verifier();
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let started = Instant::now();
-    let control = PollControl::default();
-    let wait = async {
+    let authorization = async {
         let response = client
             .post(endpoint)
             .form(&[
@@ -272,41 +310,27 @@ pub(crate) async fn login_device_code(
             .send()
             .await
             .map_err(|_| "UC device authorization is unavailable; no local session was changed")?;
-        let grant = authorization_response(response, &environment.issuer).await?;
-        eprintln!(
-            "Open this page in a browser on another device:\n{}\n\nEnter this code: {}\nCheck the account and permissions, then approve or deny access.\nWaiting for authorization (up to {} seconds). Press Ctrl+C to stop.",
-            grant.verification_uri,
-            grant.user_code,
-            grant.wait_duration().as_secs()
-        );
-        poll(
-            &client,
-            &environment,
-            &grant,
-            &verifier,
-            &control,
-            started + grant.wait_duration(),
-        )
-        .await
+        authorization_response(response, &environment.issuer).await
     };
-    tokio::pin!(wait);
-    let tokens = tokio::select! {
-        biased;
-        result = &mut wait => result?,
-        _ = interrupt.recv() => {
-            control.cancelled.store(true, Ordering::SeqCst);
-            if control.in_flight.load(Ordering::SeqCst) {
-                eprintln!("A device token request is in flight. Waiting up to 15 seconds to settle it before stopping.");
-                let tokens = wait.await?;
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    native::revoke(&environment, &tokens.refresh_token),
-                ).await;
-                return Err("Device sign-in stopped before credential publication. No local session was changed.".into());
-            }
-            return Err("Device sign-in stopped. No local session was changed; the pending request will expire.".into());
-        }
+    let grant = tokio::select! {
+        result = authorization => result?,
+        _ = interrupt.recv() => return Err(STOPPED.into()),
     };
+    eprintln!(
+        "Open this page in a browser on another device:\n{}\n\nEnter this code: {}\nCheck the account and permissions, then approve or deny access.\nWaiting for authorization (up to {} seconds). Press Ctrl+C to stop.",
+        grant.verification_uri,
+        grant.user_code,
+        grant.wait_duration().as_secs()
+    );
+    let tokens = poll(
+        &client,
+        &environment,
+        &grant,
+        &verifier,
+        &mut interrupt,
+        started + grant.wait_duration(),
+    )
+    .await?;
     // Preparation has no local publication. Cancellation revokes the new token;
     // the credential owner arbitrates cancellation against the commit boundary.
     eprintln!(
@@ -317,36 +341,27 @@ pub(crate) async fn login_device_code(
         super::prepare(&client, &environment, &tokens, &nonce),
     );
     let prepared = tokio::select! {
+        biased;
+        _ = interrupt.recv() => Err("Device sign-in stopped before credential publication. No local session was changed.".into()),
         result = preparation => result
             .map_err(|_| "UC product sign-in timed out".to_string())
             .and_then(|result| result),
-        _ = interrupt.recv() => Err("Device sign-in stopped before credential publication. No local session was changed.".into()),
     };
     let (session, bootstrap) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
-            if !tokens.refresh_token.is_empty() {
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    native::revoke(&environment, &tokens.refresh_token),
-                )
-                .await;
-            }
+            super::revoke_new_session(&environment, &tokens.refresh_token).await;
             return Err(error);
         }
     };
     let (session, bootstrap) =
         super::publish_prepared_login(&store, session, bootstrap, &mut interrupt).await?;
-    if let Err(error) = super::choose_workspace_with_interrupt(
-        &store,
-        &session,
-        bootstrap,
-        None,
-        &mut interrupt,
-    )
-    .await
+    if let Err(error) =
+        super::choose_workspace(&store, &session, bootstrap, None, &mut interrupt).await
     {
-        eprintln!("Workspace not selected: {error}. Use `astra auth workspace` later.");
+        eprintln!(
+            "Workspace selection: {error}. Sign-in remains active; use `astra auth workspace` later."
+        );
     }
     Ok(())
 }

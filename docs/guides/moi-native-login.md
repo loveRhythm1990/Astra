@@ -60,10 +60,9 @@ There is no automatic fallback from ordinary browser login or `--manual`.
 Device login uses a fresh nonce and S256 PKCE and validates the same issuer,
 ID token and MOI/Astra bootstraps as browser login. The grant secret is held only
 in memory. Pending, denial, expiry and failures before publication preserve the
-previous local sign-in. Ctrl+C stops authorization waiting; the pending request
-expires on its own. After successful token response headers, body settlement has
-its own 15-second bound (also subject to the HTTP request timeout); cancellation
-waits for that result and attempts to revoke a received token without publishing.
+previous local sign-in. Ctrl+C stops authorization waiting. An already-sent token
+request is settled for up to 15 seconds after cancellation or the local deadline;
+if cancellation wins, Astra attempts to revoke a received token without publishing.
 An uncertain token response is reported explicitly and never replays the grant.
 
 Product preparation has a 60-second timeout and can be cancelled. Credential
@@ -81,8 +80,10 @@ The CLI waits at most 600 seconds, or the server's shorter device-code lifetime.
 A longer server lifetime is accepted, but reaching the local limit reports a
 waiting timeout, not a claim that the server grant has expired. Polling intervals
 and retry delays are never shortened to fit one last request before the deadline.
-If device-code creation is rate limited, wait before retrying; a temporarily
-unavailable UC service is reported separately from a rejected request.
+Ambiguous token-request failures, including 429 and 5xx, are not automatically
+retried because they may follow consumption of the grant. If device-code
+creation is rate limited, wait before retrying; a temporarily unavailable UC
+service is reported separately from a rejected request.
 
 UC binds the browser identity to the original device session; Keycloak owns the
 single final approval/denial and the resulting grant. Existing browser SSO does

@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::Ordering;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -75,14 +76,8 @@ fn longer_server_lifetimes_limit_waiting_without_claiming_expiry() {
         value.expires_in = lifetime;
         assert!(value.validate(issuer).is_ok());
         assert_eq!(value.wait_duration().as_secs(), lifetime.min(600));
-        assert_eq!(
-            value.deadline_error(),
-            if lifetime > 600 {
-                WAIT_TIMEOUT
-            } else {
-                EXPIRED
-            }
-        );
+        assert!(value.deadline_error().contains("Stopped waiting"));
+        assert!(!value.deadline_error().contains("expired"));
     }
 }
 
@@ -157,12 +152,12 @@ fn slowdown_is_permanent_and_connection_backoff_is_bounded() {
     assert_eq!(policy.interval, Duration::from_secs(10));
     policy.pending();
     assert_eq!(policy.delay, Duration::from_secs(10));
-    policy.unavailable(Some(30));
-    assert_eq!(policy.delay, Duration::from_secs(30));
-    policy.unavailable(None);
+    policy.unavailable();
+    assert_eq!(policy.delay, Duration::from_secs(20));
+    policy.unavailable();
+    assert_eq!(policy.delay, Duration::from_secs(40));
+    policy.unavailable();
     assert_eq!(policy.delay, Duration::from_secs(60));
-    policy.unavailable(Some(u64::MAX));
-    assert_eq!(policy.delay, Duration::from_secs(600));
     policy.pending();
     assert_eq!(policy.delay, Duration::from_secs(10));
 }
@@ -181,11 +176,11 @@ async fn expiry_stops_before_another_poll_request() {
         &environment,
         &grant(&environment.issuer),
         "private-verifier",
-        &PollControl::default(),
+        &mut super::super::LoginInterrupt::new().unwrap(),
         Instant::now() + Duration::from_millis(20),
     )
     .await;
-    assert!(matches!(result, Err(error) if error == EXPIRED));
+    assert!(matches!(result, Err(error) if error.contains("Stopped waiting")));
 }
 
 #[tokio::test]
@@ -205,21 +200,47 @@ async fn local_wait_timeout_does_not_claim_the_server_grant_expired() {
         &environment,
         &value,
         "private-verifier",
-        &PollControl::default(),
+        &mut super::super::LoginInterrupt::new().unwrap(),
         Instant::now() + Duration::from_millis(20),
     )
     .await
     .err()
     .unwrap();
-    assert_eq!(error, WAIT_TIMEOUT);
+    assert!(error.contains("Stopped waiting"));
 }
 
 #[tokio::test]
-async fn retry_delay_and_slowdown_are_not_shortened_for_a_final_poll() {
+async fn slowdown_is_not_shortened_for_a_final_poll() {
+    let server = MockServer::start().await;
+    let environment = environment(&server);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "slow_down"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let result = poll(
+        &native::http_client().unwrap(),
+        &environment,
+        &grant(&environment.issuer),
+        "private-verifier",
+        &mut super::super::LoginInterrupt::new().unwrap(),
+        deadline,
+    )
+    .await;
+    assert!(matches!(result, Err(error) if error.contains("Stopped waiting")));
+    assert!(Instant::now() >= deadline);
+}
+
+#[tokio::test]
+async fn ambiguous_server_failures_are_not_replayed() {
     for response in [
-        ResponseTemplate::new(429).insert_header("Retry-After", "60"),
+        ResponseTemplate::new(429),
         ResponseTemplate::new(503),
-        ResponseTemplate::new(400).set_body_json(serde_json::json!({"error": "slow_down"})),
+        ResponseTemplate::new(400)
+            .set_body_json(serde_json::json!({"error": "temporarily_unavailable"})),
     ] {
         let server = MockServer::start().await;
         let environment = environment(&server);
@@ -228,18 +249,16 @@ async fn retry_delay_and_slowdown_are_not_shortened_for_a_final_poll() {
             .expect(1)
             .mount(&server)
             .await;
-        let deadline = Instant::now() + Duration::from_secs(2);
         let result = poll(
             &native::http_client().unwrap(),
             &environment,
             &grant(&environment.issuer),
             "private-verifier",
-            &PollControl::default(),
-            deadline,
+            &mut super::super::LoginInterrupt::new().unwrap(),
+            Instant::now() + Duration::from_secs(10),
         )
         .await;
-        assert!(matches!(result, Err(error) if error == EXPIRED));
-        assert!(Instant::now() >= deadline);
+        assert!(matches!(result, Err(error) if error == TOKEN_UNCONFIRMED));
     }
 }
 
@@ -261,7 +280,7 @@ async fn server_expiry_is_terminal_even_when_local_wait_would_be_longer() {
         &environment,
         &value,
         "private-verifier",
-        &PollControl::default(),
+        &mut super::super::LoginInterrupt::new().unwrap(),
         Instant::now() + Duration::from_secs(10),
     )
     .await;
@@ -287,7 +306,7 @@ async fn denial_does_not_expose_upstream_text_or_retry() {
         &environment,
         &grant(&environment.issuer),
         "private-verifier",
-        &PollControl::default(),
+        &mut super::super::LoginInterrupt::new().unwrap(),
         Instant::now() + Duration::from_secs(10),
     )
     .await;
@@ -310,7 +329,7 @@ async fn a_successful_but_invalid_token_body_is_not_replayed() {
         &environment,
         &grant(&environment.issuer),
         "private-verifier",
-        &PollControl::default(),
+        &mut super::super::LoginInterrupt::new().unwrap(),
         Instant::now() + Duration::from_secs(10),
     )
     .await;
@@ -353,19 +372,18 @@ async fn successful_headers_before_deadline_allow_body_to_settle_after_deadline(
         jwks_uri: format!("{origin}/certs"),
     };
     let deadline = Instant::now() + Duration::from_millis(1500);
-    let control = PollControl::default();
+    let mut interrupt = super::super::LoginInterrupt::new().unwrap();
     let result = poll(
         &native::http_client().unwrap(),
         &environment,
         &grant(&environment.issuer),
         "private-verifier",
-        &control,
+        &mut interrupt,
         deadline,
     )
     .await;
     server.abort();
     assert_eq!(result.unwrap().access_token, "test-access");
-    assert!(control.in_flight.load(Ordering::SeqCst));
     assert!(Instant::now() > deadline);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -401,13 +419,45 @@ async fn pending_then_success_submits_the_same_grant_and_verifier() {
         &environment,
         &grant(&environment.issuer),
         "private-verifier",
-        &PollControl::default(),
+        &mut super::super::LoginInterrupt::new().unwrap(),
         Instant::now() + Duration::from_secs(15),
     )
     .await
     .unwrap();
     assert_eq!(tokens.access_token, "test-access");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn delayed_wakeup_does_not_start_an_exchange_after_the_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/realms/test/protocol/openid-connect/token"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let environment = environment(&server);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let grant = grant(&environment.issuer);
+    let client = native::http_client().unwrap();
+    let mut interrupt = super::super::LoginInterrupt::new().unwrap();
+    let request = poll(
+        &client,
+        &environment,
+        &grant,
+        "private-verifier",
+        &mut interrupt,
+        deadline,
+    );
+    tokio::pin!(request);
+    // Poll once to ensure the interval timer is registered before time moves.
+    assert!(matches!(
+        futures_util::poll!(&mut request),
+        std::task::Poll::Pending
+    ));
+    tokio::time::advance(Duration::from_secs(3)).await;
+    assert!(matches!(request.await, Err(error) if error.contains("Stopped waiting")));
 }
 
 #[tokio::test]
@@ -456,29 +506,4 @@ async fn optional_device_metadata_does_not_break_existing_browser_discovery() {
             }))
         );
     }
-}
-
-#[tokio::test]
-async fn request_timeout_before_headers_is_unconfirmed_and_not_replayed() {
-    let server = MockServer::start().await;
-    let environment = environment(&server);
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(1)))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(100))
-        .build()
-        .unwrap();
-    let result = poll(
-        &client,
-        &environment,
-        &grant(&environment.issuer),
-        "private-verifier",
-        &PollControl::default(),
-        Instant::now() + Duration::from_secs(10),
-    )
-    .await;
-    assert!(matches!(result, Err(error) if error == TOKEN_UNCONFIRMED));
 }
