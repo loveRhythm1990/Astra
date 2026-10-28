@@ -302,6 +302,10 @@ fn criteria(
                     crate::criteria::execution_contract_proof(&c.criterion, outcome, session)
                         .map(|(_, diagnostic)| diagnostic)
                         .unwrap_or_else(|failure| failure.diagnostic()),
+                Criterion::JournalToolOutcomeCount { name, ok, min, max } => session
+                    .map(|session| json!({"kind":"count", "min":min, "max":max,
+                        "actual":session.journal_tool_outcome_count(name, *ok)}))
+                    .unwrap_or(Value::Null),
                 Criterion::DurationBetween { min_ms, max_ms } =>
                     json!({"kind":"count", "min":min_ms, "max":max_ms, "actual":outcome.duration_ms}),
                 Criterion::ToolsCountBetween { min, max } =>
@@ -1126,6 +1130,59 @@ mod tests {
             .and_then(|s| s.execution.as_ref())
             .map(crate::execution_capture::tests::trace);
         super::criteria(values, outcome, trace.as_ref())
+    }
+
+    #[test]
+    fn journal_outcome_progress_matches_verdict_without_exposing_tool_payloads() {
+        use crate::session_capture::{JournalEvent, SessionCapture};
+        let outcome = RunOutcome::new("model");
+        let criterion = Criterion::JournalToolOutcomeCount {
+            name: "write_file".into(),
+            ok: true,
+            min: 1,
+            max: 1,
+        };
+        for count in [0, 1, 2] {
+            let mut calls: Vec<_> = (0..count)
+                .map(|index| {
+                    json!({
+                        "tool_call_id":format!("call-{index}"), "name":"write_file", "ok":true,
+                        "args_full":"private-sentinel", "result_full":"private-sentinel"
+                    })
+                })
+                .collect();
+            calls.push(json!({"tool_call_id":"rejected", "name":"write_file", "ok":false}));
+            let capture = SessionCapture {
+                events: vec![JournalEvent {
+                    event_type: "turn".into(),
+                    raw: json!({
+                        "event_type":"turn", "tool_calls":calls
+                    }),
+                }],
+                ..Default::default()
+            };
+            let checks = crate::criteria::evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome,
+                Some(&capture),
+            );
+            let projected = super::criteria(&checks, &outcome, Some(&capture)).unwrap();
+            assert_eq!(projected[0]["passed"], count == 1);
+            assert_eq!(
+                projected[0]["diagnostic"],
+                json!({"kind":"count","min":1,"max":1,"actual":count})
+            );
+            assert!(
+                !serde_json::to_string(&projected)
+                    .unwrap()
+                    .contains("private-sentinel")
+            );
+        }
+        let checks =
+            crate::criteria::evaluate_deterministic_with_session(&[criterion], &outcome, None);
+        let projected = super::criteria(&checks, &outcome, None).unwrap();
+        assert_eq!(projected[0]["passed"], false);
+        assert!(projected[0]["diagnostic"].is_null());
     }
 
     #[test]

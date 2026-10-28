@@ -3535,11 +3535,7 @@ fn evaluate_one_with_primary_cache(
             let Some(session) = session else {
                 return missing_required_session(c, "journal_tool_outcome_count");
             };
-            let count = session
-                .journal_tool_calls()
-                .iter()
-                .filter(|call| call.name == *name && call.ok == Some(*ok))
-                .count() as u32;
+            let count = session.journal_tool_outcome_count(name, *ok) as u32;
             let passed = count >= *min && count <= *max;
             CriterionResult {
                 criterion: c.clone(),

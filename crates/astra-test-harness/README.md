@@ -248,6 +248,10 @@ check results, not a claimed root-cause analysis. Raw prompts, tool/provider bod
 and free-form judge diagnostics remain private; public artifacts do not include
 them. Checks without a safe numeric projection explicitly say that their detailed
 payload is withheld. Full private diagnostics remain in the local suite report.
+Journal tool-outcome count failures publish only the expected bounds and actual
+count, using the same deduplicated records as the verdict. Tool arguments,
+results, and file contents remain private; an unavailable capture reports no
+count instead of inventing zero.
 
 Prompt-cache scope checks retain their grading-time observation count, post-cold
 cache-read sum, and bounded per-execution capture status, identity-match flags,

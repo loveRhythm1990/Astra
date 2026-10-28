@@ -848,41 +848,60 @@ impl MatrixE2eCtx {
     /// assertion pool leaks the `SharedPool` global connection reservation
     /// across subsequent journeys in the same system-E2E binary.
     pub async fn close(&self) {
+        let started = tokio::time::Instant::now();
+        let phase = |name: &str| {
+            eprintln!(
+                "fixture_close_phase={name} elapsed_ms={}",
+                started.elapsed().as_millis()
+            )
+        };
+        phase("heartbeat");
         self.stop_fixture_heartbeat().await;
         // Mirror the production shutdown contract: passive drain owns normal
         // completion and checkpoint persistence; forced stop is only the
         // bounded fallback. Calling stop directly violates its documented
         // precondition and can abort a finalizer while it still owns a pooled
         // database connection.
+        phase("drain_runs");
         if !self
             .app_state
             .drain_background_runs(std::time::Duration::from_secs(2))
             .await
         {
-            let _ = self
-                .app_state
-                .stop_background_runs(std::time::Duration::from_secs(2))
-                .await;
+            phase("stop_runs");
+            assert!(
+                self.app_state
+                    .stop_background_runs(std::time::Duration::from_secs(2))
+                    .await,
+                "fixture background tasks must stop before deleting their session"
+            );
         }
+        phase("delete_session");
         cleanup_session_data(&self.shared_pool, &self.user_id, &self.session_id).await;
+        phase("delete_edge");
         cleanup_edge_registry(&self.pool, &self.user_id, &self.edge_agent_id).await;
         // Each bootstrap creates an isolated mock Offering. Remove it before
         // closing the pool so later memory-extraction/model-resolution paths
         // do not fan out across every stale E2E fixture left in MatrixOne.
+        phase("delete_offering");
         let offering_cleanup = sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
             .bind(&self.model_offering_id)
             .execute(&self.pool)
             .await;
         astra_services::models::invalidate_active_llm_model_resolution_cache();
+        phase("close_assertion_pool");
         self.pool.close().await;
+        phase("close_app_pools");
         self.app_state.close_database_pools().await;
         offering_cleanup.expect("remove Matrix E2E fixture Offering");
+        phase("verify_providers");
         for gateway in self.native_providers.lock().await.iter() {
             gateway.assert_complete();
         }
         if let Some(error) = self.fixture_heartbeat_error.lock().await.take() {
             panic!("Matrix E2E fixture heartbeat failed before cleanup: {error}");
         }
+        phase("completed");
     }
 }
 

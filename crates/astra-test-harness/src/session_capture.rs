@@ -693,6 +693,14 @@ impl SessionCapture {
         self.collect_tool_calls(true)
     }
 
+    /// Shared count for the journal outcome assertion and its safe progress diagnostic.
+    pub(crate) fn journal_tool_outcome_count(&self, name: &str, ok: bool) -> usize {
+        self.journal_tool_calls()
+            .iter()
+            .filter(|call| call.name == name && call.ok == Some(ok))
+            .count()
+    }
+
     // Turn summaries may include child observations without per-call ownership.
     // Keep them for journal display, but only round witnesses certify execution.
     fn collect_tool_calls(&self, include_turn_summaries: bool) -> Vec<JournalToolCall> {
