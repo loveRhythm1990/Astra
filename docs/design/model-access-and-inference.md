@@ -169,14 +169,15 @@ policy does not claim to repair the original 0.2.10 conversation failure.
 Version validation does not authorize access. The response uses the existing
 service-owned authorized catalog, Offering identity, capabilities, access
 policy, pagination, revision, defaults, and execution admission. Unsupported
-explicit reasoning controls are rejected with upgrade guidance; they are
+explicit reasoning controls are rejected with protocol-specific errors; they are
 never silently translated to a default, toggle, effort, or budget.
 
 Current `ModelListItemResponse`, `ModelListPageResponse`, and
 `ModelAccessProjectionResponse` readers tolerate additive metadata at those
 object boundaries. This is defensive reader behavior for non-authoritative
 metadata, independent of the producer's frozen response obligations; it does
-not replace the historical decoder tests. Their nested access/status, default-resolution, cursor,
+not replace the historical decoder tests. Their nested access/status,
+default-resolution, cursor,
 required-field, and typed enum contracts remain strict. This reader tolerance
 is not permission to extend v2 responses: the published 0.2.12 decoder is
 strict, and an independent frozen fixture protects its complete response
