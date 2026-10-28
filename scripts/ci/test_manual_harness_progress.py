@@ -98,6 +98,34 @@ class ManualHarnessProgressTests(unittest.TestCase):
             self.assertIn("results_adopted", (root / "job-summary").read_text())
             self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
 
+    def test_step_journal_diagnostics_survive_summary_without_borrowing_root_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = events(("failed",))
+            result = next(e["row"] for e in data if e["type"] == "case_completed")
+            journal = {"skipped_lines":0, "dropped_lines":0, "integrity_errors":0,
+                       "last_event":"llm_round_failed", "event_counts":{"llm_round_failed":1},
+                       "loop_boundaries":{"llm_round":{}, "child_barrier":{}},
+                       "last_provider_failure":{
+                           "event":"llm_round_failed", "run_scope":"root", "error_kind":"provider_deadline",
+                           "failure_stage":"provider", "deadline_phase":"waiting_provider_response",
+                           "dispatch_started":True, "provider_completed":False}}
+            result["steps"][0]["execution_diagnostic"]["journal"] = journal
+            result["execution_diagnostic"]["error_kind"] = "auth"
+            unknown = {**journal, "last_provider_failure":None}
+            result["steps"].append({**result["steps"][0], "step_index":1,
+                "execution_diagnostic":{**execution_diagnostic(), "journal":unknown}})
+            write_events(root, data)
+            (root / "execution.json").write_text(json.dumps({"exit_code":1, "termination":"finished"}))
+            code, summary = self.publish(root, "failure", cli=True)
+            self.assertEqual(code, 1)
+            self.assertIsNone(summary["observation_error"])
+            projected = summary["runs"][0]
+            self.assertEqual(projected["execution_diagnostic"]["error_kind"], "auth")
+            self.assertEqual(projected["steps"][0]["execution_diagnostic"]["journal"], journal)
+            self.assertEqual(projected["steps"][1]["execution_diagnostic"]["journal"], unknown)
+            self.assertIn("waiting_provider_response", (root / "job-summary").read_text())
+
     def test_execution_diagnostics_reject_private_tags_and_extra_payload(self):
         h.safe_execution_diagnostic(execution_diagnostic())
         for key in ("final_state", "interruption_kind", "error_kind", "error_code", "detail"):

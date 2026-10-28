@@ -1090,10 +1090,20 @@ The CI safe progress stream (`astra.harness_progress.v7`) includes an
 the job log and summary, and retain it in `summary.json` and
 `progress.safe.jsonl`. It preserves recognized terminal state, interruption,
 error kind/code, admission status, and available journal/live-stream event
-counts and last event type. Unknown tags become `other`; missing capture
+counts and the last captured row's event type (`last_event`, in artifact merge
+order for journals). Unknown tags become `other`; missing capture
 remains `null`. The journal's last provider failure retains its typed error,
 admission/provider/settlement stage, deadline phase, dispatch/completion flags,
-and whether its reported run matches the root or another run. This is a
+and whether its reported run matches the root or another run. Failure ordering
+uses producer UTC wall-clock time (`ts` in canonical rows, epoch-millisecond
+`created_at` in typed step rows), not artifact merge order. This is captured
+time ordering, not proof of causality across producers. `last_provider_failure`
+is `null` when there are no captured failures, any failure lacks a valid
+timestamp, or the latest timestamp has conflicting safe failure projections.
+Event counters still retain those failures. Per-step journals require matching
+session and run identities and use the canonical invocation scope, including
+causally linked descendants; an unavailable association remains `null` rather
+than borrowing another step's journal. This is a
 captured observation, not a root-cause verdict. No stderr, response bodies,
 event text, identities, or tool arguments are published. Live termination counters count observed events,
 not unique children or verified adoption, and captured events may be partial.

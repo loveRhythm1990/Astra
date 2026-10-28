@@ -1036,21 +1036,28 @@ fn materialize_persisted_tool_results(
 /// Canonical session events carry RFC3339 `ts` plus metadata.run_id. Typed
 /// StepEvent artifacts carry run_id and epoch-ms created_at on the event
 /// itself. No session/task/step label is accepted as a substitute identity.
-fn event_invocation_binding(
+pub(crate) fn event_invocation_binding(
     raw: &serde_json::Value,
 ) -> Option<(&str, chrono::DateTime<chrono::Utc>)> {
     let run_id = event_run_id(raw)?;
+    Some((run_id, event_timestamp(raw)?))
+}
+
+/// Producer UTC wall-clock time shared by canonical and typed step rows.
+/// This permits captured-time comparison across merged artifacts, not a
+/// causal ordering guarantee across producers. Invalid/missing time is unknown.
+pub(crate) fn event_timestamp(raw: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>> {
     let logical = logical_event(raw);
 
     if let Some(ts) = raw.get("ts").and_then(|value| value.as_str()) {
         let timestamp = chrono::DateTime::parse_from_rfc3339(ts)
             .ok()?
             .with_timezone(&chrono::Utc);
-        return Some((run_id, timestamp));
+        return Some(timestamp);
     }
     let created_at = logical.get("created_at").and_then(|value| value.as_u64())?;
     let created_at = i64::try_from(created_at).ok()?;
-    Some((run_id, chrono::DateTime::from_timestamp_millis(created_at)?))
+    chrono::DateTime::from_timestamp_millis(created_at)
 }
 
 fn logical_event_id(raw: &serde_json::Value) -> Option<&str> {

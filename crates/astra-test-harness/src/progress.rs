@@ -158,7 +158,9 @@ fn execution_diagnostic(
     let journal = session.map(|session| {
         let mut counts = BTreeMap::<&str, u64>::new();
         let mut last_event = None;
-        let mut last_provider_failure = None;
+        let mut last_provider_failure = None::<(chrono::DateTime<chrono::Utc>, Value)>;
+        let mut failure_time_unknown = false;
+        let mut latest_failure_conflicts = false;
         let mut loop_reasons = BTreeMap::<&str, BTreeMap<&str, u64>>::new();
         let mut child_boundaries = BTreeMap::<&str, BTreeMap<&str, u64>>::new();
         for event in &session.events {
@@ -220,7 +222,7 @@ fn execution_diagnostic(
                         "provider_attempt_persistence" => "provider_attempt_persistence",
                         _ => "other",
                     });
-                    last_provider_failure = Some(json!({
+                    let failure = json!({
                         "event":tag,
                         "run_scope":scope,
                         "error_kind":payload["error_kind"].as_str().map(error_kind),
@@ -231,10 +233,30 @@ fn execution_diagnostic(
                         "deadline_phase":phase,
                         "dispatch_started":payload["dispatch_started"].as_bool(),
                         "provider_completed":payload["provider_completed"].as_bool(),
-                    }));
+                    });
+                    // Owner-artifact merge order is not chronological. Compare
+                    // producer time; missing time or conflicting projections
+                    // at the latest timestamp cannot identify a latest failure.
+                    if let Some(time) = crate::session_capture::event_timestamp(&event.raw) {
+                        match &last_provider_failure {
+                            Some((latest, previous)) if time == *latest => {
+                                latest_failure_conflicts |= failure != *previous;
+                            }
+                            Some((latest, _)) if time < *latest => {}
+                            _ => {
+                                last_provider_failure = Some((time, failure));
+                                latest_failure_conflicts = false;
+                            }
+                        }
+                    } else {
+                        failure_time_unknown = true;
+                    }
                 }
             }
         }
+        let last_provider_failure = last_provider_failure.and_then(|(_, failure)| {
+            (!failure_time_unknown && !latest_failure_conflicts).then_some(failure)
+        });
         json!({"skipped_lines":session.skipped_lines, "dropped_lines":session.dropped_lines,
             "integrity_errors":session.integrity_errors,
             "last_event":last_event, "event_counts":counts,
@@ -319,6 +341,42 @@ fn criteria(
         .collect()
 }
 
+fn step_journal(
+    report: &CaseRunReport,
+    outcome: &RunOutcome,
+) -> Option<crate::session_capture::SessionCapture> {
+    let session_id = outcome
+        .session_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())?;
+    let run_id = outcome
+        .run_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())?;
+    report
+        .session
+        .iter()
+        .chain(&report.session_captures)
+        .filter(|capture| capture.session_id == session_id)
+        .find_map(|capture| {
+            // Run identity is immutable and unique. The report already owns
+            // its captured time window; reuse the canonical causal scoper
+            // without inventing an invocation start time at projection time.
+            let scoped = capture.scoped_to_invocation(
+                &[run_id.to_string()],
+                chrono::DateTime::<chrono::Utc>::MIN_UTC,
+            );
+            scoped
+                .events
+                .iter()
+                .any(|event| {
+                    crate::session_capture::event_invocation_binding(&event.raw)
+                        .is_some_and(|(run, _)| run == run_id)
+                })
+                .then_some(scoped)
+        })
+}
+
 fn row(report: &CaseRunReport) -> io::Result<Value> {
     let o = &report.outcome;
     let failure = serde_json::to_value(&report.failure_class)?;
@@ -331,10 +389,11 @@ fn row(report: &CaseRunReport) -> io::Result<Value> {
         .steps
         .iter()
         .map(|s| {
+            let session = step_journal(report, &s.outcome);
             Ok(json!({
                 "step_index":s.step_index, "passed":s.passed, "duration_ms":s.duration_ms,
-                "execution_diagnostic":execution_diagnostic(&s.outcome, None),
-                "criteria":criteria(&s.criteria, &s.outcome, report.session.as_ref())?
+                "execution_diagnostic":execution_diagnostic(&s.outcome, session.as_ref()),
+                "criteria":criteria(&s.criteria, &s.outcome, session.as_ref())?
             }))
         })
         .collect();
@@ -670,7 +729,7 @@ mod tests {
                 "other_run",
             ),
         ] {
-            let logical = json!({"run_id":if wrapped {"private-sentinel"} else {"root"},
+            let logical = json!({"run_id":if wrapped {"private-sentinel"} else {"root"}, "created_at":300,
             "event_type":"LlmRoundFailed", "payload":{
                 "error_kind":kind, "failure_stage":stage, "deadline_phase":phase,
                 "dispatch_started":true, "provider_completed":false, "message":"private-sentinel"
@@ -708,6 +767,214 @@ mod tests {
             assert_eq!(failure["dispatch_started"], true);
             assert!(!diagnostic.to_string().contains("private-sentinel"));
         }
+    }
+
+    fn failure_event(
+        run: &str,
+        kind: &str,
+        created_at: Value,
+    ) -> crate::session_capture::JournalEvent {
+        crate::session_capture::JournalEvent {
+            event_type: "LlmRoundFailed".into(),
+            raw: json!({"event_type":"LlmRoundFailed", "run_id":run, "created_at":created_at,
+                "payload":{"error_kind":kind, "failure_stage":"provider", "message":"private-sentinel"}}),
+        }
+    }
+
+    fn diagnostic_report() -> CaseRunReport {
+        serde_json::from_value(json!({
+            "case_name":"multi-step", "model":"model", "status":"failed",
+            "outcome":RunOutcome {
+                session_id:Some("session".into()), run_id:Some("root".into()),
+                ..RunOutcome::new("model")
+            }, "criteria":[]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn multi_step_diagnostics_bind_each_journal_to_its_invocation() {
+        use crate::{
+            report::StepResult,
+            session_capture::{JournalEvent, SessionCapture},
+        };
+        let mut report = diagnostic_report();
+        report.session = Some(SessionCapture {
+            session_id: "session".into(),
+            events: vec![
+                failure_event("step", "provider_deadline", json!(200)),
+                failure_event("root", "auth", json!(300)),
+                JournalEvent {
+                    event_type: "agent_spawned".into(),
+                    raw: json!({
+                        "type":"agent_spawned", "ts":"1970-01-01T00:00:00.210Z",
+                        "metadata":{"parent_run_id":"step", "run_id":"child"}
+                    }),
+                },
+                JournalEvent {
+                    event_type: "ToolCallCompleted".into(),
+                    raw: json!({
+                        "event_type":"ToolCallCompleted", "run_id":"child", "created_at":220
+                    }),
+                },
+                JournalEvent {
+                    event_type: "llm_round".into(),
+                    raw: json!({
+                        "type":"llm_round", "ts":"1970-01-01T00:00:00.400Z",
+                        "producer_scope":{"run_id":"next-step"}, "metadata":{"finish_reason":"stop"}
+                    }),
+                },
+            ],
+            ..Default::default()
+        });
+        for (step_index, run) in [(0, "step"), (1, "next-step")] {
+            report.steps.push(StepResult {
+                step_index,
+                prompt: "private-sentinel".into(),
+                duration_ms: 1,
+                outcome: RunOutcome {
+                    session_id: Some("session".into()),
+                    run_id: Some(run.into()),
+                    ..RunOutcome::new("model")
+                },
+                criteria: vec![],
+                passed: step_index != 0,
+            });
+        }
+        let projected = row(&report).unwrap();
+        assert_eq!(
+            projected["execution_diagnostic"]["journal"]["last_provider_failure"]["error_kind"],
+            "auth"
+        );
+        let first = &projected["steps"][0]["execution_diagnostic"]["journal"];
+        assert_eq!(
+            first["last_provider_failure"]["error_kind"],
+            "provider_deadline"
+        );
+        assert_eq!(first["last_provider_failure"]["run_scope"], "root");
+        assert_eq!(first["event_counts"]["llm_round_failed"], 1);
+        assert_eq!(first["event_counts"]["tool_call_completed"], 1);
+        let second = &projected["steps"][1]["execution_diagnostic"]["journal"];
+        assert_eq!(second["event_counts"]["llm_round"], 1);
+        assert!(second["last_provider_failure"].is_null());
+        assert!(second["event_counts"].get("llm_round_failed").is_none());
+        assert!(!projected.to_string().contains("private-sentinel"));
+    }
+
+    #[test]
+    fn step_diagnostic_requires_matching_session_and_typed_run_evidence() {
+        use crate::{report::StepResult, session_capture::SessionCapture};
+        let mut report = diagnostic_report();
+        let capture = SessionCapture {
+            session_id: "session".into(),
+            events: vec![failure_event("step", "provider_deadline", json!(200))],
+            ..Default::default()
+        };
+        report.session_captures.push(capture.clone());
+        report.steps.push(StepResult {
+            step_index: 0,
+            prompt: String::new(),
+            duration_ms: 1,
+            outcome: RunOutcome {
+                session_id: Some("session".into()),
+                run_id: Some("step".into()),
+                ..RunOutcome::new("model")
+            },
+            criteria: vec![],
+            passed: false,
+        });
+        assert_eq!(
+            row(&report).unwrap()["steps"][0]["execution_diagnostic"]["journal"]["event_counts"]["llm_round_failed"],
+            1
+        );
+        for (session, run, timestamp) in [
+            (Some("other-session"), Some("step"), json!(200)),
+            (None, Some("step"), json!(200)),
+            (Some("session"), None, json!(200)),
+            (Some("session"), Some(" "), json!(200)),
+            (Some("session"), Some("unmatched"), json!(200)),
+            (Some("session"), Some("step"), Value::Null),
+        ] {
+            report.steps[0].outcome.session_id = session.map(str::to_string);
+            report.steps[0].outcome.run_id = run.map(str::to_string);
+            report.session_captures[0].events[0] =
+                failure_event("step", "provider_deadline", timestamp);
+            assert!(row(&report).unwrap()["steps"][0]["execution_diagnostic"]["journal"].is_null());
+        }
+    }
+
+    #[test]
+    fn latest_provider_failure_uses_event_time_not_artifact_order() {
+        use crate::session_capture::SessionCapture;
+        let outcome = RunOutcome {
+            run_id: Some("root".into()),
+            ..RunOutcome::new("model")
+        };
+        let mut latest = failure_event("root", "provider_deadline", Value::Null);
+        latest.raw["ts"] = json!("1970-01-01T01:00:00.300+01:00");
+        let mut older = failure_event("child", "auth", json!(50));
+        older.raw = json!({"artifact_kind":"step_event", "payload":older.raw});
+        for events in [vec![latest.clone(), older.clone()], vec![older, latest]] {
+            let capture = SessionCapture {
+                events,
+                ..Default::default()
+            };
+            let diagnostic = execution_diagnostic(&outcome, Some(&capture));
+            assert_eq!(
+                diagnostic["journal"]["last_provider_failure"]["error_kind"],
+                "provider_deadline"
+            );
+            assert_eq!(
+                diagnostic["journal"]["last_provider_failure"]["run_scope"],
+                "root"
+            );
+            assert!(!diagnostic.to_string().contains("private-sentinel"));
+        }
+    }
+
+    #[test]
+    fn latest_provider_failure_is_unknown_without_a_unique_ordered_projection() {
+        use crate::session_capture::SessionCapture;
+        let outcome = RunOutcome::new("model");
+        for events in [
+            vec![failure_event("root", "auth", Value::Null)],
+            vec![
+                failure_event("root", "provider_deadline", json!(300)),
+                failure_event("child", "auth", Value::Null),
+            ],
+            vec![
+                failure_event("child", "auth", Value::Null),
+                failure_event("root", "provider_deadline", json!(300)),
+            ],
+            vec![
+                failure_event("root", "provider_deadline", json!(300)),
+                failure_event("child", "auth", json!(300)),
+            ],
+        ] {
+            let count = events.len();
+            let capture = SessionCapture {
+                events,
+                ..Default::default()
+            };
+            let diagnostic = execution_diagnostic(&outcome, Some(&capture));
+            assert!(diagnostic["journal"]["last_provider_failure"].is_null());
+            assert_eq!(
+                diagnostic["journal"]["event_counts"]["llm_round_failed"],
+                count
+            );
+        }
+        let capture = SessionCapture {
+            events: vec![
+                failure_event("root", "provider_deadline", json!(300)),
+                failure_event("child", "auth", json!(50)),
+                failure_event("child", "network", json!(50)),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            execution_diagnostic(&outcome, Some(&capture))["journal"]["last_provider_failure"]["error_kind"],
+            "provider_deadline"
+        );
     }
 
     fn fixture_evaluate(criteria: &[Criterion], outcome: &RunOutcome) -> Vec<CriterionResult> {
