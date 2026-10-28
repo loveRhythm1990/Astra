@@ -218,7 +218,13 @@ pub(crate) async fn login_device_code(
 ) -> Result<(), String> {
     let store = NativeStore::new()?;
     store.prepare_for_login()?;
-    let (client, environment, endpoint) = super::discover_environment(api, &discovery).await?;
+    let mut interrupt = super::LoginInterrupt::new()?;
+    let (client, environment, endpoint) = tokio::select! {
+        result = super::discover_environment(api, &discovery) => result?,
+        _ = interrupt.recv() => {
+            return Err("Device sign-in stopped. No local session was changed.".into());
+        }
+    };
     let endpoint = issuer_endpoint(
         endpoint
             .as_ref()
@@ -267,8 +273,7 @@ pub(crate) async fn login_device_code(
     let tokens = tokio::select! {
         biased;
         result = &mut wait => result?,
-        signal = tokio::signal::ctrl_c() => {
-            signal.map_err(|_| "Could not observe sign-in cancellation")?;
+        _ = interrupt.recv() => {
             if accepted.load(Ordering::SeqCst) {
                 eprintln!("UC accepted authorization. Finishing the token response before stopping.");
                 let tokens = wait.await?;
@@ -294,7 +299,7 @@ pub(crate) async fn login_device_code(
         result = preparation => result
             .map_err(|_| "UC product sign-in timed out".to_string())
             .and_then(|result| result),
-        _ = tokio::signal::ctrl_c() => Err("Device sign-in stopped before credential publication. No local session was changed.".into()),
+        _ = interrupt.recv() => Err("Device sign-in stopped before credential publication. No local session was changed.".into()),
     };
     let (session, bootstrap) = match prepared {
         Ok(prepared) => prepared,
@@ -309,7 +314,8 @@ pub(crate) async fn login_device_code(
             return Err(error);
         }
     };
-    let (session, bootstrap) = super::publish_prepared_login(&store, session, bootstrap).await?;
+    let (session, bootstrap) =
+        super::publish_prepared_login(&store, session, bootstrap, &mut interrupt).await?;
     if let Err(error) = super::choose_workspace(&store, &session, bootstrap, None) {
         eprintln!("Workspace not selected: {error}. Use `astra auth workspace` later.");
     }

@@ -147,13 +147,21 @@ impl PublicationControl {
 
     pub fn cancel(&self) -> bool {
         self.phase
-            .compare_exchange(0, 1, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+            .compare_exchange(
+                0,
+                1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
             .is_ok()
     }
 
     fn check(&self) -> Result<(), String> {
         if self.phase.load(std::sync::atomic::Ordering::SeqCst) == 1 {
-            return Err("Sign-in stopped before credential publication; the saved sign-in is unchanged.".into());
+            return Err(
+                "Sign-in stopped before credential publication; the saved sign-in is unchanged."
+                    .into(),
+            );
         }
         if std::time::Instant::now() >= self.deadline {
             return Err("Timed out waiting to publish credentials; the saved sign-in is unchanged. Close other sign-in operations and try again.".into());
@@ -164,8 +172,16 @@ impl PublicationControl {
     fn begin_commit(&self) -> Result<(), String> {
         self.check()?;
         self.phase
-            .compare_exchange(0, 2, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
-            .map_err(|_| "Sign-in stopped before credential publication; the saved sign-in is unchanged.".to_string())?;
+            .compare_exchange(
+                0,
+                2,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .map_err(|_| {
+                "Sign-in stopped before credential publication; the saved sign-in is unchanged."
+                    .to_string()
+            })?;
         Ok(())
     }
 }
@@ -495,14 +511,19 @@ impl NativeStore {
             // revoke the newly published session as if publication had failed.
             let directory_synced = sync_directory(&self.root).is_ok();
             if !directory_synced {
-                tracing::warn!("MOI credentials are visible but directory durability is unconfirmed");
+                tracing::warn!(
+                    "MOI credentials are visible but directory durability is unconfirmed"
+                );
             }
             Ok(directory_synced)
         };
         let directory_synced = write().inspect_err(|_| {
             let _ = fs::remove_file(&tmp_path);
         })?;
-        Ok(Committed { value: result, directory_synced })
+        Ok(Committed {
+            value: result,
+            directory_synced,
+        })
     }
 }
 

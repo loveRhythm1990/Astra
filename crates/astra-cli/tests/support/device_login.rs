@@ -10,7 +10,7 @@ use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -24,9 +24,8 @@ enum Scenario {
 }
 
 async fn journey(scenario: Scenario) {
-    static KEY: LazyLock<rsa::RsaPrivateKey> = LazyLock::new(|| {
-        rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap()
-    });
+    static KEY: LazyLock<rsa::RsaPrivateKey> =
+        LazyLock::new(|| rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap());
     let server = MockServer::start().await;
     let origin = server.uri();
     let issuer = format!("{origin}/realms/test");
@@ -43,25 +42,38 @@ async fn journey(scenario: Scenario) {
     let auth = home.path().join("auth");
     let store = NativeStore::with_directory(auth.clone());
     store.prepare_for_login().unwrap();
-    store.publish(NativeSession {
-        environment: environment.clone(), generation: String::new(),
-        subject: "previous-user".into(), session_id: "old-session".into(),
-        astra_user_id: "previous-astra".into(), moi_principal_id: "previous-moi".into(),
-        catalog_user_id: "previous-catalog".into(), access_token: "old-access".into(),
-        refresh_token: "old-refresh".into(), expires_at: unix_now().unwrap() + 3600,
-        workspace_id: None, role_id: None, refresh_pending: false,
-    }).unwrap();
+    store
+        .publish(NativeSession {
+            environment: environment.clone(),
+            generation: String::new(),
+            subject: "previous-user".into(),
+            session_id: "old-session".into(),
+            astra_user_id: "previous-astra".into(),
+            moi_principal_id: "previous-moi".into(),
+            catalog_user_id: "previous-catalog".into(),
+            access_token: "old-access".into(),
+            refresh_token: "old-refresh".into(),
+            expires_at: unix_now().unwrap() + 3600,
+            workspace_id: None,
+            role_id: None,
+            refresh_pending: false,
+        })
+        .unwrap();
     let before = std::fs::read(auth.join("auth.json")).unwrap();
     let form = Arc::new(Mutex::new(BTreeMap::<String, String>::new()));
     let revoked = Arc::new(Mutex::new(Vec::<String>::new()));
     let held_lock = Arc::new(Mutex::new(None::<std::fs::File>));
     let token_requested = Arc::new(tokio::sync::Notify::new());
     Mock::given(path("/auth/methods"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"uc": {
-            "issuer": issuer, "client_id": "astra-cli", "moi_api_url": origin,
-            "scope": "openid profile email astra:user aistudio:user", "resource": "astra-api"
-        }})))
-        .expect(1).mount(&server).await;
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"uc": {
+                "issuer": issuer, "client_id": "astra-cli", "moi_api_url": origin,
+                "scope": "openid profile email astra:user aistudio:user", "resource": "astra-api"
+            }})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
     Mock::given(path("/realms/test/.well-known/openid-configuration"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "issuer": issuer, "authorization_endpoint": environment.authorization_endpoint,
@@ -121,13 +133,14 @@ async fn journey(scenario: Scenario) {
     let lock_for_bootstrap = held_lock.clone();
     let lock_path = auth.join("auth.lock");
     Mock::given(method("POST")).and(path("/auth/cli/bootstrap"))
+        .and(header("authorization", "Bearer new-access"))
         .respond_with(move |_: &wiremock::Request| {
             if scenario == Scenario::PrepareFailure {
                 return ResponseTemplate::new(503).set_body_json(serde_json::json!({"code":"unavailable", "msg":"Synthetic preparation failure"}));
             }
             if matches!(scenario, Scenario::CancelLock | Scenario::LockTimeout) {
                 let lock = std::fs::OpenOptions::new().read(true).write(true).open(&lock_path).unwrap();
-                FileExt::lock_exclusive(&lock).unwrap();
+                FileExt::try_lock_exclusive(&lock).unwrap();
                 *lock_for_bootstrap.lock().unwrap() = Some(lock);
             }
             ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":"OK", "data": {
@@ -137,26 +150,38 @@ async fn journey(scenario: Scenario) {
             }}))
         }).mount(&server).await;
     Mock::given(method("POST")).and(path("/auth/uc/bootstrap"))
+        .and(header("authorization", "Bearer new-access"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "issuer": issuer, "subject":"new-user", "session_id":"new-session", "user_id":"new-astra"
         }))).mount(&server).await;
     let revocations = revoked.clone();
-    Mock::given(method("POST")).and(path("/realms/test/protocol/openid-connect/revoke"))
+    Mock::given(method("POST"))
+        .and(path("/realms/test/protocol/openid-connect/revoke"))
         .respond_with(move |request: &wiremock::Request| {
-            let parsed = url::form_urlencoded::parse(&request.body).into_owned().collect::<BTreeMap<_, _>>();
+            let parsed = url::form_urlencoded::parse(&request.body)
+                .into_owned()
+                .collect::<BTreeMap<_, _>>();
             revocations.lock().unwrap().push(parsed["token"].clone());
             ResponseTemplate::new(200)
-        }).mount(&server).await;
+        })
+        .mount(&server)
+        .await;
 
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_astra"))
-        .current_dir(home.path()).env_clear().env("HOME", home.path())
+        .current_dir(home.path())
+        .env_clear()
+        .env("HOME", home.path())
         .env("MOI_AUTH_DIR", &auth)
         .env("XDG_CONFIG_HOME", home.path().join(".config"))
         .env("XDG_CACHE_HOME", home.path().join(".cache"))
         .env("XDG_DATA_HOME", home.path().join(".local/share"))
         .args(["--api-url", &origin, "login", "--device-code"])
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped())
-        .kill_on_drop(true).spawn().unwrap();
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
     let pid = nix::unistd::Pid::from_raw(child.id().unwrap() as i32);
     let lock_waiting = Arc::new(tokio::sync::Notify::new());
     let waiting = lock_waiting.clone();
@@ -165,19 +190,29 @@ async fn journey(scenario: Scenario) {
         let mut lines = tokio::io::BufReader::new(stderr).lines();
         let mut output = String::new();
         while let Some(line) = lines.next_line().await.unwrap() {
-            if line.contains("Waiting to save sign-in credentials") { waiting.notify_one(); }
+            if line.contains("Waiting to save sign-in credentials") {
+                waiting.notify_one();
+            }
             output.push_str(&line);
             output.push('\n');
         }
         output
     });
     if matches!(scenario, Scenario::CancelPending | Scenario::CancelLock) {
-        let ready = if scenario == Scenario::CancelPending { token_requested } else { lock_waiting };
-        tokio::time::timeout(Duration::from_secs(15), ready.notified()).await.unwrap();
+        let ready = if scenario == Scenario::CancelPending {
+            token_requested
+        } else {
+            lock_waiting
+        };
+        tokio::time::timeout(Duration::from_secs(15), ready.notified())
+            .await
+            .unwrap();
         nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).unwrap();
     }
-    let status = tokio::time::timeout(Duration::from_secs(20), child.wait()).await
-        .expect("public login must exit even while the parent still holds auth.lock").unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("public login must exit even while the parent still holds auth.lock")
+        .unwrap();
     let output = reader.await.unwrap();
     drop(held_lock.lock().unwrap().take());
     assert!(!output.contains("new-refresh") && !output.contains("old-refresh"));
@@ -196,20 +231,39 @@ async fn journey(scenario: Scenario) {
         } else {
             assert_eq!(*revoked.lock().unwrap(), vec!["new-refresh"]);
         }
-        if scenario == Scenario::LockTimeout { assert!(output.contains("Timed out waiting to publish")); }
-        if scenario == Scenario::CancelLock { assert!(output.contains("stopped before credential publication")); }
+        if scenario == Scenario::LockTimeout {
+            assert!(output.contains("Timed out waiting to publish"));
+        }
+        if scenario == Scenario::CancelLock {
+            assert!(
+                output.contains("stopped before credential publication"),
+                "{output}"
+            );
+        }
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn device_login_public_success_verifies_nonce_pkce_and_publishes() { journey(Scenario::Success).await; }
+async fn device_login_public_success_verifies_nonce_pkce_and_publishes() {
+    journey(Scenario::Success).await;
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn device_login_public_bad_nonce_preserves_previous_session() { journey(Scenario::BadNonce).await; }
+async fn device_login_public_bad_nonce_preserves_previous_session() {
+    journey(Scenario::BadNonce).await;
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn device_login_public_prepare_failure_preserves_previous_session() { journey(Scenario::PrepareFailure).await; }
+async fn device_login_public_prepare_failure_preserves_previous_session() {
+    journey(Scenario::PrepareFailure).await;
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn device_login_public_pending_can_be_interrupted() { journey(Scenario::CancelPending).await; }
+async fn device_login_public_pending_can_be_interrupted() {
+    journey(Scenario::CancelPending).await;
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn device_login_public_lock_wait_can_be_interrupted_without_late_commit() { journey(Scenario::CancelLock).await; }
+async fn device_login_public_lock_wait_can_be_interrupted_without_late_commit() {
+    journey(Scenario::CancelLock).await;
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn device_login_public_lock_wait_has_a_deadline() { journey(Scenario::LockTimeout).await; }
+async fn device_login_public_lock_wait_has_a_deadline() {
+    journey(Scenario::LockTimeout).await;
+}

@@ -6,6 +6,38 @@ use std::collections::BTreeMap;
 mod device_code;
 pub(crate) use device_code::login_device_code;
 
+// Keep one registered receiver across device-login phase changes. Recreating
+// ctrl_c() futures can lose SIGINT between dropping one and polling the next.
+struct LoginInterrupt {
+    #[cfg(unix)]
+    signal: tokio::signal::unix::Signal,
+}
+
+impl LoginInterrupt {
+    fn new() -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                signal: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .map_err(|_| "Could not observe sign-in cancellation")?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Err("MOI native authentication currently supports macOS and Linux".into())
+        }
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            self.signal.recv().await;
+        }
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await;
+    }
+}
+
 async fn discover_environment(
     api: &astra_thin_client::ThinClient,
     discovery: &UcDiscovery,
@@ -145,7 +177,10 @@ pub(crate) async fn login_with_observer(
         .map_err(|_| "UC login timed out".to_string())
         .and_then(|result| result);
         let result = match result {
-            Ok((session, bootstrap)) => publish_prepared_login(&store, session, bootstrap).await,
+            Ok((session, bootstrap)) => {
+                let mut interrupt = LoginInterrupt::new()?;
+                publish_prepared_login(&store, session, bootstrap, &mut interrupt).await
+            }
             Err(error) => Err(error),
         };
         super::browser_code::write_result(
@@ -296,6 +331,7 @@ async fn publish_prepared_login(
     store: &NativeStore,
     session: NativeSession,
     bootstrap: MoiBootstrap,
+    interrupt: &mut LoginInterrupt,
 ) -> Result<(NativeSession, MoiBootstrap), String> {
     // The browser deadline has ended. Publication is the success boundary;
     // neither revocation nor result-page delivery may reverse it.
@@ -303,14 +339,16 @@ async fn publish_prepared_login(
     let writer_control = control.clone();
     let writer_store = store.clone();
     let candidate = session.clone();
-    eprintln!("Waiting to save sign-in credentials (up to 10 seconds); Ctrl+C cancels before commit.");
+    eprintln!(
+        "Waiting to save sign-in credentials (up to 10 seconds); Ctrl+C cancels before commit."
+    );
     let mut writer = tokio::task::spawn_blocking(move || {
         writer_store.publish_controlled(candidate, &writer_control)
     });
     let result = tokio::select! {
         biased;
         result = &mut writer => result,
-        _ = tokio::signal::ctrl_c() => {
+        _ = interrupt.recv() => {
             if !control.cancel() {
                 eprintln!("Credential commit has started. Waiting for sign-in to settle.");
             }
@@ -333,7 +371,9 @@ async fn publish_prepared_login(
         }
     };
     if !committed.directory_synced {
-        eprintln!("Sign-in was saved, but its durability after a system crash could not be confirmed. Check `astra auth status` after restarting.");
+        eprintln!(
+            "Sign-in was saved, but its durability after a system crash could not be confirmed. Check `astra auth status` after restarting."
+        );
     }
     let published = committed.session;
     let old = committed.previous;
@@ -588,7 +628,8 @@ mod tests {
             "catalog_user_id":"catalog-user", "workspaces":[], "workspace_initialization":{"status":"pending"}
         })).unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
-        let (published, _) = publish_prepared_login(&store, prepared, bootstrap)
+        let mut interrupt = LoginInterrupt::new().unwrap();
+        let (published, _) = publish_prepared_login(&store, prepared, bootstrap, &mut interrupt)
             .await
             .unwrap();
         assert!(tokio::time::Instant::now() > deadline);

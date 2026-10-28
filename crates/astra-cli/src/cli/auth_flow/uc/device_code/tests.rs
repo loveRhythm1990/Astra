@@ -234,7 +234,7 @@ async fn retry_delay_and_slowdown_are_not_shortened_for_a_final_poll() {
             &environment,
             &grant(&environment.issuer),
             "private-verifier",
-        &AtomicBool::new(false),
+            &AtomicBool::new(false),
             deadline,
         )
         .await;
@@ -340,18 +340,29 @@ async fn successful_headers_before_deadline_allow_body_to_settle_after_deadline(
             Body::from_stream(prefix.chain(suffix))
         }
     }));
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
     let environment = Environment {
-        issuer: origin.clone(), astra_url: origin.clone(), moi_url: origin.clone(),
-        authorization_endpoint: format!("{origin}/authorize"), token_endpoint: format!("{origin}/token"),
-        revocation_endpoint: format!("{origin}/revoke"), jwks_uri: format!("{origin}/certs"),
+        issuer: origin.clone(),
+        astra_url: origin.clone(),
+        moi_url: origin.clone(),
+        authorization_endpoint: format!("{origin}/authorize"),
+        token_endpoint: format!("{origin}/token"),
+        revocation_endpoint: format!("{origin}/revoke"),
+        jwks_uri: format!("{origin}/certs"),
     };
     let deadline = Instant::now() + Duration::from_millis(1500);
     let accepted = AtomicBool::new(false);
     let result = poll(
-        &native::http_client().unwrap(), &environment, &grant(&environment.issuer),
-        "private-verifier", &accepted, deadline,
-    ).await;
+        &native::http_client().unwrap(),
+        &environment,
+        &grant(&environment.issuer),
+        "private-verifier",
+        &accepted,
+        deadline,
+    )
+    .await;
     server.abort();
     assert_eq!(result.unwrap().access_token, "test-access");
     assert!(accepted.load(Ordering::SeqCst));
