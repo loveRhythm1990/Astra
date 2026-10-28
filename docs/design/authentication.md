@@ -41,6 +41,60 @@ can reject invalid or revoked sessions earlier with 401. Older servers without
 these codes retain generic CLI permission hints; detail text is not parsed to
 infer an authorization category.
 
+## Ordinary request authentication cache
+
+The authentication service verifies each local access JWT's signature, type,
+subject, session, origin and expiry before consulting its process-local cache.
+A miss reads account activity, refresh-session expiry and issuer binding in one
+SQL snapshot. A successful observation can be reused for at most 30 seconds,
+bounded further by token/session expiry and the Memoria access-token lifetime.
+Hits do not extend freshness. Ordinary local authentication therefore uses one
+cold statement and no SQL on a cache hit; Memoria misses additionally resolve
+the current connection credential. No bearer, password hash or memory credential
+is retained in the cache.
+
+The cache is shared by service clones and bounded to 1,024 entries, 4 MiB of
+accounted storage and 16 KiB per entry. Reconfiguring a service's pool, issuer or
+encryptor starts a new namespace. Logout invalidates only its session's local
+observations and fences matching in-flight fills; account-wide changes still
+invalidate all observations, including on uncertain commits. Session fences are
+bounded within the cache; overflow conservatively fences older in-flight fills.
+Other processes and out-of-band account/session mutations can take up
+to 30 seconds to affect ordinary request admission. Expired observations require
+a successful fresh lookup; database errors do not enable stale fallback.
+
+A successful database snapshot authenticates a request overlapping logout;
+cache invalidation prevents retaining that observation and does not reject an
+unrelated principal. Absolute token, observed Session and Memoria access expiry
+are checked again after awaited validation. A request starting after a local
+logout cannot reuse an invalidated observation.
+
+Refresh and logout serialize on the account lock. Refresh atomically replaces
+the active token hash in its existing session row; the consumed hash cannot
+refresh again. Logout uses a signed, strictly unexpired refresh token's user and
+session claims to revoke that session, even after the old hash is replaced or
+cleaned up. A valid proof with no remaining session is an idempotent success;
+it cannot revoke another session. This relies on unique session IDs and trusted
+JWT signing keys: removing an old hash alone no longer revokes its logout proof.
+Expired or revoked rows remain eligible for the existing bounded cleanup.
+Do not mix this version with older servers: an old server may report logout
+success after a new server has already replaced the hash, leaving the session
+active. For upgrade or rollback, stop admission to all API replicas, drain or
+terminate their in-flight requests, and wait until every old process has exited
+before starting any replica of the other version. This cutover interrupts
+service; ordinary rolling updates and session affinity do not provide the
+required ordering. Keep all API replicas on the same side of the cutover.
+After rollback, an older server cannot use a token already consumed by the
+newer version to revoke its successor; it rejects that logout. Draining
+requests does not restore replaced hashes, so clients must use their current
+refresh tokens or the affected sessions must be revoked separately.
+
+This cache observes identity, not operation permissions. Memory operations
+continue resolving scoped credentials through the canonical credential resolver;
+provider-request replay checks, sensitive reauthentication and execution-handoff
+reauthorization retain their own fresh authority checks. Already admitted work
+continues under its existing execution/cancellation authority.
+
 ## Atomic binding and sessions
 
 Login verifies the key, takes the canonical account lock, rechecks the key after waiting, and commits identity, encrypted binding and refresh session together. Concurrent first logins resolve one account. A deterministic credential token primary key identifies one binding per provider/account; replacements remove superseded ciphertext in the same transaction. The verified key ID identifies the upstream key generation. Astra also persists a local connection lifecycle nonce in credential metadata: ordinary login with the same active binding preserves it; key replacement or reconnect after disconnect generates a new nonce, even when the upstream key ID is unchanged. Failed issuance rolls back every login-owned row.

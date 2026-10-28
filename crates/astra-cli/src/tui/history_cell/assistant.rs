@@ -11,12 +11,11 @@
 //! thinking window). One source of truth, one render path. See
 //! `docs/design/tui-refactor.md` §3.3.
 //!
-//! Reply body keeps a stable left accent gutter once settled in
-//! scrollback, so long numbered answers still scan like one unified
-//! assistant block. Live cells still use the active-slot wrapper for
-//! structure, but committed replies retain the visual anchor the old
-//! TUI had. A
-//! active response is kept visually distinct by the surrounding status line;
+//! Settled reply bodies indent prose rows with plain spaces and carry no
+//! glyph marker; code-block rows stay verbatim at column 0, so text selected
+//! from native scrollback copies as written.
+//! Live cells still use the active-slot wrapper for structure.
+//! An active response is kept visually distinct by the surrounding status line;
 //! its content itself stays free of transient transport counters.
 //!
 //! ## Inline thinking handling
@@ -46,7 +45,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::HistoryCell;
-use crate::tui::markdown_render::render_markdown_text_with_width;
+use crate::tui::markdown_render::{
+    MarkdownRow, render_markdown_rows_with_width, render_markdown_text_with_width,
+};
 use crate::tui::render::line_utils::line_to_static;
 use crate::tui::turn_event::TurnEvent;
 
@@ -63,7 +64,7 @@ struct MarkdownLayoutCache {
     /// without retaining a second full copy merely for cache matching.
     source_ptr: usize,
     source_len: usize,
-    lines: Vec<Line<'static>>,
+    rows: Vec<MarkdownRow>,
 }
 
 /// Bounded live Markdown projection. It intentionally lags a burst by a
@@ -270,17 +271,13 @@ impl AssistantCell {
             return;
         }
 
-        let lines = render_markdown_text_with_width(source, Some(width))
-            .lines
-            .iter()
-            .map(line_to_static)
-            .collect::<Vec<_>>();
+        let rows = render_markdown_rows_with_width(source, Some(width));
         *cache = Some(MarkdownLayoutCache {
             revision: self.render_revision,
             width,
             source_ptr: source.as_ptr() as usize,
             source_len: source.len(),
-            lines,
+            rows,
         });
     }
 
@@ -290,7 +287,7 @@ impl AssistantCell {
         width: usize,
         start: usize,
         maximum: usize,
-    ) -> (Vec<Line<'static>>, usize) {
+    ) -> (Vec<MarkdownRow>, usize) {
         self.ensure_markdown_layout(source, width);
         let cache = astra_core::sync_poison::recover_mutex_lock(&self.render_cache);
         let cache = cache
@@ -302,42 +299,29 @@ impl AssistantCell {
             width,
             self.render_revision
         ));
-        let total = cache.lines.len();
+        let total = cache.rows.len();
         let start = start.min(total);
         let end = start.saturating_add(maximum).min(total);
-        (cache.lines[start..end].to_vec(), total)
+        (cache.rows[start..end].to_vec(), total)
     }
 
-    fn markdown_layout(&self, source: &str, width: usize) -> Vec<Line<'static>> {
+    fn markdown_layout(&self, source: &str, width: usize) -> Vec<MarkdownRow> {
         self.markdown_layout_window(source, width, 0, usize::MAX).0
     }
 
-    fn scrollback_body_lines(
+    fn scrollback_body_rows(
         &self,
         source: &str,
         width: u16,
         start: usize,
         maximum: usize,
-    ) -> (Vec<Line<'static>>, usize) {
+    ) -> (Vec<MarkdownRow>, usize) {
         if source.is_empty() || maximum == 0 {
             return (Vec::new(), 0);
         }
         let inner_width = (width as usize).saturating_sub(2).max(20);
         let (rendered, total) = self.markdown_layout_window(source, inner_width, start, maximum);
-        let theme = crate::tui::theme::current();
-        // A settled assistant response is a completed unit, so its guide uses
-        // the exact success colour of terminal `●` markers. Live responses
-        // use the distinct focus gutter supplied by `LiveFramedCell`.
-        let gutter_style = Style::default().fg(theme.success);
-        let lines = rendered
-            .into_iter()
-            .map(|line| {
-                let mut spans = Vec::with_capacity(line.spans.len() + 1);
-                spans.push(Span::styled("█ ", gutter_style));
-                spans.extend(line.spans);
-                Line::from(spans)
-            })
-            .collect();
+        let lines = rendered.into_iter().map(prefix_settled_row).collect();
         (lines, total)
     }
 
@@ -515,12 +499,12 @@ impl AssistantCell {
     /// Materialize only a bounded portion of a final reply for native
     /// scrollback. Long final messages are inserted over several frames so
     /// the event loop can continue accepting composer input between chunks.
-    pub(crate) fn scrollback_lines_chunk(
+    pub(crate) fn scrollback_rows_chunk(
         &self,
         width: u16,
         start: usize,
         maximum: usize,
-    ) -> (Vec<Line<'static>>, usize, bool) {
+    ) -> (Vec<MarkdownRow>, usize, bool) {
         debug_assert!(!self.live, "live assistant cells stay in the viewport");
         if maximum == 0 {
             return (Vec::new(), start, false);
@@ -545,11 +529,12 @@ impl AssistantCell {
             .skip(start)
             .take(maximum)
             .cloned()
+            .map(MarkdownRow::from)
             .collect::<Vec<_>>();
         let body_start = start.saturating_sub(headers.len());
         let remaining = maximum.saturating_sub(lines.len());
         let (body_lines, body_total) =
-            self.scrollback_body_lines(body_source, width, body_start, remaining);
+            self.scrollback_body_rows(body_source, width, body_start, remaining);
         lines.extend(body_lines);
         let next = start.saturating_add(lines.len());
         let total = headers.len().saturating_add(body_total);
@@ -560,7 +545,7 @@ impl AssistantCell {
         if source.trim().is_empty() {
             return Vec::new();
         }
-        // Settled cells prepend `█ ` (2 cols) to every line, so wrap text
+        // Settled cells prepend a 2-col prefix to every line, so wrap text
         // at `width - 2` to avoid terminal hard-wrap overflow. Live cells
         // already receive `width - 2` from `active_viewport` (the
         // `LiveFramedCell` wrapper paints its own gutter column). This means
@@ -578,20 +563,27 @@ impl AssistantCell {
             return Vec::new();
         }
 
-        let theme = crate::tui::theme::current();
-        let gutter_style = Style::default().fg(theme.success);
         rendered
             .into_iter()
-            .map(|line| {
-                let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 1);
+            .map(|row| {
                 if prepend_gutter {
-                    spans.push(Span::styled("█ ", gutter_style));
+                    prefix_settled_row(row).line
+                } else {
+                    row.line
                 }
-                spans.extend(line.spans.iter().cloned());
-                Line::from(spans)
             })
             .collect()
     }
+}
+
+/// Decorate prose while retaining code-row semantics for the final writer.
+/// Settled code starts at column zero and uses terminal soft wrapping; live
+/// responses keep their distinct focus gutter supplied by `LiveFramedCell`.
+fn prefix_settled_row(mut row: MarkdownRow) -> MarkdownRow {
+    if !row.verbatim {
+        row.line.spans.insert(0, Span::raw("  "));
+    }
+    row
 }
 
 impl HistoryCell for AssistantCell {
@@ -1062,9 +1054,9 @@ mod tests {
         let mut actual = Vec::new();
         let mut start = 0;
         loop {
-            let (chunk, next, complete) = c.scrollback_lines_chunk(80, start, 8);
+            let (chunk, next, complete) = c.scrollback_rows_chunk(80, start, 8);
             assert!(chunk.len() <= 8);
-            actual.extend(chunk);
+            actual.extend(chunk.into_iter().map(|row| row.line));
             if complete {
                 break;
             }
@@ -1088,15 +1080,46 @@ mod tests {
     }
 
     #[test]
-    fn settled_assistant_guide_matches_terminal_success_marker() {
-        let c = AssistantCell::from_markdown("done");
-        let lines = c.display_lines(40);
-        let guide = lines
-            .first()
-            .and_then(|line| line.spans.first())
-            .expect("settled assistant has a guide");
-        assert_eq!(guide.content.as_ref(), "█ ");
-        assert_eq!(guide.style.fg, Some(crate::tui::theme::current().success));
+    fn settled_single_line_command_reply_copies_without_glyphs() {
+        for source in ["`git status`", "git status"] {
+            let c = AssistantCell::from_markdown(source);
+            let (scrollback, _, complete) = c.scrollback_rows_chunk(80, 0, usize::MAX);
+            assert!(complete);
+            for lines in [
+                c.display_lines(80),
+                scrollback.into_iter().map(|row| row.line).collect(),
+            ] {
+                assert_eq!(line_text(&lines), "  git status", "{source:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn settled_code_blocks_copy_verbatim_from_scrollback() {
+        // A heredoc terminator and indentation only survive a copy when the
+        // selected rows match the source exactly, so compare the whole block
+        // rather than trimmed rows.
+        let block = "cat <<'EOF'\n  indented\nEOF\ngit status";
+        for source in [
+            format!("Run these:\n\n```\n{block}\n```\n\nThen `make lint`."),
+            format!("```\n{block}\n```"),
+        ] {
+            let c = AssistantCell::from_markdown(source.clone());
+            let (scrollback, _, complete) = c.scrollback_rows_chunk(80, 0, usize::MAX);
+            assert!(complete);
+            for lines in [
+                c.display_lines(80),
+                scrollback.into_iter().map(|row| row.line).collect(),
+            ] {
+                let text = line_text(&lines);
+                assert!(
+                    text.contains(&format!("\n{block}\n")) || text.ends_with(&format!("\n{block}")),
+                    "{source:?} rendered {text:?}"
+                );
+                assert!(!text.contains('●'), "{text}");
+                assert!(!text.contains('█'), "{text}");
+            }
+        }
     }
 
     #[test]
@@ -1136,17 +1159,22 @@ mod tests {
                 .join("\n\n"),
         );
 
-        let (first, next, complete) = c.scrollback_lines_chunk(80, 0, 3);
+        let (first, next, complete) = c.scrollback_rows_chunk(80, 0, 3);
         assert_eq!(first.len(), 3);
         assert_eq!(next, 3);
         assert!(!complete);
 
-        let (second, next, complete) = c.scrollback_lines_chunk(80, next, 3);
+        let (second, next, complete) = c.scrollback_rows_chunk(80, next, 3);
         assert_eq!(second.len(), 3);
         assert_eq!(next, 6);
         assert!(!complete);
-        assert!(first[0].spans[0].content.starts_with("█ "));
-        assert!(second[0].spans[0].content.starts_with("█ "));
+        assert!(
+            first
+                .iter()
+                .chain(&second)
+                .all(|row| row.line.spans[0].content.as_ref() == "  "),
+            "every chunk indents prose rows with plain spaces"
+        );
     }
 
     #[test]
@@ -1157,10 +1185,11 @@ mod tests {
         c.prepare_scrollback_layout(80);
 
         assert!(c.has_scrollback_layout(80));
-        let (lines, _, complete) = c.scrollback_lines_chunk(80, 0, 8);
+        let (lines, _, complete) = c.scrollback_rows_chunk(80, 0, 8);
         assert!(complete);
-        assert!(lines.iter().any(|line| {
-            line.spans
+        assert!(lines.iter().any(|row| {
+            row.line
+                .spans
                 .iter()
                 .any(|span| span.content.contains("Result"))
         }));

@@ -28,7 +28,6 @@ import type {
   RunListCursor,
   RunListParams,
   RunListResponse,
-  RunProjectionRepairResponse,
   RunProjectionResponse,
   RunStatus,
   RuntimeChatResponse,
@@ -48,6 +47,7 @@ import type {
   RuntimeSessionUpdateBody,
   RuntimeTranscriptParams,
   RuntimeTranscriptResponse,
+  RuntimeConversationResponse,
   ReauthenticationProof,
   ReauthenticationPurpose,
   SessionActivityCursor,
@@ -174,7 +174,6 @@ import {
   chatRunPath,
   chatRunPausePath,
   chatRunProjectionPath,
-  chatRunProjectionRepairPath,
   chatRunResumePath,
   chatRunStreamPath,
   chatSessionDecisionTracePath,
@@ -243,7 +242,6 @@ import { SSEClient, parseSseDataEvents } from "./sse-client";
 import {
   headersInitToRecord,
   readAstraError,
-  readAstraErrorDetail,
 } from "./http";
 import { modelSelectionToWire } from "./wire";
 import {
@@ -624,15 +622,32 @@ export function chatRequestToWire(req: ChatRequest): Record<string, unknown> {
  * same layout as `astra-thin-client` / `astra-server`; set `pathPrefix` when a
  * gateway mounts the API under a prefix.
  */
+type RefreshAttempt = {
+  phase: "refreshing" | "notifying" | "done";
+  result: boolean;
+  waiters: Set<(result: boolean) => void>;
+};
+
+type TokenRevision = {
+  accessToken: string | null;
+  refreshToken: string | null;
+  notification: "pending" | "succeeded" | "failed";
+  attempt: RefreshAttempt | null;
+};
+
+function tokenRevision(accessToken: string | null, refreshToken: string | null): TokenRevision {
+  return { accessToken, refreshToken, notification: "succeeded", attempt: null };
+}
+
 export class AstraClient {
   private config: AstraClientConfig;
-  private accessToken: string | null;
-  private refreshTokenValue: string | null;
+  private tokens: TokenRevision;
+  private authGeneration = 0;
+  private authAttempt: object | null = null;
 
   constructor(config: AstraClientConfig) {
     this.config = config;
-    this.accessToken = config.accessToken ?? null;
-    this.refreshTokenValue = config.refreshToken ?? null;
+    this.tokens = tokenRevision(config.accessToken ?? null, config.refreshToken ?? null);
   }
 
   private apiPath(path: string): string {
@@ -654,34 +669,47 @@ export class AstraClient {
     const email = options?.email ?? `${username}@users.local.astra`;
     const body: Record<string, unknown> = { username, email, password };
     if (options?.displayName) body.display_name = options.displayName;
-    const result = await this.post<AuthResult>(PATH_AUTH_REGISTER, body);
-    this.accessToken = result.access_token;
-    this.refreshTokenValue = result.refresh_token;
-    return result;
+    return this.authenticate(PATH_AUTH_REGISTER, body);
   }
 
   /** Log in with username/password. Stores tokens automatically. */
   async login(username: string, password: string): Promise<AuthResult> {
-    const result = await this.post<AuthResult>(PATH_AUTH_LOGIN, {
+    return this.authenticate(PATH_AUTH_LOGIN, {
       username,
       password,
     });
-    this.accessToken = result.access_token;
-    this.refreshTokenValue = result.refresh_token;
-    return result;
+  }
+
+  private async authenticate(path: string, body: unknown): Promise<AuthResult> {
+    const attempt = {};
+    this.authAttempt = attempt;
+    try {
+      const response = await this.request(path, {
+        method: "POST",
+        body: JSON.stringify(body),
+      }, { auth: "none" });
+      const result = await response.json() as AuthResult;
+      if (this.authAttempt !== attempt) {
+        throw new Error("Authentication attempt was superseded");
+      }
+      this.setTokens(result.access_token, result.refresh_token);
+      return result;
+    } finally {
+      if (this.authAttempt === attempt) this.authAttempt = null;
+    }
   }
 
   /** Log out and clear stored tokens. Requires refresh token in client state. */
   async logout(): Promise<void> {
-    try {
-      if (this.refreshTokenValue) {
-        await this.post(PATH_AUTH_LOGOUT, {
-          refresh_token: this.refreshTokenValue,
-        });
-      }
-    } finally {
-      this.accessToken = null;
-      this.refreshTokenValue = null;
+    this.authGeneration++;
+    this.authAttempt = null;
+    const refreshToken = this.tokens.refreshToken;
+    this.tokens = tokenRevision(null, null);
+    if (refreshToken) {
+      await this.request(PATH_AUTH_LOGOUT, {
+        method: "POST",
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      }, { auth: "none" });
     }
   }
 
@@ -744,72 +772,158 @@ export class AstraClient {
   }
 
   setTokens(accessToken: string, refreshToken?: string): void {
-    this.accessToken = accessToken;
-    if (refreshToken) this.refreshTokenValue = refreshToken;
+    this.authGeneration++;
+    this.authAttempt = null;
+    this.tokens = tokenRevision(accessToken, refreshToken || null);
   }
 
-  private async tryRefreshToken(): Promise<boolean> {
-    if (!this.refreshTokenValue) return false;
+  /** A detached snapshot of the credentials currently owned by this client. */
+  getTokens(): Readonly<{ accessToken: string | null; refreshToken: string | null }> {
+    return { accessToken: this.tokens.accessToken, refreshToken: this.tokens.refreshToken };
+  }
+
+  private tryRefreshToken(generation: number, revision: TokenRevision, signal?: AbortSignal | null): Promise<boolean> {
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    if (generation !== this.authGeneration) return Promise.resolve(false);
+    // Do not overlap notifications: an older async persistence callback could
+    // otherwise overwrite the successor refresh token after rotation.
+    if (this.tokens.notification === "pending") return Promise.resolve(false);
+    let attempt = revision.attempt;
+    if (attempt?.phase === "notifying") return Promise.resolve(false);
+    if (attempt?.phase === "done") {
+      const newerAttempt = this.tokens.attempt;
+      if (newerAttempt?.phase === "refreshing") {
+        // Join the newer rotation instead of retrying a token that another
+        // request has already rejected.
+        attempt = newerAttempt;
+      } else {
+        return Promise.resolve(
+          (attempt.result || revision !== this.tokens) && this.tokens.notification === "succeeded",
+        );
+      }
+    }
+    if (!attempt) {
+      if (revision !== this.tokens || !revision.refreshToken) return Promise.resolve(false);
+      attempt = { phase: "refreshing", result: false, waiters: new Set() };
+      revision.attempt = attempt;
+      const current = attempt;
+      const finish = (result: boolean) => {
+        current.phase = "done";
+        current.result = result;
+        // Failed network/HTTP refreshes may be tried again later.
+        if (revision === this.tokens) revision.attempt = null;
+        for (const settle of current.waiters) settle(result);
+      };
+      void this.refreshTokens(generation, revision, current).then(
+        result => {
+          finish(result);
+        },
+        () => {
+          finish(false);
+        },
+      );
+    }
+    const current = attempt;
+    return new Promise<boolean>((resolve, reject) => {
+      const cleanup = () => {
+        current.waiters.delete(settle);
+        signal?.removeEventListener("abort", abort);
+      };
+      const settle = (result: boolean) => { cleanup(); resolve(result); };
+      const abort = () => { cleanup(); reject(signal?.reason); };
+      current.waiters.add(settle);
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
+    });
+  }
+
+  private async refreshTokens(generation: number, revision: TokenRevision, attempt: RefreshAttempt): Promise<boolean> {
     try {
       const res = await fetch(this.apiPath(PATH_AUTH_REFRESH), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refresh_token: this.refreshTokenValue }),
+        body: JSON.stringify({ refresh_token: revision.refreshToken }),
+        cache: "no-store",
       });
       if (!res.ok) return false;
       const data = (await res.json()) as AuthResult;
-      this.accessToken = data.access_token;
-      this.refreshTokenValue = data.refresh_token;
-      await this.config.onTokenRefresh?.({
-        accessToken: data.access_token,
-        refreshToken: data.refresh_token,
-      });
-      return true;
+      if (
+        generation !== this.authGeneration ||
+        !data ||
+        typeof data.access_token !== "string" ||
+        typeof data.refresh_token !== "string"
+      ) return false;
+      const next = tokenRevision(data.access_token, data.refresh_token);
+      this.tokens = next;
+      if (this.config.onTokenRefresh) {
+        next.notification = "pending";
+        attempt.phase = "notifying";
+        try {
+          await this.config.onTokenRefresh({ accessToken: data.access_token, refreshToken: data.refresh_token });
+          next.notification = "succeeded";
+        } catch {
+          next.notification = "failed";
+          return false;
+        }
+      }
+      return generation === this.authGeneration && this.tokens.notification === "succeeded";
     } catch {
       return false;
     }
   }
 
-  private buildHeaders(
-    init?: RequestInit,
-    extra?: Record<string, string>,
-  ): Record<string, string> {
-    const headers = headersInitToRecord(this.config.headers ?? {}, extra);
-    const generated: Record<string, string> = {};
-    const method = (init?.method ?? "GET").toUpperCase();
-    if (
-      init?.body != null &&
-      (method === "POST" ||
-        method === "PUT" ||
-        method === "PATCH" ||
-        method === "DELETE")
-    ) {
-      generated["Content-Type"] = "application/json";
-    }
-    if (this.accessToken) {
-      generated["Authorization"] = `Bearer ${this.accessToken}`;
-    }
-    return headersInitToRecord(headers, generated);
+  private buildHeaders(auth: "optional" | "none"): Record<string, string> {
+    const headers = new Headers(headersInitToRecord(this.config.headers ?? {}));
+    if (auth === "none") headers.delete("Authorization");
+    else if (this.tokens.accessToken) headers.set("Authorization", `Bearer ${this.tokens.accessToken}`);
+    return headersInitToRecord({}, headers);
+  }
+
+  private streamHeaders(extra?: Record<string, string>): Record<string, string> {
+    const headers = new Headers(headersInitToRecord(this.config.headers ?? {}));
+    headers.delete("Authorization");
+    return headersInitToRecord(headersInitToRecord({}, headers), extra);
   }
 
   // ─── HTTP helpers ──────────────────────────────────────────────────
 
-  private async request(path: string, init?: RequestInit): Promise<Response> {
+  /** Raw, body-neutral transport; returns the final response without consuming it. */
+  async fetchResponse(
+    path: string,
+    init?: RequestInit,
+    options?: { auth?: "optional" | "none"; retryUnauthorized?: boolean },
+  ): Promise<Response> {
+    const auth = options?.auth ?? "optional";
     const url = this.apiPath(path);
-    let res = await fetch(url, {
+    const generation = this.authGeneration;
+    const revision = this.tokens;
+    const accessToken = revision.accessToken;
+    const requestHeaders = headersInitToRecord({}, init?.headers);
+    const explicitAuthorization = new Headers(requestHeaders).has("Authorization")
+      || (!accessToken && new Headers(headersInitToRecord(this.config.headers ?? {})).has("Authorization"));
+    const method = (init?.method ?? "GET").toUpperCase();
+    const replayable = !(typeof ReadableStream !== "undefined" && init?.body instanceof ReadableStream);
+    const mayRetry = options?.retryUnauthorized ?? (method === "GET" || method === "HEAD");
+    const send = () => fetch(url, {
       ...init,
-      headers: headersInitToRecord(this.buildHeaders(init), init?.headers),
+      headers: headersInitToRecord(this.buildHeaders(auth), requestHeaders),
     });
-
-    if (res.status === 401) {
-      const refreshed = await this.tryRefreshToken();
-      if (refreshed) {
-        res = await fetch(url, {
-          ...init,
-          headers: headersInitToRecord(this.buildHeaders(init), init?.headers),
-        });
-      }
+    let res = await send();
+    if (res.status === 401 && auth !== "none" && (accessToken || revision.refreshToken) && !explicitAuthorization && mayRetry && replayable && !init?.signal?.aborted) {
+      const refreshed = await this.tryRefreshToken(generation, revision, init?.signal);
+      if (init?.signal?.aborted) throw init.signal.reason;
+      if (refreshed && generation === this.authGeneration && this.tokens.notification === "succeeded") res = await send();
     }
+    return res;
+  }
+
+  private async request(path: string, init?: RequestInit, options?: { auth?: "optional" | "none" }): Promise<Response> {
+    const method = (init?.method ?? "GET").toUpperCase();
+    const json = init?.body != null && ["POST", "PUT", "PATCH", "DELETE"].includes(method);
+    const res = await this.fetchResponse(path, {
+      ...init,
+      headers: headersInitToRecord(json ? { "Content-Type": "application/json" } : {}, init?.headers),
+    }, { ...options, retryUnauthorized: true });
 
     if (!res.ok) {
       const error = await readAstraError(res);
@@ -2666,6 +2780,7 @@ export class AstraClient {
       );
     }
     const url = this.apiPath(workBranchTurnsPath(workId, branchId));
+    const generation = this.authGeneration;
     let client: SSEClient;
     client = new SSEClient({
       url,
@@ -2675,11 +2790,13 @@ export class AstraClient {
         attachment_id: input.attachmentId,
         message: input.message,
       }),
-      token: this.accessToken ?? undefined,
-      headers: {
-        ...this.config.headers,
-        [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR,
+      transport: (_url, init) => {
+        if (generation !== this.authGeneration) throw new Error("Authentication changed before stream connection");
+        return this.fetchResponse(workBranchTurnsPath(workId, branchId), init, { retryUnauthorized: true });
       },
+      headers: this.streamHeaders({
+        [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR,
+      }),
       onEvent: (event) => {
         try {
           callbacks.onEvent(decodeWorkTurnStreamEventV1(event));
@@ -2798,6 +2915,15 @@ export class AstraClient {
     body: RuntimeSessionUpdateBody,
   ): Promise<RuntimeSessionResponse> {
     return this.put<RuntimeSessionResponse>(sessionPath(sessionId), body);
+  }
+
+  /** Current root and bounded conversation facts from one database snapshot. */
+  async getSessionConversation(sessionId: string, limit = 200,
+    continuation?: { runId: string; preserveTerminal: boolean }): Promise<RuntimeConversationResponse> {
+    return this.fetch<RuntimeConversationResponse>(
+      `${sessionTranscriptPath(sessionId)}${buildQueryString({ scope: "conversation", limit,
+        ...(continuation ? { reuse_run_id: continuation.runId, reuse_terminal: String(continuation.preserveTerminal) } : {}) })}`,
+    );
   }
 
   async getSessionTranscript(
@@ -3052,27 +3178,9 @@ export class AstraClient {
    */
   async getRunEvents(runId: string, startIndex = 0): Promise<StreamEvent[]> {
     const path = `${chatRunStreamPath(runId)}?last_index=${encodeURIComponent(String(startIndex))}`;
-    const url = this.apiPath(path);
-    const streamHeaders = this.buildHeaders(undefined, {
-      Accept: "text/event-stream",
+    const res = await this.request(path, {
+      headers: { Accept: "text/event-stream" },
     });
-    let res = await fetch(url, { headers: streamHeaders });
-
-    if (res.status === 401) {
-      const refreshed = await this.tryRefreshToken();
-      if (refreshed) {
-        res = await fetch(url, {
-          headers: this.buildHeaders(undefined, {
-            Accept: "text/event-stream",
-          }),
-        });
-      }
-    }
-
-    if (!res.ok) {
-      const body = await readAstraErrorDetail(res);
-      throw new AstraApiError(res.status, body, path);
-    }
 
     // Response.text() strips a BOM before the shared parser can apply its rule.
     const text = new TextDecoder("utf-8", { ignoreBOM: true }).decode(await res.arrayBuffer());
@@ -3080,7 +3188,7 @@ export class AstraClient {
   }
 
   /**
-   * Fetch the bounded durable projection for a run without attaching to its
+   * Fetch the bounded canonical snapshot for a run without attaching to its
    * live SSE stream.
    */
   async getRunProjection(
@@ -3097,22 +3205,7 @@ export class AstraClient {
     );
   }
 
-  /**
-   * Rebuild the durable projection for a run from authoritative facts.
-   */
-  async repairRunProjection(
-    runId: string,
-    opts?: { recentLimit?: number },
-  ): Promise<RunProjectionRepairResponse> {
-    const q = buildQueryString({
-      ...(opts?.recentLimit !== undefined
-        ? { recent_limit: opts.recentLimit }
-        : {}),
-    });
-    return this.post<RunProjectionRepairResponse>(
-      `${chatRunProjectionRepairPath(runId)}${q}`,
-    );
-  }
+
 
   /** `GET /runs` — list durable runs for the current user. */
   async listRuns(opts: RunListParams = {}): Promise<RunListResponse> {
@@ -3405,12 +3498,16 @@ export class AstraClient {
     },
   ): SSEClient {
     const url = this.apiPath(PATH_CHAT_STREAM);
+    const generation = this.authGeneration;
     const client = new SSEClient({
       url,
       method: "POST",
       body: JSON.stringify(chatRequestToWire(request)),
-      token: this.accessToken ?? undefined,
-      headers: this.config.headers,
+      transport: (_url, init) => {
+        if (generation !== this.authGeneration) throw new Error("Authentication changed before stream connection");
+        return this.fetchResponse(PATH_CHAT_STREAM, init, { retryUnauthorized: true });
+      },
+      headers: this.streamHeaders(),
       onEvent: callbacks.onEvent,
       onStateChange: callbacks.onStateChange,
       onRawLine: callbacks.onRawLine,
