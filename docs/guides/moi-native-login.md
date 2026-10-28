@@ -59,13 +59,23 @@ There is no automatic fallback from ordinary browser login or `--manual`.
 
 Device login uses a fresh nonce and S256 PKCE and validates the same issuer,
 ID token and MOI/Astra bootstraps as browser login. The grant secret is held only
-in memory. Pending, denial, expiry, cancellation and failed preparation preserve
-the previous local sign-in. Ctrl+C stops waiting; the pending server-side request
-expires on its own. Once tokens arrive, wait for bounded sign-in preparation and
-publication to settle; Ctrl+C does not cancel this credential finalization phase.
-The 60-second preparation timeout does not include local publication or the
-separate old-session revocation attempt. An uncertain token response requires
-starting a new request, rather than treating the terminal as authenticated.
+in memory. Pending, denial, expiry and failures before publication preserve the
+previous local sign-in. Ctrl+C stops authorization waiting; the pending request
+expires on its own. After successful token response headers, body settlement has
+its own 15-second bound (also subject to the HTTP request timeout); cancellation
+waits for that result and attempts to revoke a received token without publishing.
+An uncertain token response is reported explicitly and never replays the grant.
+
+Product preparation has a 60-second timeout and can be cancelled. Credential
+publication waits at most 10 seconds for the local lock and checks cancellation
+again immediately before admitting the atomic rename. Cancellation is joined,
+not detached: it cannot cause a later background credential replacement. Once
+commit is admitted, the operation settles rather than claiming it was cancelled.
+These budgets do not guarantee a wall-clock bound for a stalled filesystem call.
+If directory sync fails after rename, the new sign-in is already visible: Astra
+warns that crash durability is unconfirmed and still attempts to revoke the old
+session. It never treats that outcome as a failed, uncommitted login or revokes
+the newly saved session. Revocation attempts have a separate two-second timeout.
 
 The CLI waits at most 600 seconds, or the server's shorter device-code lifetime.
 A longer server lifetime is accepted, but reaching the local limit reports a

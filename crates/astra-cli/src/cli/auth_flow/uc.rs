@@ -299,7 +299,44 @@ async fn publish_prepared_login(
 ) -> Result<(NativeSession, MoiBootstrap), String> {
     // The browser deadline has ended. Publication is the success boundary;
     // neither revocation nor result-page delivery may reverse it.
-    let (published, old) = store.publish(session)?;
+    let control = native::PublicationControl::new(std::time::Duration::from_secs(10));
+    let writer_control = control.clone();
+    let writer_store = store.clone();
+    let candidate = session.clone();
+    eprintln!("Waiting to save sign-in credentials (up to 10 seconds); Ctrl+C cancels before commit.");
+    let mut writer = tokio::task::spawn_blocking(move || {
+        writer_store.publish_controlled(candidate, &writer_control)
+    });
+    let result = tokio::select! {
+        biased;
+        result = &mut writer => result,
+        _ = tokio::signal::ctrl_c() => {
+            if !control.cancel() {
+                eprintln!("Credential commit has started. Waiting for sign-in to settle.");
+            }
+            // Do not detach a write that could subsequently replace auth.json.
+            writer.await
+        }
+    };
+    let committed = match result {
+        Ok(Ok(committed)) => committed,
+        Ok(Err(error)) => {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                native::revoke(&session.environment, &session.refresh_token),
+            )
+            .await;
+            return Err(error);
+        }
+        Err(_) => {
+            return Err("Credential publication could not be confirmed. Inspect `astra auth status` before signing in again.".into());
+        }
+    };
+    if !committed.directory_synced {
+        eprintln!("Sign-in was saved, but its durability after a system crash could not be confirmed. Check `astra auth status` after restarting.");
+    }
+    let published = committed.session;
+    let old = committed.previous;
     if let Some(old) = old {
         match tokio::time::timeout(
             std::time::Duration::from_secs(2),

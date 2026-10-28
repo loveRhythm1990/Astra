@@ -3,6 +3,8 @@
 //! part of this protocol, not optional legacy profile attributes.
 use fs2::FileExt;
 mod diagnostics;
+#[cfg(all(test, unix))]
+mod publication_tests;
 use diagnostics::{RotationDiagnostic, response_request_id, transport_cause};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -127,6 +129,59 @@ pub struct NativeStore {
     root: PathBuf,
 }
 
+/// Cancellation wins only before the atomic rename is admitted. Callers must
+/// join publication after requesting cancellation; never detach a writer.
+#[derive(Clone)]
+pub struct PublicationControl {
+    phase: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    deadline: std::time::Instant,
+}
+
+impl PublicationControl {
+    pub fn new(wait: std::time::Duration) -> Self {
+        Self {
+            phase: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            deadline: std::time::Instant::now() + wait,
+        }
+    }
+
+    pub fn cancel(&self) -> bool {
+        self.phase
+            .compare_exchange(0, 1, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+            .is_ok()
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.phase.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+            return Err("Sign-in stopped before credential publication; the saved sign-in is unchanged.".into());
+        }
+        if std::time::Instant::now() >= self.deadline {
+            return Err("Timed out waiting to publish credentials; the saved sign-in is unchanged. Close other sign-in operations and try again.".into());
+        }
+        Ok(())
+    }
+
+    fn begin_commit(&self) -> Result<(), String> {
+        self.check()?;
+        self.phase
+            .compare_exchange(0, 2, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+            .map_err(|_| "Sign-in stopped before credential publication; the saved sign-in is unchanged.".to_string())?;
+        Ok(())
+    }
+}
+
+/// Rename made the new session visible even when directory fsync failed.
+pub struct PublishedLogin {
+    pub session: NativeSession,
+    pub previous: Option<NativeSession>,
+    pub directory_synced: bool,
+}
+
+struct Committed<T> {
+    value: T,
+    directory_synced: bool,
+}
+
 /// Read-only local status; observing it never sends a refresh request.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -204,8 +259,29 @@ impl NativeStore {
 
     pub fn publish(
         &self,
-        mut session: NativeSession,
+        session: NativeSession,
     ) -> Result<(NativeSession, Option<NativeSession>), String> {
+        let result = self.publish_controlled(
+            session,
+            &PublicationControl::new(std::time::Duration::from_secs(10)),
+        )?;
+        Ok((result.session, result.previous))
+    }
+
+    pub fn publish_controlled(
+        &self,
+        session: NativeSession,
+        control: &PublicationControl,
+    ) -> Result<PublishedLogin, String> {
+        self.publish_with_sync(session, control, sync_auth_directory)
+    }
+
+    fn publish_with_sync(
+        &self,
+        mut session: NativeSession,
+        control: &PublicationControl,
+        sync_directory: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<PublishedLogin, String> {
         session.environment.validate()?;
         if [
             &session.subject,
@@ -225,7 +301,7 @@ impl NativeStore {
         session.refresh_pending = false;
         session.workspace_id = None;
         session.role_id = None;
-        self.transaction(|state| {
+        let committed = self.transaction_with_sync(Some(control), sync_directory, |state| {
             let previous = state
                 .active
                 .as_ref()
@@ -241,6 +317,11 @@ impl NativeStore {
                 .insert(key.clone(), session.environment.clone());
             state.sessions.insert(key, Some(session.clone()));
             Ok((session, previous))
+        })?;
+        Ok(PublishedLogin {
+            session: committed.value.0,
+            previous: committed.value.1,
+            directory_synced: committed.directory_synced,
         })
     }
 
@@ -370,31 +451,63 @@ impl NativeStore {
     }
 
     fn transaction<R>(&self, f: impl FnOnce(&mut State) -> Result<R, String>) -> Result<R, String> {
+        self.transaction_with_sync(None, sync_auth_directory, f)
+            .map(|committed| committed.value)
+    }
+
+    fn transaction_with_sync<R>(
+        &self,
+        control: Option<&PublicationControl>,
+        sync_directory: impl FnOnce(&Path) -> std::io::Result<()>,
+        f: impl FnOnce(&mut State) -> Result<R, String>,
+    ) -> Result<Committed<R>, String> {
         self.prepare_dir()?;
         let lock = private_open(&self.root.join("auth.lock"), true)?;
-        FileExt::lock_exclusive(&lock).map_err(|_| "cannot lock MOI credentials")?;
+        if let Some(control) = control {
+            loop {
+                control.check()?;
+                match FileExt::try_lock_exclusive(&lock) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(_) => return Err("cannot lock MOI credentials".into()),
+                }
+            }
+        } else {
+            FileExt::lock_exclusive(&lock).map_err(|_| "cannot lock MOI credentials")?;
+        }
         let mut state = self.read_locked()?;
         let result = f(&mut state)?;
         let body = serde_json::to_vec(&state).map_err(|_| "cannot encode MOI credentials")?;
         let tmp_path = self.root.join(format!("auth-{}.tmp", uuid::Uuid::new_v4()));
-        let write = || -> Result<(), String> {
+        let write = || -> Result<bool, String> {
             let mut tmp = private_create(&tmp_path)?;
             tmp.write_all(&body)
                 .map_err(|_| "cannot write MOI credentials")?;
             tmp.sync_all().map_err(|_| "cannot sync MOI credentials")?;
+            if let Some(control) = control {
+                control.begin_commit()?;
+            }
             fs::rename(&tmp_path, self.root.join("auth.json"))
                 .map_err(|_| "cannot publish MOI credentials")?;
-            File::open(&self.root)
-                .and_then(|f| f.sync_all())
-                .map_err(|_| "cannot sync MOI auth directory")?;
-            Ok(())
+            // The commit is visible. Never return a pre-commit error here or
+            // revoke the newly published session as if publication had failed.
+            let directory_synced = sync_directory(&self.root).is_ok();
+            if !directory_synced {
+                tracing::warn!("MOI credentials are visible but directory durability is unconfirmed");
+            }
+            Ok(directory_synced)
         };
-        if let Err(error) = write() {
+        let directory_synced = write().inspect_err(|_| {
             let _ = fs::remove_file(&tmp_path);
-            return Err(error);
-        }
-        Ok(result)
+        })?;
+        Ok(Committed { value: result, directory_synced })
     }
+}
+
+fn sync_auth_directory(root: &Path) -> std::io::Result<()> {
+    File::open(root).and_then(|file| file.sync_all())
 }
 
 fn private_create(path: &Path) -> Result<File, String> {
@@ -1516,7 +1629,7 @@ mod tests {
         assert_eq!(store.current().unwrap().subject, "A");
     }
 
-    fn session(subject: &str) -> NativeSession {
+    pub(super) fn session(subject: &str) -> NativeSession {
         let issuer = "https://uc.example.test/realms/moi";
         NativeSession {
             environment: Environment {
@@ -1543,7 +1656,7 @@ mod tests {
         }
     }
 
-    fn store() -> (tempfile::TempDir, NativeStore) {
+    pub(super) fn store() -> (tempfile::TempDir, NativeStore) {
         let directory = tempfile::tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let store = NativeStore::with_directory(directory.path().to_path_buf());

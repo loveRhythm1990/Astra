@@ -367,6 +367,18 @@ A successful but malformed token response is terminal and is not
 replayed. New credentials are published only after existing MOI and Astra
 preparation succeeds. No implicit browser/manual fallback is introduced.
 
+Successful token headers end authorization waiting. Body settlement uses an
+independent bounded read and reports an unconfirmed outcome on failure, rather
+than claiming the grant expired. The shared native credential owner arbitrates
+cancellation against rename admission, polls contended publication locks for up
+to ten seconds, and distinguishes pre-rename failure from visible publication
+whose directory durability is unconfirmed. Callers join the writer after
+cancellation, revoke new credentials only on definite pre-commit failure, and
+attempt old-session revocation for both durable and visible-but-unconfirmed
+publication. Filesystem operations themselves cannot be forcibly interrupted;
+no caller timeout may leave a detached writer behind. This publication contract
+is shared by browser and device login; there is no device-only auth.json writer.
+
 ## CLI in-flight credential ownership
 
 A CLI turn captures its admitted credential owner once, including when

@@ -1,4 +1,8 @@
 #[cfg(unix)]
+#[path = "support/device_login.rs"]
+mod device_login;
+
+#[cfg(unix)]
 #[test]
 fn completion_stops_quietly_when_the_consumer_closes_stdout() {
     assert_public_stdout_closes_quietly(&["completion", "zsh"]);

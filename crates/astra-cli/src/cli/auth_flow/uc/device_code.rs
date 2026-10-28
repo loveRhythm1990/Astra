@@ -3,6 +3,7 @@ use astra_services::auth::uc::UcDiscovery;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -10,6 +11,7 @@ const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const EXPIRED: &str = "Device sign-in expired. Run `astra login --device-code` to start again.";
 const MAX_WAIT_SECS: u64 = 600;
 const WAIT_TIMEOUT: &str = "Stopped waiting for device sign-in after 600 seconds. No local session was changed; the pending request may remain valid until it expires. Run `astra login --device-code` to start again.";
+const TOKEN_UNCONFIRMED: &str = "UC accepted device sign-in, but the token response could not be confirmed. No local session was changed. Start a new sign-in request; the previous grant will not be retried.";
 
 // Deliberately not Debug: the grant secret must never be rendered or logged.
 #[derive(Deserialize)]
@@ -133,6 +135,7 @@ async fn poll(
     environment: &Environment,
     grant: &DeviceAuthorization,
     verifier: &str,
+    accepted: &AtomicBool,
     deadline: Instant,
 ) -> Result<TokenResponse, String> {
     let mut policy = PollPolicy::new(grant.interval);
@@ -172,11 +175,13 @@ async fn poll(
         };
         let status = response.status();
         if status.is_success() {
+            accepted.store(true, Ordering::SeqCst);
             // A 2xx may have consumed the grant. Do not replay it after an
             // interrupted/invalid token body or a product bootstrap failure.
-            return tokio::time::timeout_at(deadline, native::bounded_json(response))
+            return tokio::time::timeout(Duration::from_secs(15), native::bounded_json(response))
                 .await
-                .map_err(|_| grant.deadline_error())?;
+                .map_err(|_| TOKEN_UNCONFIRMED.to_string())?
+                .map_err(|_| TOKEN_UNCONFIRMED.to_string());
         }
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
             let retry_after = response
@@ -227,6 +232,7 @@ pub(crate) async fn login_device_code(
     let verifier = super::super::browser_code::verifier();
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let started = Instant::now();
+    let accepted = AtomicBool::new(false);
     let wait = async {
         let response = client
             .post(endpoint)
@@ -252,29 +258,44 @@ pub(crate) async fn login_device_code(
             &environment,
             &grant,
             &verifier,
+            &accepted,
             started + grant.wait_duration(),
         )
         .await
     };
+    tokio::pin!(wait);
     let tokens = tokio::select! {
-        result = wait => result?,
+        biased;
+        result = &mut wait => result?,
         signal = tokio::signal::ctrl_c() => {
             signal.map_err(|_| "Could not observe sign-in cancellation")?;
+            if accepted.load(Ordering::SeqCst) {
+                eprintln!("UC accepted authorization. Finishing the token response before stopping.");
+                let tokens = wait.await?;
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    native::revoke(&environment, &tokens.refresh_token),
+                ).await;
+                return Err("Device sign-in stopped before credential publication. No local session was changed.".into());
+            }
             return Err("Device sign-in stopped. No local session was changed; the pending request will expire.".into());
         }
     };
-    // Once credentials have arrived, settle the bounded product bootstrap and
-    // publication rather than cancelling across a possible local commit.
+    // Preparation has no local publication. Cancellation revokes the new token;
+    // the credential owner arbitrates cancellation against the commit boundary.
     eprintln!(
-        "Authorization approved. Completing sign-in; Ctrl+C will not cancel credential finalization. Please wait."
+        "Authorization approved. Preparing sign-in. Credential lock waiting can be cancelled with Ctrl+C; once commit starts, please wait for it to settle."
     );
-    let prepared = tokio::time::timeout(
+    let preparation = tokio::time::timeout(
         Duration::from_secs(60),
         super::prepare(&client, &environment, &tokens, &nonce),
-    )
-    .await
-    .map_err(|_| "UC product sign-in timed out".to_string())
-    .and_then(|result| result);
+    );
+    let prepared = tokio::select! {
+        result = preparation => result
+            .map_err(|_| "UC product sign-in timed out".to_string())
+            .and_then(|result| result),
+        _ = tokio::signal::ctrl_c() => Err("Device sign-in stopped before credential publication. No local session was changed.".into()),
+    };
     let (session, bootstrap) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {

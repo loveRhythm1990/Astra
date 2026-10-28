@@ -181,6 +181,7 @@ async fn expiry_stops_before_another_poll_request() {
         &environment,
         &grant(&environment.issuer),
         "private-verifier",
+        &AtomicBool::new(false),
         Instant::now() + Duration::from_millis(20),
     )
     .await;
@@ -204,6 +205,7 @@ async fn local_wait_timeout_does_not_claim_the_server_grant_expired() {
         &environment,
         &value,
         "private-verifier",
+        &AtomicBool::new(false),
         Instant::now() + Duration::from_millis(20),
     )
     .await
@@ -232,6 +234,7 @@ async fn retry_delay_and_slowdown_are_not_shortened_for_a_final_poll() {
             &environment,
             &grant(&environment.issuer),
             "private-verifier",
+        &AtomicBool::new(false),
             deadline,
         )
         .await;
@@ -258,6 +261,7 @@ async fn server_expiry_is_terminal_even_when_local_wait_would_be_longer() {
         &environment,
         &value,
         "private-verifier",
+        &AtomicBool::new(false),
         Instant::now() + Duration::from_secs(10),
     )
     .await;
@@ -283,6 +287,7 @@ async fn denial_does_not_expose_upstream_text_or_retry() {
         &environment,
         &grant(&environment.issuer),
         "private-verifier",
+        &AtomicBool::new(false),
         Instant::now() + Duration::from_secs(10),
     )
     .await;
@@ -305,10 +310,53 @@ async fn a_successful_but_invalid_token_body_is_not_replayed() {
         &environment,
         &grant(&environment.issuer),
         "private-verifier",
+        &AtomicBool::new(false),
         Instant::now() + Duration::from_secs(10),
     )
     .await;
-    assert!(result.is_err());
+    assert!(matches!(result, Err(error) if error == TOKEN_UNCONFIRMED));
+}
+
+#[tokio::test]
+async fn successful_headers_before_deadline_allow_body_to_settle_after_deadline() {
+    use axum::{Router, body::Body, routing::post};
+    use futures_util::StreamExt;
+    use std::convert::Infallible;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new().route("/token", post(move || {
+        let observed = observed.clone();
+        async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+            let prefix = futures_util::stream::once(async { Ok::<_, Infallible>("{") });
+            let suffix = futures_util::stream::once(async {
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                Ok::<_, Infallible>(r#""access_token":"test-access","refresh_token":"test-refresh","expires_in":300,"token_type":"Bearer","id_token":"test-id"}"#)
+            });
+            Body::from_stream(prefix.chain(suffix))
+        }
+    }));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    let environment = Environment {
+        issuer: origin.clone(), astra_url: origin.clone(), moi_url: origin.clone(),
+        authorization_endpoint: format!("{origin}/authorize"), token_endpoint: format!("{origin}/token"),
+        revocation_endpoint: format!("{origin}/revoke"), jwks_uri: format!("{origin}/certs"),
+    };
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    let accepted = AtomicBool::new(false);
+    let result = poll(
+        &native::http_client().unwrap(), &environment, &grant(&environment.issuer),
+        "private-verifier", &accepted, deadline,
+    ).await;
+    server.abort();
+    assert_eq!(result.unwrap().access_token, "test-access");
+    assert!(accepted.load(Ordering::SeqCst));
+    assert!(Instant::now() > deadline);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -342,6 +390,7 @@ async fn pending_then_success_submits_the_same_grant_and_verifier() {
         &environment,
         &grant(&environment.issuer),
         "private-verifier",
+        &AtomicBool::new(false),
         Instant::now() + Duration::from_secs(15),
     )
     .await
