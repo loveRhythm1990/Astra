@@ -303,6 +303,8 @@ fn criteria(
                         .map(|(_, diagnostic)| diagnostic)
                         .unwrap_or_else(|failure| failure.diagnostic()),
                 Criterion::JournalToolOutcomeCount { name, ok, min, max } => session
+                    .filter(|capture| capture.skipped_lines == 0 && capture.dropped_lines == 0
+                        && !capture.has_integrity_errors())
                     .map(|session| json!({"kind":"count", "min":min, "max":max,
                         "actual":session.journal_tool_outcome_count(name, *ok)}))
                     .unwrap_or(Value::Null),
@@ -1177,6 +1179,29 @@ mod tests {
                     .unwrap()
                     .contains("private-sentinel")
             );
+        }
+        for capture in [
+            SessionCapture {
+                skipped_lines: 1,
+                ..Default::default()
+            },
+            SessionCapture {
+                dropped_lines: 1,
+                ..Default::default()
+            },
+            SessionCapture {
+                integrity_errors: 1,
+                ..Default::default()
+            },
+        ] {
+            let checks = crate::criteria::evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome,
+                Some(&capture),
+            );
+            let projected = super::criteria(&checks, &outcome, Some(&capture)).unwrap();
+            assert_eq!(projected[0]["passed"], false);
+            assert!(projected[0]["diagnostic"].is_null());
         }
         let checks =
             crate::criteria::evaluate_deterministic_with_session(&[criterion], &outcome, None);
