@@ -8299,6 +8299,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workspace_child_read_requires_successful_causal_completion() {
+        let criterion = Criterion::JournalChildToolCallCount {
+            parent: "agent_fanout".into(),
+            child: "read_file".into(),
+            min: 1,
+            max: 1,
+            min_distinct_child_runs: 1,
+        };
+        for (is_error, run, linked, expected) in [
+            (Some(false), "child", true, true),
+            (Some(true), "child", true, false),
+            (None, "child", true, false),
+            (Some(false), "root", true, false),
+            (Some(false), "child", false, false),
+        ] {
+            let capture = mk_session(&[
+                (
+                    "ToolCallStarted",
+                    serde_json::json!({
+                        "event_type": "ToolCallStarted", "event_id": "fanout",
+                        "run_id": "root", "payload": {"tool_name": "agent_fanout"},
+                    }),
+                ),
+                (
+                    "ToolCallCompleted",
+                    serde_json::json!({
+                        "event_type": "ToolCallCompleted", "event_id": "read",
+                        "run_id": run, "caused_by": if linked { vec!["fanout"] } else { vec![] },
+                        "payload": {"tool_name": "read_file", "is_error": is_error},
+                    }),
+                ),
+            ]);
+            let results = evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome_with_tools(&[]),
+                Some(&capture),
+            );
+            assert_eq!(
+                results[0].passed, expected,
+                "is_error={is_error:?}, run={run}, linked={linked}"
+            );
+        }
+    }
+
     fn pipeline_feedback_event(
         round: u32,
         cache_identity: &str,
