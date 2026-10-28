@@ -203,6 +203,49 @@ class ManualHarnessProgressTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 h.safe_diagnostic(dict(valid, **changes), 0)
 
+    def test_journal_diagnostics_survive_public_summary_without_raw_payload(self):
+        diagnostics = [
+            ("journal_tool_call_count", {"kind":"journal_count", "min":1, "max":1,
+             "actual":2, "considered":5, "outcome_matches":5, "missing":1,
+             "type_mismatch":1, "value_mismatch":1}, "observed 2"),
+            ("journal_tool_success_ratio", {"kind":"journal_ratio", "min":0.9,
+             "min_calls":3, "allowed_failures":1, "terminal":4, "succeeded":2,
+             "failed":2, "pending":1, "adjusted_terminal":3}, "adjusted ratio=2/3"),
+        ]
+        for kind, diagnostic, expected in diagnostics:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                data = events(("failed",))
+                result = next(e["row"] for e in data if e["type"] == "case_completed")
+                result["criteria"] = [{"type":kind, "severity":"hard", "score":None,
+                    "passed":False, "evaluation":"reported", "diagnostic":diagnostic}]
+                write_events(root, data)
+                (root / "report.json").write_text("private-sentinel")
+                (root / "execution.json").write_text(json.dumps({"exit_code":1,"termination":"finished"}))
+                code, summary = self.publish(root, "failure", cli=True)
+                self.assertEqual(code, 1)
+                self.assertIsNone(summary["observation_error"])
+                self.assertEqual(summary["runs"][0]["criteria"][0]["diagnostic"], diagnostic)
+                self.assertIn(expected, (root / "job-summary").read_text())
+                self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
+                for changes in ({"raw":"private-sentinel"}, {"actual":"private-sentinel"},
+                                {"min":True}, {"considered":-1}):
+                    with self.assertRaises(ValueError):
+                        h.safe_diagnostic(dict(diagnostic, **changes), 0)
+
+    def test_journal_diagnostics_reject_inconsistent_accounting(self):
+        count = {"kind":"journal_count", "min":1, "max":1, "actual":0,
+                 "considered":1, "outcome_matches":1, "missing":1,
+                 "type_mismatch":0, "value_mismatch":0}
+        ratio = {"kind":"journal_ratio", "min":0.9, "min_calls":3,
+                 "allowed_failures":1, "terminal":4, "succeeded":2,
+                 "failed":2, "pending":0, "adjusted_terminal":3}
+        for value, changes in [(count, {"actual":1}), (count, {"considered":0}),
+                               (ratio, {"terminal":3}), (ratio, {"adjusted_terminal":4}),
+                               (ratio, {"min":float("nan")}), (ratio, {"min_calls":0})]:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                h.safe_diagnostic(dict(value, **changes), 0)
+
     def test_judge_failure_accepts_only_fixed_typed_metadata(self):
         base = {"kind":"judge", "assessment":"unavailable", "threshold":0.8,
                 "failure":{"error_kind":"provider_deadline", "stage":"completion"}}

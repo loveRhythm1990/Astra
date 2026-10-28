@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-SCHEMA = "astra.harness_progress.v7"
+SCHEMA = "astra.harness_progress.v8"
 MAX_RECORD = 262_144
 MAX_FILE = 32 * 1024 * 1024
 STATUSES = ("passed", "failed", "cancelled", "unavailable")
@@ -216,6 +216,8 @@ def safe_diagnostic(value, depth):
     kind = value.get("kind")
     fields = {"count": {"min", "max", "actual"}, "exit": {"expected", "actual"},
               "tool_count": {"min", "max", "actual", "considered", "expected_ok", "outcome_matches", "error_matches", "predicate_matches", "predicate_mismatches", "observed_outcomes", "outcomes_omitted"},
+              "journal_count": {"min", "max", "actual", "considered", "outcome_matches", "missing", "type_mismatch", "value_mismatch"},
+              "journal_ratio": {"min", "min_calls", "allowed_failures", "terminal", "succeeded", "failed", "pending", "adjusted_terminal"},
               "sequence": {"matched", "expected"}, "proof": {"proven"},
               "judge": {"threshold", "assessment", "failure"}, "unavailable": set(), "composite": {"checks"},
               "child_adoption": {"status", "reason"}}
@@ -248,6 +250,21 @@ def safe_diagnostic(value, depth):
             for key in ("scope_count", "cache_read_tokens"):
                 if execution[key] is not None:
                     integer(execution[key])
+    elif kind == "journal_count":
+        for key in fields[kind]:
+            integer(value[key])
+        if (value["min"] > value["max"] or value["outcome_matches"] > value["considered"]
+            or value["actual"] + value["missing"] + value["type_mismatch"] + value["value_mismatch"] != value["outcome_matches"]):
+            raise ValueError("inconsistent journal count accounting")
+    elif kind == "journal_ratio":
+        for key in fields[kind] - {"min"}:
+            integer(value[key])
+        if (type(value["min"]) not in (int, float) or not math.isfinite(value["min"])
+            or not 0 <= value["min"] <= 1 or value["min_calls"] < 1
+            or value["allowed_failures"] >= value["min_calls"]
+            or value["succeeded"] + value["failed"] != value["terminal"]
+            or value["adjusted_terminal"] != value["succeeded"] + max(0, value["failed"] - value["allowed_failures"])):
+            raise ValueError("inconsistent journal ratio accounting")
     elif kind == "composite":
         safe_criteria(value["checks"], owner_passed=False, depth=depth+1)
     elif kind == "child_adoption":
@@ -415,14 +432,22 @@ def check_lines(items, prefix):
                           "this is NOT a negative quality verdict")
             elif assessment in ("accepted", "rejected"):
                 reason = f"LLM judge {assessment} the declared criterion (acceptance verdict, not a numeric grade)"
+                if assessment == "rejected":
+                    reason += "; structured rejection reason was not captured; do not infer one from this verdict"
             elif check["evaluation"] == "scored":
                 reason = f"LLM judge score={check['score']}, threshold={threshold}; passed={check['passed']}"
             elif check["evaluation"] == "unscored":
                 reason = "LLM judge unscored; no usable score (not a pass)"
             else:
                 reason = f"Required judge passed={check['passed']}; decision diagnostics unreported (do not infer a model verdict)"
-        elif kind in ("count", "tool_count"):
+        elif kind in ("count", "tool_count", "journal_count"):
             reason = f"expected {diagnostic['min']}..{diagnostic['max']}, observed {diagnostic['actual']}"
+            if kind == "journal_count":
+                reason += (f"; tool/scope candidates={diagnostic['considered']}, "
+                           f"matching outcomes={diagnostic['outcome_matches']}; "
+                           f"predicate mismatches: missing={diagnostic['missing']}, "
+                           f"type={diagnostic['type_mismatch']}, value={diagnostic['value_mismatch']}; "
+                           "predicate definition is in the case YAML at this criterion index; raw values withheld")
             if kind == "tool_count":
                 reason += (f"; tool/scope candidates={diagnostic['considered']}; "
                            f"expected ok={diagnostic['expected_ok']}, matching outcomes={diagnostic['outcome_matches']}")
@@ -454,6 +479,13 @@ def check_lines(items, prefix):
                     reason += "; Attribution: invalid request reported; the safe code alone does not identify which input was invalid"
                 else:
                     reason += "; Attribution: contract mismatch observed; root cause is not established by these counts"
+        elif kind == "journal_ratio":
+            reason = (f"success={diagnostic['succeeded']}, failed={diagnostic['failed']}, "
+                      f"terminal={diagnostic['terminal']}, pending={diagnostic['pending']}; "
+                      f"allowed failures={diagnostic['allowed_failures']}; "
+                      f"adjusted ratio={diagnostic['succeeded']}/{diagnostic['adjusted_terminal']} "
+                      f"(zero denominator means 0); required ratio>={diagnostic['min']}, "
+                      f"terminal calls>={diagnostic['min_calls']}")
         elif kind == "exit":
             reason = f"expected exit={diagnostic['expected']}, observed exit={diagnostic['actual']}"
         elif kind == "cache_scope":

@@ -409,7 +409,7 @@ loss or file-write failure cancels via the existing runner and fails closed.
 Selected custom source revisions must support this option and the repository
 helper; unsupported sources fail explicitly, without an old-log fallback.
 
-Progress uses `astra.harness_progress.v7`. Unavailable judges report the canonical
+Progress uses `astra.harness_progress.v8`. Unavailable judges report the canonical
 error kind and a fixed failure stage; unknown causes remain `unknown`. Required
 quorum failures retain the first typed cause and still fail closed. Raw errors
 and individual vote diagnostics remain private. Argument failures include bounded
@@ -1089,7 +1089,7 @@ harness scheduling pressure, a heartbeat without new typed evidence is an
 efficiency/non-convergence signal, and a terminal report with incomplete
 evidence is never promoted to success merely because the process stayed alive.
 
-The CI safe progress stream (`astra.harness_progress.v7`) includes an
+The CI safe progress stream (`astra.harness_progress.v8`) includes an
 `execution_diagnostic` on each terminal row and step. Failed rows print it in
 the job log and summary, and retain it in `summary.json` and
 `progress.safe.jsonl`. It preserves recognized terminal state, interruption,
@@ -1130,6 +1130,23 @@ underlying transition did not happen.
 In particular, a cancellation observed after an outer timeout is not proof of
 the original failure cause. Push a new commit to exercise new diagnostics;
 rerunning an older workflow run still checks out that run's original PR SHA.
+
+Journal call-count failures additionally publish numeric `journal_count` evidence:
+scoped candidates, outcome matches, final matches, and disjoint missing/type/value
+mismatch counts. The evaluator produces these counters while deciding the verdict;
+the progress reporter does not reconstruct them from error text. Use the reported
+criterion index to find the predicate in the case YAML. Tool arguments, JSON paths,
+expected/actual values, commands and output text are not copied into this diagnostic.
+Journal success-ratio failures publish successes, failures, pending calls, the
+allowed-failure allowance and adjusted denominator. Pending calls are excluded from
+the ratio, and a zero denominator means zero, exactly as in the assertion.
+
+A rejected LLM acceptance verdict is distinct from an unavailable judge. The current
+acceptance protocol does not record structured rejection reasons; CI says so instead
+of inferring a reason or publishing raw response prose. These diagnostics do not
+change thresholds, classify a failure as flaky, or retry until a case passes.
+Compare separate run attempts when investigating repeatability; retain each failure.
+
 
 ## Preflight checks
 

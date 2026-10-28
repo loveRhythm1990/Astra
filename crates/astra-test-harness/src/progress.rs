@@ -13,7 +13,7 @@ use std::sync::{
 };
 use tokio::sync::broadcast;
 
-pub const SCHEMA: &str = "astra.harness_progress.v7";
+pub const SCHEMA: &str = "astra.harness_progress.v8";
 pub const MAX_RECORD_BYTES: usize = 262_144;
 
 // Closed projections only: even machine-looking upstream tags can contain
@@ -302,6 +302,15 @@ fn criteria(
                     crate::criteria::execution_contract_proof(&c.criterion, outcome, session)
                         .map(|(_, diagnostic)| diagnostic)
                         .unwrap_or_else(|failure| failure.diagnostic()),
+                Criterion::JournalToolCallCount { .. }
+                | Criterion::JournalToolSuccessRatio { .. } => {
+                    match c.full_detail.as_deref().and_then(|raw| {
+                        serde_json::from_str::<crate::criteria::JournalDiagnostic>(raw).ok()
+                    }) {
+                        Some(diagnostic) => serde_json::to_value(diagnostic)?,
+                        None => Value::Null,
+                    }
+                }
                 Criterion::JournalToolOutcomeCount { name, ok, min, max } => session
                     .map(|session| json!({"kind":"count", "min":min, "max":max,
                         "actual":session.journal_tool_outcome_count(name, *ok)}))
@@ -1234,6 +1243,35 @@ mod tests {
         diagnostic["post_cold_cache_read_tokens"] = json!("private-sentinel");
         bad[0].full_detail = Some(diagnostic.to_string());
         assert!(fixture_criteria(&bad, &outcome).is_err());
+    }
+
+    #[test]
+    fn journal_progress_exports_only_typed_evaluator_diagnostics() {
+        let criterion = Criterion::JournalToolSuccessRatio {
+            min: 0.9,
+            min_calls: 3,
+            allowed_failures: 1,
+        };
+        let diagnostic = json!({
+            "kind":"journal_ratio", "min":0.9, "min_calls":3, "allowed_failures":1,
+            "terminal":4, "succeeded":2, "failed":2, "pending":0, "adjusted_terminal":3
+        });
+        let mut checks = fixture_evaluate(&[criterion], &RunOutcome::new("model"));
+        checks[0].full_detail = Some(diagnostic.to_string());
+        checks[0].detail = "private-sentinel".into();
+        let projected = fixture_criteria(&checks, &RunOutcome::new("model")).unwrap();
+        assert_eq!(projected[0]["diagnostic"], diagnostic);
+        assert_eq!(projected[0]["passed"], false);
+        assert!(
+            !serde_json::to_string(&projected)
+                .unwrap()
+                .contains("private-sentinel")
+        );
+        let mut unsafe_diagnostic = diagnostic;
+        unsafe_diagnostic["raw_error"] = json!("private-sentinel");
+        checks[0].full_detail = Some(unsafe_diagnostic.to_string());
+        let projected = fixture_criteria(&checks, &RunOutcome::new("model")).unwrap();
+        assert!(projected[0]["diagnostic"].is_null());
     }
 
     #[test]
