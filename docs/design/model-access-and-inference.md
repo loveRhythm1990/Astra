@@ -176,7 +176,11 @@ Current `ModelListItemResponse`, `ModelListPageResponse`, and
 `ModelAccessProjectionResponse` readers tolerate additive metadata at those
 object boundaries. This is defensive reader behavior for non-authoritative
 metadata, independent of the producer's frozen response obligations; it does
-not replace the historical decoder tests. Their nested access/status,
+not replace the historical decoder tests. After an explicitly reviewed support
+baseline change establishes that every supported consumer safely ignores a
+particular class of optional metadata, v2 may be extended within that class.
+The corresponding frozen-consumer coverage must change with that decision;
+current reader tolerance alone is insufficient. Their nested access/status,
 default-resolution, cursor,
 required-field, and typed enum contracts remain strict. This reader tolerance
 is not permission to extend v2 responses: the published 0.2.12 decoder is
