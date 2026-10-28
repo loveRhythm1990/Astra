@@ -159,7 +159,9 @@ fn execution_diagnostic(
         let mut counts = BTreeMap::<&str, u64>::new();
         let mut last_event = None;
         let mut last_provider_failure = None::<(chrono::DateTime<chrono::Utc>, Value)>;
-        let mut failure_time_unknown = false;
+        let mut failure_order_unknown = session.skipped_lines > 0
+            || session.dropped_lines > 0
+            || session.has_integrity_errors();
         let mut latest_failure_conflicts = false;
         let mut loop_reasons = BTreeMap::<&str, BTreeMap<&str, u64>>::new();
         let mut child_boundaries = BTreeMap::<&str, BTreeMap<&str, u64>>::new();
@@ -204,7 +206,9 @@ fn execution_diagnostic(
             if matches!(tag, "llm_round_failed" | "llm_round_completed") {
                 let logical = crate::session_capture::logical_event(&event.raw);
                 let payload = &logical["payload"];
-                if payload.get("error_kind").is_some() {
+                if tag == "llm_round_failed"
+                    || payload.get("error_kind").is_some_and(|kind| !kind.is_null())
+                {
                     let scope = match (logical["run_id"].as_str(), outcome.run_id.as_deref()) {
                         (Some(run), Some(root)) if run == root => "root",
                         (Some(_), Some(_)) => "other_run",
@@ -249,13 +253,13 @@ fn execution_diagnostic(
                             }
                         }
                     } else {
-                        failure_time_unknown = true;
+                        failure_order_unknown = true;
                     }
                 }
             }
         }
         let last_provider_failure = last_provider_failure.and_then(|(_, failure)| {
-            (!failure_time_unknown && !latest_failure_conflicts).then_some(failure)
+            (!failure_order_unknown && !latest_failure_conflicts).then_some(failure)
         });
         json!({"skipped_lines":session.skipped_lines, "dropped_lines":session.dropped_lines,
             "integrity_errors":session.integrity_errors,
@@ -975,6 +979,132 @@ mod tests {
             execution_diagnostic(&outcome, Some(&capture))["journal"]["last_provider_failure"]["error_kind"],
             "provider_deadline"
         );
+    }
+
+    #[test]
+    fn invalid_failure_time_survives_loader_scope_and_progress_as_uncertainty() {
+        use crate::session_capture::load_session_from_path;
+        use astra_pipeline::step_protocol::{StepEvent, StepEventType};
+        for wrapped in [false, true] {
+            for target in ["root", "step"] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("step_events.jsonl");
+                let events = [
+                    ("earlier", 50, "auth"),
+                    ("unorderable", u64::MAX, "provider_deadline"),
+                ]
+                .map(|(id, created_at, kind)| {
+                    let event = serde_json::to_value(StepEvent {
+                        event_id: id.into(),
+                        run_id: target.into(),
+                        canonical_event_id: None,
+                        step_id: "step-id".into(),
+                        event_type: StepEventType::LlmRoundFailed,
+                        agent_id: None,
+                        caused_by: vec![],
+                        created_at,
+                        payload: Some(json!({"error_kind":kind, "failure_stage":"provider",
+                                "message":"private-sentinel"})),
+                    })
+                    .unwrap();
+                    if wrapped {
+                        json!({"artifact_kind":"step_event", "payload":event})
+                    } else {
+                        event
+                    }
+                });
+                std::fs::write(
+                    &path,
+                    events
+                        .iter()
+                        .map(Value::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+                .unwrap();
+                let capture = load_session_from_path("session", &path).unwrap();
+                let mut report = diagnostic_report();
+                assert!(execution_diagnostic(&report.outcome, Some(&capture))["journal"]["last_provider_failure"].is_null());
+                // Match SuiteRunner's time window followed by row's per-step
+                // invocation scope, rather than bypassing those production owners.
+                report.session = Some(capture.scoped_to_invocation(
+                    &["root".into(), "step".into()],
+                    chrono::DateTime::UNIX_EPOCH,
+                ));
+                report.steps.push(StepResult {
+                    step_index: 0,
+                    prompt: "private-sentinel".into(),
+                    duration_ms: 1,
+                    outcome: RunOutcome {
+                        session_id: Some("session".into()),
+                        run_id: Some("step".into()),
+                        ..RunOutcome::new("model")
+                    },
+                    criteria: vec![],
+                    passed: false,
+                });
+                let projected = row(&report).unwrap();
+                let root = &projected["execution_diagnostic"]["journal"];
+                assert!(
+                    root["last_provider_failure"].is_null(),
+                    "{wrapped} {target}: {root}"
+                );
+                assert!(
+                    root["skipped_lines"].as_u64().unwrap()
+                        + root["integrity_errors"].as_u64().unwrap()
+                        > 0
+                );
+                if target == "step" {
+                    let step = &projected["steps"][0]["execution_diagnostic"]["journal"];
+                    assert!(step["last_provider_failure"].is_null());
+                    assert_eq!(step["event_counts"]["llm_round_failed"], 1);
+                    assert!(
+                        step["skipped_lines"].as_u64().unwrap()
+                            + step["integrity_errors"].as_u64().unwrap()
+                            > 0
+                    );
+                }
+                assert!(!projected.to_string().contains("private-sentinel"));
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_capture_never_claims_a_latest_provider_failure() {
+        use crate::session_capture::SessionCapture;
+        let outcome = RunOutcome::new("model");
+        for (skipped_lines, dropped_lines, integrity_errors) in [(1, 0, 0), (0, 1, 0), (0, 0, 1)] {
+            let capture = SessionCapture {
+                events: vec![failure_event("root", "auth", json!(50))],
+                skipped_lines,
+                dropped_lines,
+                integrity_errors,
+                ..Default::default()
+            };
+            let diagnostic = execution_diagnostic(&outcome, Some(&capture));
+            assert!(diagnostic["journal"]["last_provider_failure"].is_null());
+            assert_eq!(diagnostic["journal"]["event_counts"]["llm_round_failed"], 1);
+        }
+    }
+
+    #[test]
+    fn failed_event_without_error_kind_is_not_hidden_by_an_older_failure() {
+        use crate::session_capture::SessionCapture;
+        let outcome = RunOutcome::new("model");
+        let mut latest = failure_event("root", "provider_deadline", json!(100));
+        latest.raw["payload"] = json!({});
+        let mut success = failure_event("root", "auth", json!(200));
+        success.event_type = "LlmRoundCompleted".into();
+        success.raw["event_type"] = json!("LlmRoundCompleted");
+        success.raw["payload"] = json!({"error_kind":null});
+        let capture = SessionCapture {
+            events: vec![failure_event("root", "auth", json!(50)), latest, success],
+            ..Default::default()
+        };
+        let diagnostic = execution_diagnostic(&outcome, Some(&capture));
+        let failure = &diagnostic["journal"]["last_provider_failure"];
+        assert_eq!(failure["event"], "llm_round_failed");
+        assert!(failure["error_kind"].is_null());
     }
 
     fn fixture_evaluate(criteria: &[Criterion], outcome: &RunOutcome) -> Vec<CriterionResult> {

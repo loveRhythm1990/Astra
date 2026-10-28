@@ -112,7 +112,7 @@ class ManualHarnessProgressTests(unittest.TestCase):
                            "dispatch_started":True, "provider_completed":False}}
             result["steps"][0]["execution_diagnostic"]["journal"] = journal
             result["execution_diagnostic"]["error_kind"] = "auth"
-            unknown = {**journal, "last_provider_failure":None}
+            unknown = {**journal, "last_provider_failure":None, "integrity_errors":1, "skipped_lines":1}
             result["steps"].append({**result["steps"][0], "step_index":1,
                 "execution_diagnostic":{**execution_diagnostic(), "journal":unknown}})
             write_events(root, data)

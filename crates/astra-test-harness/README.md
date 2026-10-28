@@ -1098,16 +1098,25 @@ and whether its reported run matches the root or another run. Failure ordering
 uses producer UTC wall-clock time (`ts` in canonical rows, epoch-millisecond
 `created_at` in typed step rows), not artifact merge order. This is captured
 time ordering, not proof of causality across producers. `last_provider_failure`
-is `null` when there are no captured failures, any failure lacks a valid
+is `null` when there are no captured failures, the capture is incomplete
+(skipped/truncated rows or integrity errors), any retained failure lacks a valid
 timestamp, or the latest timestamp has conflicting safe failure projections.
-Event counters still retain those failures. Per-step journals require matching
+The loader rejects typed events with missing or unrepresentable producer time
+and records capture corruption. Invocation scoping also marks reliably owned
+but unorderable rows as corrupt before excluding them; further scopes retain
+that uncertainty. Invalid rows never become certified invocation evidence.
+Retained-event counters and corruption/truncation counters remain visible;
+they do not reconstruct dropped failures. A failed-event tag remains a failure
+observation even when its optional error kind is missing; a successful completed
+event's null error kind does not replace a failure. Per-step journals require matching
 session and run identities and use the canonical invocation scope, including
 causally linked descendants; an unavailable association remains `null` rather
 than borrowing another step's journal. This is a
 captured observation, not a root-cause verdict. No stderr, response bodies,
 event text, identities, or tool arguments are published. Live termination counters count observed events,
 not unique children or verified adoption, and captured events may be partial.
-These diagnostics do not change verdicts, retries, timeouts, or cleanup.
+Diagnostic fields do not regrade outcomes or change runtime retries/timeouts.
+Corrupt captures fail closed for durable evidence and session cleanup.
 The journal also projects `loop_boundaries`: counts of recognized model-round
 finish reasons and direct-child dependency outcomes, grouped as root, another
 run, or unattributed. This distinguishes recovery loops, superseded responses,

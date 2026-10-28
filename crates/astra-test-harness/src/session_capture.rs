@@ -171,11 +171,20 @@ impl SessionCapture {
         started_at: chrono::DateTime<chrono::Utc>,
     ) -> Self {
         let invocation_run_ids = self.invocation_run_ids_with_descendants(run_ids, started_at);
+        let mut integrity_errors = self.integrity_errors;
         let events = self
             .events
             .iter()
             .filter(|event| {
                 let Some((run_id, timestamp)) = event_invocation_binding(&event.raw) else {
+                    // Known run ownership does not make unorderable time valid
+                    // invocation evidence. Exclude the row, but preserve the
+                    // uncertainty through subsequent scopes and projections.
+                    if event_run_id(&event.raw)
+                        .is_some_and(|run_id| invocation_run_ids.contains(run_id))
+                    {
+                        integrity_errors = integrity_errors.saturating_add(1);
+                    }
                     return false;
                 };
                 invocation_run_ids.contains(run_id) && timestamp >= started_at
@@ -189,7 +198,7 @@ impl SessionCapture {
             events,
             skipped_lines: self.skipped_lines,
             dropped_lines: self.dropped_lines,
-            integrity_errors: self.integrity_errors,
+            integrity_errors,
         }
     }
 
@@ -1792,6 +1801,14 @@ pub fn load_session_from_path_with_caps(
         match serde_json::from_str::<serde_json::Value>(line) {
             Ok(v) => {
                 let raw_logical = logical_event(&v);
+                if is_step_event_type(raw_logical) && event_timestamp(raw_logical).is_none() {
+                    // StepEvent's u64 representation admits timestamps that
+                    // the invocation time domain cannot represent. Reject
+                    // them here instead of silently losing them during scope.
+                    skipped = skipped.saturating_add(1);
+                    integrity_errors = integrity_errors.saturating_add(1);
+                    continue;
+                }
                 if is_step_event_type(raw_logical)
                     && (event_id(raw_logical).is_none() || !valid_step_event_shape(raw_logical))
                 {
@@ -1871,6 +1888,44 @@ pub fn load_session_from_path_with_caps(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn invocation_scope_preserves_unorderable_related_event_uncertainty() {
+        use super::{JournalEvent, SessionCapture};
+        use serde_json::json;
+        for bad in [
+            json!({"run_id":"root", "created_at":u64::MAX}),
+            json!({"producer_scope":{"run_id":"root"}, "ts":"invalid-time"}),
+            json!({"metadata":{"run_id":"root"}}),
+        ] {
+            let capture = SessionCapture {
+                events: vec![
+                    JournalEvent {
+                        event_type: "LlmRoundFailed".into(),
+                        raw: json!({"run_id":"root", "created_at":50}),
+                    },
+                    JournalEvent {
+                        event_type: "LlmRoundFailed".into(),
+                        raw: bad,
+                    },
+                    JournalEvent {
+                        event_type: "LlmRoundFailed".into(),
+                        raw: json!({"run_id":"unrelated", "created_at":u64::MAX}),
+                    },
+                ],
+                ..Default::default()
+            };
+            let scoped =
+                capture.scoped_to_invocation(&["root".into()], chrono::DateTime::UNIX_EPOCH);
+            assert_eq!(scoped.events.len(), 1);
+            assert_eq!(scoped.integrity_errors, 1);
+            assert!(scoped.has_integrity_errors());
+            let scoped_again =
+                scoped.scoped_to_invocation(&["root".into()], chrono::DateTime::UNIX_EPOCH);
+            assert_eq!(scoped_again.events.len(), 1);
+            assert_eq!(scoped_again.integrity_errors, 1);
+        }
+    }
 
     #[test]
     fn execution_records_require_names_and_actual_round_witnesses() {
