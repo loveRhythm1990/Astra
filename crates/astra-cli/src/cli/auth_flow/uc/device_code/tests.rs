@@ -181,7 +181,7 @@ async fn expiry_stops_before_another_poll_request() {
         &environment,
         &grant(&environment.issuer),
         "private-verifier",
-        &AtomicBool::new(false),
+        &PollControl::default(),
         Instant::now() + Duration::from_millis(20),
     )
     .await;
@@ -205,7 +205,7 @@ async fn local_wait_timeout_does_not_claim_the_server_grant_expired() {
         &environment,
         &value,
         "private-verifier",
-        &AtomicBool::new(false),
+        &PollControl::default(),
         Instant::now() + Duration::from_millis(20),
     )
     .await
@@ -234,7 +234,7 @@ async fn retry_delay_and_slowdown_are_not_shortened_for_a_final_poll() {
             &environment,
             &grant(&environment.issuer),
             "private-verifier",
-            &AtomicBool::new(false),
+            &PollControl::default(),
             deadline,
         )
         .await;
@@ -261,7 +261,7 @@ async fn server_expiry_is_terminal_even_when_local_wait_would_be_longer() {
         &environment,
         &value,
         "private-verifier",
-        &AtomicBool::new(false),
+        &PollControl::default(),
         Instant::now() + Duration::from_secs(10),
     )
     .await;
@@ -287,7 +287,7 @@ async fn denial_does_not_expose_upstream_text_or_retry() {
         &environment,
         &grant(&environment.issuer),
         "private-verifier",
-        &AtomicBool::new(false),
+        &PollControl::default(),
         Instant::now() + Duration::from_secs(10),
     )
     .await;
@@ -310,7 +310,7 @@ async fn a_successful_but_invalid_token_body_is_not_replayed() {
         &environment,
         &grant(&environment.issuer),
         "private-verifier",
-        &AtomicBool::new(false),
+        &PollControl::default(),
         Instant::now() + Duration::from_secs(10),
     )
     .await;
@@ -353,19 +353,19 @@ async fn successful_headers_before_deadline_allow_body_to_settle_after_deadline(
         jwks_uri: format!("{origin}/certs"),
     };
     let deadline = Instant::now() + Duration::from_millis(1500);
-    let accepted = AtomicBool::new(false);
+    let control = PollControl::default();
     let result = poll(
         &native::http_client().unwrap(),
         &environment,
         &grant(&environment.issuer),
         "private-verifier",
-        &accepted,
+        &control,
         deadline,
     )
     .await;
     server.abort();
     assert_eq!(result.unwrap().access_token, "test-access");
-    assert!(accepted.load(Ordering::SeqCst));
+    assert!(control.in_flight.load(Ordering::SeqCst));
     assert!(Instant::now() > deadline);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -401,7 +401,7 @@ async fn pending_then_success_submits_the_same_grant_and_verifier() {
         &environment,
         &grant(&environment.issuer),
         "private-verifier",
-        &AtomicBool::new(false),
+        &PollControl::default(),
         Instant::now() + Duration::from_secs(15),
     )
     .await
@@ -456,4 +456,29 @@ async fn optional_device_metadata_does_not_break_existing_browser_discovery() {
             }))
         );
     }
+}
+
+#[tokio::test]
+async fn request_timeout_before_headers_is_unconfirmed_and_not_replayed() {
+    let server = MockServer::start().await;
+    let environment = environment(&server);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(1)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(100))
+        .build()
+        .unwrap();
+    let result = poll(
+        &client,
+        &environment,
+        &grant(&environment.issuer),
+        "private-verifier",
+        &PollControl::default(),
+        Instant::now() + Duration::from_secs(10),
+    )
+    .await;
+    assert!(matches!(result, Err(error) if error == TOKEN_UNCONFIRMED));
 }

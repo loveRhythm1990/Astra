@@ -193,7 +193,7 @@ pub(crate) async fn login_with_observer(
         // Login is already committed. Workspace selection is optional, and a
         // queue/list/prompt failure cannot undo authentication success.
         if terminal_workspace_prompt
-            && let Err(error) = choose_workspace(&store, &session, bootstrap, None)
+            && let Err(error) = choose_workspace(&store, &session, bootstrap, None).await
         {
             eprintln!("Workspace not selected: {error}. Use `astra auth workspace` later.");
         }
@@ -519,12 +519,62 @@ fn terminal_text(value: &str) -> String {
         .collect()
 }
 
-pub(crate) fn choose_workspace(
+pub(crate) async fn choose_workspace(
     store: &NativeStore,
     session: &NativeSession,
     bootstrap: MoiBootstrap,
     selected: Option<&str>,
 ) -> Result<(), String> {
+    let mut interrupt = LoginInterrupt::new()?;
+    choose_workspace_with_interrupt(store, session, bootstrap, selected, &mut interrupt).await
+}
+
+async fn choose_workspace_with_interrupt(
+    store: &NativeStore,
+    session: &NativeSession,
+    bootstrap: MoiBootstrap,
+    selected: Option<&str>,
+    interrupt: &mut LoginInterrupt,
+) -> Result<(), String> {
+    let Some(workspace) = prompt_workspace(bootstrap, selected)? else {
+        return Ok(());
+    };
+    let control = native::PublicationControl::new(std::time::Duration::from_secs(10));
+    let writer_control = control.clone();
+    let writer_store = store.clone();
+    let expected = session.clone();
+    let selected_workspace = workspace.clone();
+    eprintln!("Authentication is complete. Waiting to save workspace selection (up to 10 seconds); Ctrl+C cancels the selection.");
+    let mut writer = tokio::task::spawn_blocking(move || {
+        writer_store.select_workspace_controlled(&expected, Some(&selected_workspace), &writer_control)
+    });
+    let result = tokio::select! {
+        biased;
+        result = &mut writer => result,
+        _ = interrupt.recv() => {
+            let cancelled = control.cancel();
+            // Join even after cancellation: a late workspace write must never
+            // escape the command that owns it.
+            let result = writer.await;
+            if cancelled && matches!(result, Ok(Err(_))) {
+                return Err("Workspace selection stopped. Authentication is complete.".into());
+            }
+            result
+        }
+    };
+    let directory_synced = result
+        .map_err(|_| "Workspace selection could not be confirmed; authentication remains complete")??;
+    if !directory_synced {
+        eprintln!("Workspace selection was saved, but its crash durability could not be confirmed.");
+    }
+    eprintln!("MOI workspace selected: {}", terminal_text(&workspace));
+    Ok(())
+}
+
+fn prompt_workspace(
+    bootstrap: MoiBootstrap,
+    selected: Option<&str>,
+) -> Result<Option<String>, String> {
     use std::io::IsTerminal;
     let choices: Vec<_> = bootstrap
         .workspaces
@@ -536,9 +586,7 @@ pub(crate) fn choose_workspace(
         if !choices.iter().any(|v| v.id == id) {
             return Err("workspace is not an active membership of this MOI account".into());
         }
-        store.select_workspace(session, Some(id))?;
-        eprintln!("MOI workspace selected: {}", terminal_text(id));
-        return Ok(());
+        return Ok(Some(id.to_owned()));
     }
     if choices.is_empty() {
         eprintln!(
@@ -550,10 +598,10 @@ pub(crate) fn choose_workspace(
         eprintln!(
             "Authentication is complete; use `astra auth workspace` when a workspace is ready."
         );
-        return Ok(());
+        return Ok(None);
     }
     if !std::io::stdin().is_terminal() {
-        return Ok(());
+        return Ok(None);
     }
     let mut labels = vec!["Skip for now".to_string()];
     labels.extend(
@@ -568,13 +616,13 @@ pub(crate) fn choose_workspace(
                 .position(|v| v == &label)
                 .ok_or("invalid workspace choice")?;
             if index > 0 {
-                store.select_workspace(session, Some(&choices[index - 1].id))?;
+                return Ok(Some(choices[index - 1].id.clone()));
             }
-            Ok(())
+            Ok(None)
         }
         Err(
             inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted,
-        ) => Ok(()),
+        ) => Ok(None),
         Err(_) => Err("workspace selection prompt unavailable".into()),
     }
 }

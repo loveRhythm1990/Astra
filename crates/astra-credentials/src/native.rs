@@ -127,6 +127,8 @@ struct State {
 #[derive(Clone, Debug)]
 pub struct NativeStore {
     root: PathBuf,
+    #[cfg(test)]
+    fail_sync_after: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Cancellation wins only before the atomic rename is admitted. Callers must
@@ -198,6 +200,15 @@ struct Committed<T> {
     directory_synced: bool,
 }
 
+impl<T> Committed<T> {
+    fn require_durable(self) -> Result<T, String> {
+        if !self.directory_synced {
+            return Err("MOI credentials are visible but their crash durability could not be confirmed".into());
+        }
+        Ok(self.value)
+    }
+}
+
 /// Read-only local status; observing it never sends a refresh request.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -219,11 +230,15 @@ impl NativeStore {
         if !root.is_absolute() {
             return Err("MOI_AUTH_DIR must be absolute".into());
         }
-        Ok(Self { root })
+        Ok(Self::with_directory(root))
     }
 
     pub fn with_directory(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            #[cfg(test)]
+            fail_sync_after: Default::default(),
+        }
     }
 
     pub fn configured(&self) -> Result<bool, String> {
@@ -358,16 +373,39 @@ impl NativeStore {
         expected: &NativeSession,
         workspace: Option<&str>,
     ) -> Result<(), String> {
+        self.select_workspace_controlled(
+            expected,
+            workspace,
+            &PublicationControl::new(std::time::Duration::from_secs(10)),
+        )
+        .and_then(|directory_synced| {
+            Committed {
+                value: (),
+                directory_synced,
+            }
+            .require_durable()
+        })
+    }
+
+    /// Returns whether the visible workspace selection is crash durable.
+    /// Join the caller's writer even when cancellation wins before commit.
+    pub fn select_workspace_controlled(
+        &self,
+        expected: &NativeSession,
+        workspace: Option<&str>,
+        control: &PublicationControl,
+    ) -> Result<bool, String> {
         if workspace
             .is_some_and(|v| v.is_empty() || v.len() > 128 || v.chars().any(char::is_whitespace))
         {
             return Err("invalid workspace identity".into());
         }
-        self.update(expected, |session| {
+        self.update_with_control(expected, Some(control), |session| {
             session.workspace_id = workspace.map(str::to_owned);
             session.role_id = None;
             Ok(())
         })
+        .map(|committed| committed.directory_synced)
     }
 
     fn update(
@@ -375,24 +413,37 @@ impl NativeStore {
         expected: &NativeSession,
         f: impl FnOnce(&mut NativeSession) -> Result<(), String>,
     ) -> Result<(), String> {
-        self.transaction(|state| {
-            let key = expected.environment.key();
-            if state.active.as_ref() != Some(&key) {
-                return Err("MOI environment changed during operation".into());
-            }
-            let session = state
-                .sessions
-                .get_mut(&key)
-                .and_then(Option::as_mut)
-                .ok_or("MOI session logged out during operation")?;
-            if session.generation != expected.generation
-                || session.subject != expected.subject
-                || session.environment != expected.environment
-            {
-                return Err("MOI account changed during operation".into());
-            }
-            f(session)
-        })
+        self.update_with_control(expected, None, f)?.require_durable()
+    }
+
+    fn update_with_control(
+        &self,
+        expected: &NativeSession,
+        control: Option<&PublicationControl>,
+        f: impl FnOnce(&mut NativeSession) -> Result<(), String>,
+    ) -> Result<Committed<()>, String> {
+        self.transaction_with_sync(
+            control,
+            |root| self.sync_directory(root),
+            |state| {
+                let key = expected.environment.key();
+                if state.active.as_ref() != Some(&key) {
+                    return Err("MOI environment changed during operation".into());
+                }
+                let session = state
+                    .sessions
+                    .get_mut(&key)
+                    .and_then(Option::as_mut)
+                    .ok_or("MOI session logged out during operation")?;
+                if session.generation != expected.generation
+                    || session.subject != expected.subject
+                    || session.environment != expected.environment
+                {
+                    return Err("MOI account changed during operation".into());
+                }
+                f(session)
+            },
+        )
     }
 
     fn check_dir(&self) -> Result<(), String> {
@@ -467,8 +518,24 @@ impl NativeStore {
     }
 
     fn transaction<R>(&self, f: impl FnOnce(&mut State) -> Result<R, String>) -> Result<R, String> {
-        self.transaction_with_sync(None, sync_auth_directory, f)
-            .map(|committed| committed.value)
+        self.transaction_with_sync(None, |root| self.sync_directory(root), f)?
+            .require_durable()
+    }
+
+    fn sync_directory(&self, root: &Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_sync_after
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            == Ok(1)
+        {
+            return Err(std::io::Error::other("injected directory fsync failure"));
+        }
+        sync_auth_directory(root)
     }
 
     fn transaction_with_sync<R>(
@@ -1159,10 +1226,10 @@ async fn settle_token_rotation(
     diagnostic
         .record("save", "started", Some(status), request_id.as_deref(), None)
         .await;
-    if let Err(error) = store
+    let saved_result = store
         .blocking(move |store| {
             let _write_guard = write_guard;
-            store.update(&saved, |session| {
+            store.update_with_control(&saved, None, |session| {
                 session.access_token = access_token;
                 session.refresh_token = refresh_token;
                 session.expires_at = unix_now()? + expires_in;
@@ -1170,20 +1237,37 @@ async fn settle_token_rotation(
                 Ok(())
             })
         })
-        .await
-    {
+        .await;
+    let committed = match saved_result {
+        Ok(committed) => committed,
+        Err(error) => {
+            diagnostic
+                .record(
+                    "save",
+                    "storage_failed",
+                    Some(status),
+                    request_id.as_deref(),
+                    Some(&error),
+                )
+                .await;
+            let _ = revoke(&expected.environment, &token.refresh_token).await;
+            tracing::warn!(cause = %error, "rotated token could not be saved");
+            return Err(log_rotation_failure(classify_post_rotation_save(error)));
+        }
+    };
+    if !committed.directory_synced {
+        // Rename already exposed the new token. Revoking it would invalidate
+        // the saved session. The durable pending intent protects crash recovery.
         diagnostic
             .record(
                 "save",
-                "storage_failed",
+                "durability_unconfirmed",
                 Some(status),
                 request_id.as_deref(),
-                Some(&error),
+                None,
             )
             .await;
-        let _ = revoke(&expected.environment, &token.refresh_token).await;
-        tracing::warn!(cause = %error, "rotated token could not be saved");
-        return Err(log_rotation_failure(classify_post_rotation_save(error)));
+        return Err(log_rotation_failure(CredentialFailure::RotationUnconfirmed));
     }
     diagnostic
         .record(
@@ -1374,12 +1458,12 @@ mod tests {
         .expect("refresh diagnostic was not written")
     }
 
-    struct RotationFixture {
-        environment: Environment,
-        rotations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        revocations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) struct RotationFixture {
+        pub(super) environment: Environment,
+        pub(super) rotations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        pub(super) revocations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         entered: std::sync::Arc<tokio::sync::Notify>,
-        release: std::sync::Arc<tokio::sync::Notify>,
+        pub(super) release: std::sync::Arc<tokio::sync::Notify>,
         server: tokio::task::JoinHandle<()>,
     }
     impl Drop for RotationFixture {
@@ -1388,7 +1472,7 @@ mod tests {
         }
     }
 
-    async fn rotation_fixture(subject: &'static str) -> RotationFixture {
+    pub(super) async fn rotation_fixture(subject: &'static str) -> RotationFixture {
         use axum::{
             Form, Json, Router,
             routing::{get, post},

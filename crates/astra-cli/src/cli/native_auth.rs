@@ -247,7 +247,7 @@ pub(crate) async fn command(command: &NativeAuthCommand) -> Result<(), String> {
             {
                 return Err("MOI workspace response identity mismatch".into());
             }
-            super::auth_flow::uc::choose_workspace(&store, &session, bootstrap, id.as_deref())
+            super::auth_flow::uc::choose_workspace(&store, &session, bootstrap, id.as_deref()).await
         }
         NativeAuthCommand::Status { json } => {
             let configured = store.configured()?;

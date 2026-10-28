@@ -11,7 +11,15 @@ const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const EXPIRED: &str = "Device sign-in expired. Run `astra login --device-code` to start again.";
 const MAX_WAIT_SECS: u64 = 600;
 const WAIT_TIMEOUT: &str = "Stopped waiting for device sign-in after 600 seconds. No local session was changed; the pending request may remain valid until it expires. Run `astra login --device-code` to start again.";
-const TOKEN_UNCONFIRMED: &str = "UC accepted device sign-in, but the token response could not be confirmed. No local session was changed. Start a new sign-in request; the previous grant will not be retried.";
+const TOKEN_UNCONFIRMED: &str = "The result of the device token request could not be confirmed. No local session was changed. Start a new sign-in request; the previous grant will not be retried.";
+
+const STOPPED: &str = "Device sign-in stopped. No local session was changed.";
+
+#[derive(Default)]
+struct PollControl {
+    in_flight: AtomicBool,
+    cancelled: AtomicBool,
+}
 
 // Deliberately not Debug: the grant secret must never be rendered or logged.
 #[derive(Deserialize)]
@@ -135,11 +143,15 @@ async fn poll(
     environment: &Environment,
     grant: &DeviceAuthorization,
     verifier: &str,
-    accepted: &AtomicBool,
+    control: &PollControl,
     deadline: Instant,
 ) -> Result<TokenResponse, String> {
     let mut policy = PollPolicy::new(grant.interval);
     loop {
+        control.in_flight.store(false, Ordering::SeqCst);
+        if control.cancelled.load(Ordering::SeqCst) {
+            return Err(STOPPED.into());
+        }
         let now = Instant::now();
         // Do not shorten an issuer interval or retry delay to fit a final poll.
         // Compare before adding: an issuer can supply a very large interval.
@@ -149,8 +161,15 @@ async fn poll(
         }
         let wake = now + policy.delay;
         tokio::time::sleep_until(wake).await;
+        // The deadline stops new polls, never an already dispatched grant.
+        // No await separates this check, the in-flight flag, and dispatch.
+        if Instant::now() >= deadline {
+            return Err(grant.deadline_error());
+        }
+        control.in_flight.store(true, Ordering::SeqCst);
+        let settlement_deadline = Instant::now() + Duration::from_secs(15);
         let response = tokio::time::timeout_at(
-            deadline,
+            settlement_deadline,
             client
                 .post(&environment.token_endpoint)
                 .form(&[
@@ -162,23 +181,22 @@ async fn poll(
                 .send(),
         )
         .await
-        .map_err(|_| grant.deadline_error())?;
+        .map_err(|_| TOKEN_UNCONFIRMED.to_string())?;
         let response = match response {
             Ok(response) => response,
-            Err(_) => {
-                // The server might have consumed the grant before the response
-                // was lost. A later invalid_grant is terminal, never a claim
-                // that this machine has signed in or the previous session died.
+            Err(error) if error.is_connect() => {
                 policy.unavailable(None);
                 continue;
             }
+            // A timeout or lost response can follow consumption of the grant.
+            // Never replay it or claim expiry without an issuer response.
+            Err(_) => return Err(TOKEN_UNCONFIRMED.into()),
         };
         let status = response.status();
         if status.is_success() {
-            accepted.store(true, Ordering::SeqCst);
             // A 2xx may have consumed the grant. Do not replay it after an
             // interrupted/invalid token body or a product bootstrap failure.
-            return tokio::time::timeout(Duration::from_secs(15), native::bounded_json(response))
+            return tokio::time::timeout_at(settlement_deadline, native::bounded_json(response))
                 .await
                 .map_err(|_| TOKEN_UNCONFIRMED.to_string())?
                 .map_err(|_| TOKEN_UNCONFIRMED.to_string());
@@ -192,9 +210,11 @@ async fn poll(
             policy.unavailable(retry_after);
             continue;
         }
-        let error: OAuthError = tokio::time::timeout_at(deadline, native::bounded_json(response))
-            .await
-            .map_err(|_| grant.deadline_error())??;
+        let error: OAuthError =
+            tokio::time::timeout_at(settlement_deadline, native::bounded_json(response))
+                .await
+                .map_err(|_| TOKEN_UNCONFIRMED.to_string())?
+                .map_err(|_| TOKEN_UNCONFIRMED.to_string())?;
         match error.error.as_str() {
             "authorization_pending" => policy.pending(),
             "slow_down" => policy.slow_down(),
@@ -238,7 +258,7 @@ pub(crate) async fn login_device_code(
     let verifier = super::super::browser_code::verifier();
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let started = Instant::now();
-    let accepted = AtomicBool::new(false);
+    let control = PollControl::default();
     let wait = async {
         let response = client
             .post(endpoint)
@@ -264,7 +284,7 @@ pub(crate) async fn login_device_code(
             &environment,
             &grant,
             &verifier,
-            &accepted,
+            &control,
             started + grant.wait_duration(),
         )
         .await
@@ -274,8 +294,9 @@ pub(crate) async fn login_device_code(
         biased;
         result = &mut wait => result?,
         _ = interrupt.recv() => {
-            if accepted.load(Ordering::SeqCst) {
-                eprintln!("UC accepted authorization. Finishing the token response before stopping.");
+            control.cancelled.store(true, Ordering::SeqCst);
+            if control.in_flight.load(Ordering::SeqCst) {
+                eprintln!("A device token request is in flight. Waiting up to 15 seconds to settle it before stopping.");
                 let tokens = wait.await?;
                 let _ = tokio::time::timeout(
                     Duration::from_secs(2),
@@ -316,7 +337,15 @@ pub(crate) async fn login_device_code(
     };
     let (session, bootstrap) =
         super::publish_prepared_login(&store, session, bootstrap, &mut interrupt).await?;
-    if let Err(error) = super::choose_workspace(&store, &session, bootstrap, None) {
+    if let Err(error) = super::choose_workspace_with_interrupt(
+        &store,
+        &session,
+        bootstrap,
+        None,
+        &mut interrupt,
+    )
+    .await
+    {
         eprintln!("Workspace not selected: {error}. Use `astra auth workspace` later.");
     }
     Ok(())
