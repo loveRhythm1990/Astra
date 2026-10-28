@@ -28,6 +28,7 @@ function setup() {
   globalThis.__astraWebStores = undefined;
   vi.mocked(requireRuntimeUser).mockResolvedValue({ user: { user_id: "owner", display_name: null }, response: null } as never);
   const sdk = {
+    getTokens: vi.fn(() => ({ accessToken: "synthetic-test", refreshToken: null })),
     listRuntimeSessions: vi.fn().mockResolvedValue({ sessions: [session] }),
     listRuns: vi.fn().mockResolvedValue({ runs: [{ runId: "run", sessionId: "session", parentRunId: null, depth: 0, status: "running" }] }),
     getSessionConversation: vi.fn().mockResolvedValue(conversation()),

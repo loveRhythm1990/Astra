@@ -343,7 +343,7 @@ pub(crate) struct RegisterArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra login\n  astra login --manual\n  astra login --username alice --password secret"
+    after_help = "Examples:\n  astra login\n  astra login --device-code\n  astra login --manual\n  astra login --username alice --password secret"
 )]
 pub(crate) struct LoginArgs {
     /// Username to log in with
@@ -355,6 +355,9 @@ pub(crate) struct LoginArgs {
     /// Enter a Memoria connection key instead of opening the browser
     #[arg(long)]
     pub manual: bool,
+    /// Sign in to MOI from a headless terminal using another device's browser
+    #[arg(long, conflicts_with_all = ["username", "password", "manual"])]
+    pub device_code: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1337,6 +1340,23 @@ pub(crate) struct ConfigShowPolicyArgs {
 mod tests {
     use super::{Cli, Command, ModelCmd, SessionCmd, WorkSubcommand};
     use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn device_code_login_is_explicit_and_conflicts_with_other_login_methods() {
+        let cli = Cli::try_parse_from(["astra", "login", "--device-code"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Login(args)) if args.device_code));
+        for extra in [
+            vec!["--manual"],
+            vec!["--username", "alice"],
+            vec!["--password", "secret"],
+        ] {
+            let mut args = vec!["astra", "login", "--device-code"];
+            args.extend(extra);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        let cli = Cli::try_parse_from(["astra", "login"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Login(args)) if !args.device_code));
+    }
 
     #[test]
     fn mcp_effective_view_is_explicit_and_conflicts_with_a_selected_scope() {

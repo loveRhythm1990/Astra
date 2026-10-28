@@ -579,6 +579,15 @@ users or sessions. The Phase-0 production baseline journeys have additional
 exclusive-run configuration; see their dedicated instructions before enabling
 them.
 
+The slow-fanout root-cancellation journey uses the fixture-owned Session, so
+`ctx.close()` drains run/finalizer work before deleting its data. It must not
+delete another Session before that drain. All cancelled-child replay responses
+share one 10-second deadline and retain the 1 MiB body limit. Its
+`root_cancel_phase` markers record only phase names and elapsed time, allowing a
+CI timeout to distinguish setup, provider entry, cancellation, replay and
+teardown without publishing identities or payloads. The suite's 60-second
+per-test limit and cancellation/late-output assertions remain in force.
+
 Requires the same environment as `astra-server`: `MATRIXONE_*`,
 `ASTRA_JWT_SECRET`, `ASTRA_TOKEN_ENCRYPTION_KEY`, Memoria, and embedding
 settings parsed by `astra_core::AppSettings::from_env`. Use a local `.env` if
@@ -587,6 +596,43 @@ set **`ASTRA_DATABASE_PREFIX`** (effective DB = prefix + `ASTRA_DATABASE`).
 Optionally set **`ASTRA_AUTO_CREATE_DATABASE=1`** so the first
 `ensure_core_schema` (server or online tests) runs `CREATE DATABASE IF NOT
 EXISTS` for that effective name (bootstrap catalog defaults to `mysql`).
+
+### Ordinary-chat SQL budget
+
+`chat_sql_budget::ordinary_chat_and_readonly_rounds_have_bounded_total_sql`
+uses the same isolated MatrixOne setup and scripted loopback provider as the
+system HTTP journeys. Run this test by exact name in its own process because
+it owns the global SQL tracing subscriber:
+
+```bash
+MEMORIA_SELF_HOSTED_MASTER_ACCESS=1 \
+cargo test -p astra-runtime --features e2e-hooks --test chat_sql_budget \
+  ordinary_chat_and_readonly_rounds_have_bounded_total_sql -- --ignored --exact --nocapture
+```
+
+The 20-statement limit measures each request on an initialized server pool,
+including transactions, periodic control reads and the real observer's SQL.
+Pool initialization happens before capture; no statements are filtered out
+inside the measured interval. Warm-context setup consumes its complete SSE
+response and waits for observer completion before the next request starts;
+it must not use shutdown drain, which closes admission for that next request.
+Capture ends only after
+both the measured run and its observer finish: the detached observer is not
+owned by `drain_background_runs`. The authorized probe requires the exact expected
+number of both `scheduled` dispatches and `success` outcomes. An extra scheduled
+observer fails even if it is still pending when the expected successes finish.
+Errors, dropped work, missing completions, and skipped
+outcomes (`not_configured`, `access_disabled`, `empty`) fail the probe even when
+successful observations are also present. Disabled access is covered separately;
+it cannot satisfy this HTTP-path SQL measurement.
+The readonly-round comparison accounts for exact periodic control reads and
+at most one account/session authentication snapshot when its 30-second cache
+expires. Those statements still count toward the raw 20-statement limit;
+repeated authentication snapshots or any other extra readonly-round SQL fail.
+The HTTP fixture binds both the Memoria URL and its master credential to the
+strict local mock. Enabling self-hosted access exercises the authenticated
+observer request, including its authority queries; a run with access disabled
+does not validate that HTTP path. Wrong credentials still fail authentication.
 
 ### Durable provider concurrency and cancellation
 
@@ -816,6 +862,31 @@ The database tests cover canonical-context handoff recovery, shared fencing and
 lease takeover. Runtime tests exercise authenticated exit/close/status HTTP
 routes and partial-stage retry after lost receipts. CLI tests cover distinct
 Astra/Memoria owners and unsuccessful queue acknowledgments without purge.
+
+## Real Memoria observer authentication smoke
+
+`memoria_observer_live` checks the production observer worker against a real
+Memoria with owner-scoped authentication support (#250 or later) and its database.
+Use only a dedicated local test service. Supply `ASTRA_TEST_MEMORIA_OBSERVER_URL`
+(a loopback HTTP origin) and `ASTRA_TEST_MEMORIA_OBSERVER_KEY` privately through
+the test process environment; do not put credentials in command arguments or
+commit them. The test creates unique synthetic owners and retains their test
+memories. It rejects remote origins and redirects.
+
+```bash
+ASTRA_TEST_MEMORIA_OBSERVER_LIVE=1 cargo test -p astra-runtime \
+  --features live-provider-tests --test memoria_observer_live \
+  live_memoria_owner_observe -- --ignored --exact --nocapture
+```
+
+The feature, ignored-test selection and explicit opt-in are all required, so
+ordinary offline and database CI lanes cannot enable it via inherited credentials.
+It verifies that the legacy impersonation header fails with 400, the production
+self-hosted observer succeeds with `X-User-Id`, the target owner's session contains
+stored memories, and a second owner's view of the same session is empty. This is
+an observer authentication/storage check, not MOI identity or prompt recall E2E.
+The deterministic `turn_observer_authority` target remains the offline contract
+suite; it does not substitute for the real-backend smoke.
 
 ## What "done" Means
 

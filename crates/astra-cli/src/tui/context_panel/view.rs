@@ -2993,4 +2993,47 @@ mod tests {
         assert_eq!(cells.len(), GRID_CELLS);
         assert_eq!(cells.len(), 50, "5 × 10 grid: one glyph ≈ 2% of budget");
     }
+
+    #[test]
+    fn grid_represents_provider_usage_missing_from_category_estimates() {
+        let mut t = trace(102_400, 6_255, 0, 0, 11_269, 344);
+        t.token_budget.total_used = 57_802;
+        let b = ContextBreakdown::from_trace(&t);
+        assert_eq!(b.free_space_tokens, 44_598);
+        let unattributed = b
+            .categories
+            .iter()
+            .find(|c| c.kind.label() == "Unattributed");
+        assert_eq!(unattributed.map(|c| c.tokens), Some(39_934));
+        let occupied = render_grid_cells(&b)
+            .iter()
+            .filter(|cell| cell.content == "⛁ ")
+            .count();
+        assert!((27..=29).contains(&occupied), "occupied cells: {occupied}");
+        let legend = legend_lines(&b, 80);
+        let text = legend
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("Unattributed"));
+        assert!(text.contains("39.9k"));
+    }
+
+    #[test]
+    fn grid_represents_usage_without_any_category_estimates() {
+        let mut t = trace(100_000, 0, 0, 0, 0, 0);
+        t.token_budget.total_used = 60_000;
+        let b = ContextBreakdown::from_trace(&t);
+        assert_eq!(b.categories.len(), 1);
+        assert_eq!(b.categories[0].kind.label(), "Unattributed");
+        assert_eq!(b.categories[0].tokens, 60_000);
+        assert_eq!(
+            render_grid_cells(&b)
+                .iter()
+                .filter(|cell| cell.content == "⛁ ")
+                .count(),
+            30
+        );
+    }
 }

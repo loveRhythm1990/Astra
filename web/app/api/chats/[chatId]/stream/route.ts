@@ -702,6 +702,7 @@ export async function POST(
       return runtime.fetchResponse(PATH_CHAT_STREAM, {
         method: "POST",
         auth: "required",
+        retryUnauthorized: true,
         operation: "stream web chat turn",
         signal: backendAbortController.signal,
         json: {

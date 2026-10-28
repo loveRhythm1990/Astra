@@ -171,11 +171,20 @@ impl SessionCapture {
         started_at: chrono::DateTime<chrono::Utc>,
     ) -> Self {
         let invocation_run_ids = self.invocation_run_ids_with_descendants(run_ids, started_at);
+        let mut integrity_errors = self.integrity_errors;
         let events = self
             .events
             .iter()
             .filter(|event| {
                 let Some((run_id, timestamp)) = event_invocation_binding(&event.raw) else {
+                    // Known run ownership does not make unorderable time valid
+                    // invocation evidence. Exclude the row, but preserve the
+                    // uncertainty through subsequent scopes and projections.
+                    if event_run_id(&event.raw)
+                        .is_some_and(|run_id| invocation_run_ids.contains(run_id))
+                    {
+                        integrity_errors = integrity_errors.saturating_add(1);
+                    }
                     return false;
                 };
                 invocation_run_ids.contains(run_id) && timestamp >= started_at
@@ -189,7 +198,7 @@ impl SessionCapture {
             events,
             skipped_lines: self.skipped_lines,
             dropped_lines: self.dropped_lines,
-            integrity_errors: self.integrity_errors,
+            integrity_errors,
         }
     }
 
@@ -684,6 +693,14 @@ impl SessionCapture {
         self.collect_tool_calls(true)
     }
 
+    /// Shared count for the journal outcome assertion and its safe progress diagnostic.
+    pub(crate) fn journal_tool_outcome_count(&self, name: &str, ok: bool) -> usize {
+        self.journal_tool_calls()
+            .iter()
+            .filter(|call| call.name == name && call.ok == Some(ok))
+            .count()
+    }
+
     // Turn summaries may include child observations without per-call ownership.
     // Keep them for journal display, but only round witnesses certify execution.
     fn collect_tool_calls(&self, include_turn_summaries: bool) -> Vec<JournalToolCall> {
@@ -1036,21 +1053,28 @@ fn materialize_persisted_tool_results(
 /// Canonical session events carry RFC3339 `ts` plus metadata.run_id. Typed
 /// StepEvent artifacts carry run_id and epoch-ms created_at on the event
 /// itself. No session/task/step label is accepted as a substitute identity.
-fn event_invocation_binding(
+pub(crate) fn event_invocation_binding(
     raw: &serde_json::Value,
 ) -> Option<(&str, chrono::DateTime<chrono::Utc>)> {
     let run_id = event_run_id(raw)?;
+    Some((run_id, event_timestamp(raw)?))
+}
+
+/// Producer UTC wall-clock time shared by canonical and typed step rows.
+/// This permits captured-time comparison across merged artifacts, not a
+/// causal ordering guarantee across producers. Invalid/missing time is unknown.
+pub(crate) fn event_timestamp(raw: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>> {
     let logical = logical_event(raw);
 
     if let Some(ts) = raw.get("ts").and_then(|value| value.as_str()) {
         let timestamp = chrono::DateTime::parse_from_rfc3339(ts)
             .ok()?
             .with_timezone(&chrono::Utc);
-        return Some((run_id, timestamp));
+        return Some(timestamp);
     }
     let created_at = logical.get("created_at").and_then(|value| value.as_u64())?;
     let created_at = i64::try_from(created_at).ok()?;
-    Some((run_id, chrono::DateTime::from_timestamp_millis(created_at)?))
+    chrono::DateTime::from_timestamp_millis(created_at)
 }
 
 fn logical_event_id(raw: &serde_json::Value) -> Option<&str> {
@@ -1362,7 +1386,7 @@ fn session_artifact_paths_for_owners(
 /// `{artifact_kind: "step_event", payload: {event_type, payload}}`. Consumers
 /// reason about the logical event in both cases, so unwrap only the explicit
 /// artifact envelope and leave all legacy journal records unchanged.
-fn logical_event(value: &serde_json::Value) -> &serde_json::Value {
+pub(crate) fn logical_event(value: &serde_json::Value) -> &serde_json::Value {
     if value.get("artifact_kind").and_then(|kind| kind.as_str()) == Some("step_event") {
         value.get("payload").unwrap_or(value)
     } else {
@@ -1785,6 +1809,14 @@ pub fn load_session_from_path_with_caps(
         match serde_json::from_str::<serde_json::Value>(line) {
             Ok(v) => {
                 let raw_logical = logical_event(&v);
+                if is_step_event_type(raw_logical) && event_timestamp(raw_logical).is_none() {
+                    // StepEvent's u64 representation admits timestamps that
+                    // the invocation time domain cannot represent. Reject
+                    // them here instead of silently losing them during scope.
+                    skipped = skipped.saturating_add(1);
+                    integrity_errors = integrity_errors.saturating_add(1);
+                    continue;
+                }
                 if is_step_event_type(raw_logical)
                     && (event_id(raw_logical).is_none() || !valid_step_event_shape(raw_logical))
                 {
@@ -1864,6 +1896,44 @@ pub fn load_session_from_path_with_caps(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn invocation_scope_preserves_unorderable_related_event_uncertainty() {
+        use super::{JournalEvent, SessionCapture};
+        use serde_json::json;
+        for bad in [
+            json!({"run_id":"root", "created_at":u64::MAX}),
+            json!({"producer_scope":{"run_id":"root"}, "ts":"invalid-time"}),
+            json!({"metadata":{"run_id":"root"}}),
+        ] {
+            let capture = SessionCapture {
+                events: vec![
+                    JournalEvent {
+                        event_type: "LlmRoundFailed".into(),
+                        raw: json!({"run_id":"root", "created_at":50}),
+                    },
+                    JournalEvent {
+                        event_type: "LlmRoundFailed".into(),
+                        raw: bad,
+                    },
+                    JournalEvent {
+                        event_type: "LlmRoundFailed".into(),
+                        raw: json!({"run_id":"unrelated", "created_at":u64::MAX}),
+                    },
+                ],
+                ..Default::default()
+            };
+            let scoped =
+                capture.scoped_to_invocation(&["root".into()], chrono::DateTime::UNIX_EPOCH);
+            assert_eq!(scoped.events.len(), 1);
+            assert_eq!(scoped.integrity_errors, 1);
+            assert!(scoped.has_integrity_errors());
+            let scoped_again =
+                scoped.scoped_to_invocation(&["root".into()], chrono::DateTime::UNIX_EPOCH);
+            assert_eq!(scoped_again.events.len(), 1);
+            assert_eq!(scoped_again.integrity_errors, 1);
+        }
+    }
 
     #[test]
     fn execution_records_require_names_and_actual_round_witnesses() {

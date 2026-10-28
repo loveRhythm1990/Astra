@@ -97,8 +97,30 @@ impl RuntimeConfigLayer {
     }
 
     pub fn from_toml(source: &str) -> Result<Self, OverlayError> {
-        let config: RuntimeConfig = toml::from_str(source)?;
+        Self::from_toml_value(toml::from_str(source)?)
+    }
+
+    /// Parse a TOML layer that may not set `sections`. They are dropped before
+    /// typed validation, so a malformed disallowed section cannot reject the
+    /// rest of the layer. Returns the sections the source actually carried.
+    pub fn from_toml_without_sections(
+        source: &str,
+        sections: &[&'static str],
+    ) -> Result<(Self, Vec<&'static str>), OverlayError> {
         let mut value: toml::Value = toml::from_str(source)?;
+        let removed = match value.as_table_mut() {
+            Some(table) => sections
+                .iter()
+                .copied()
+                .filter(|section| table.remove(*section).is_some())
+                .collect(),
+            None => Vec::new(),
+        };
+        Ok((Self::from_toml_value(value)?, removed))
+    }
+
+    fn from_toml_value(mut value: toml::Value) -> Result<Self, OverlayError> {
+        let config: RuntimeConfig = value.clone().try_into()?;
         // TOML supports non-finite floats, JSON does not. Preserve the existing
         // trace normalization before conversion instead of turning them into null.
         if let Some(rate) = value

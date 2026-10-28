@@ -248,6 +248,10 @@ check results, not a claimed root-cause analysis. Raw prompts, tool/provider bod
 and free-form judge diagnostics remain private; public artifacts do not include
 them. Checks without a safe numeric projection explicitly say that their detailed
 payload is withheld. Full private diagnostics remain in the local suite report.
+Journal tool-outcome count failures publish only the expected bounds and actual
+count, using the same deduplicated records as the verdict. Tool arguments,
+results, and file contents remain private; an unavailable capture reports no
+count instead of inventing zero.
 
 Prompt-cache scope checks retain their grading-time observation count, post-cold
 cache-read sum, and bounded per-execution capture status, identity-match flags,
@@ -405,7 +409,7 @@ loss or file-write failure cancels via the existing runner and fails closed.
 Selected custom source revisions must support this option and the repository
 helper; unsupported sources fail explicitly, without an old-log fallback.
 
-Progress uses `astra.harness_progress.v5`. Unavailable judges report the canonical
+Progress uses `astra.harness_progress.v8`. Unavailable judges report the canonical
 error kind and a fixed failure stage; unknown causes remain `unknown`. Required
 quorum failures retain the first typed cause and still fail closed. Raw errors
 and individual vote diagnostics remain private. Argument failures include bounded
@@ -1084,6 +1088,65 @@ This distinction is important for unhappy-path diagnosis: a long queue wait is
 harness scheduling pressure, a heartbeat without new typed evidence is an
 efficiency/non-convergence signal, and a terminal report with incomplete
 evidence is never promoted to success merely because the process stayed alive.
+
+The CI safe progress stream (`astra.harness_progress.v8`) includes an
+`execution_diagnostic` on each terminal row and step. Failed rows print it in
+the job log and summary, and retain it in `summary.json` and
+`progress.safe.jsonl`. It preserves recognized terminal state, interruption,
+error kind/code, admission status, and available journal/live-stream event
+counts and the last captured row's event type (`last_event`, in artifact merge
+order for journals). Unknown tags become `other`; missing capture
+remains `null`. The journal's last provider failure retains its typed error,
+admission/provider/settlement stage, deadline phase, dispatch/completion flags,
+and whether its reported run matches the root or another run. Failure ordering
+uses producer UTC wall-clock time (`ts` in canonical rows, epoch-millisecond
+`created_at` in typed step rows), not artifact merge order. This is captured
+time ordering, not proof of causality across producers. `last_provider_failure`
+is `null` when there are no captured failures, the capture is incomplete
+(skipped/truncated rows or integrity errors), any retained failure lacks a valid
+timestamp, or the latest timestamp has conflicting safe failure projections.
+The loader rejects typed events with missing or unrepresentable producer time
+and records capture corruption. Invocation scoping also marks reliably owned
+but unorderable rows as corrupt before excluding them; further scopes retain
+that uncertainty. Invalid rows never become certified invocation evidence.
+Retained-event counters and corruption/truncation counters remain visible;
+they do not reconstruct dropped failures. A failed-event tag remains a failure
+observation even when its optional error kind is missing; a successful completed
+event's null error kind does not replace a failure. Per-step journals require matching
+session and run identities and use the canonical invocation scope, including
+causally linked descendants; an unavailable association remains `null` rather
+than borrowing another step's journal. This is a
+captured observation, not a root-cause verdict. No stderr, response bodies,
+event text, identities, or tool arguments are published. Live termination counters count observed events,
+not unique children or verified adoption, and captured events may be partial.
+Diagnostic fields do not regrade outcomes or change runtime retries/timeouts.
+Corrupt captures fail closed for durable evidence and session cleanup.
+The journal also projects `loop_boundaries`: counts of recognized model-round
+finish reasons and direct-child dependency outcomes, grouped as root, another
+run, or unattributed. This distinguishes recovery loops, superseded responses,
+and result staging/adoption without publishing trace attributes or identities.
+Missing entries mean no such observation was captured, not proof that the
+underlying transition did not happen.
+In particular, a cancellation observed after an outer timeout is not proof of
+the original failure cause. Push a new commit to exercise new diagnostics;
+rerunning an older workflow run still checks out that run's original PR SHA.
+
+Journal call-count failures additionally publish numeric `journal_count` evidence:
+scoped candidates, outcome matches, final matches, and disjoint missing/type/value
+mismatch counts. The evaluator produces these counters while deciding the verdict;
+the progress reporter does not reconstruct them from error text. Use the reported
+criterion index to find the predicate in the case YAML. Tool arguments, JSON paths,
+expected/actual values, commands and output text are not copied into this diagnostic.
+Journal success-ratio failures publish successes, failures, pending calls, the
+allowed-failure allowance and adjusted denominator. Pending calls are excluded from
+the ratio, and a zero denominator means zero, exactly as in the assertion.
+
+A rejected LLM acceptance verdict is distinct from an unavailable judge. The current
+acceptance protocol does not record structured rejection reasons; CI says so instead
+of inferring a reason or publishing raw response prose. These diagnostics do not
+change thresholds, classify a failure as flaky, or retry until a case passes.
+Compare separate run attempts when investigating repeatability; retain each failure.
+
 
 ## Preflight checks
 

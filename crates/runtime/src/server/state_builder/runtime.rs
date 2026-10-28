@@ -6,6 +6,7 @@ pub(super) async fn build_runtime_wiring(
     shared_pool: &SharedPool,
     run_encryptor: &Arc<FernetTokenEncryptor>,
     state: &AppState,
+    memoria_port: Option<Arc<dyn astra_memoria::MemoriaPort>>,
 ) -> Result<RuntimeWiring, Box<dyn std::error::Error>> {
     let run_store = Arc::new(astra_services::runs::DatabaseRunStateStore::new(
         shared_pool.clone(),
@@ -30,16 +31,6 @@ pub(super) async fn build_runtime_wiring(
         )),
         delegation_tracker.clone(),
     ));
-    let memoria_port = state.auth_service.memoria_credentials().map(|resolver| {
-        let mut port =
-            crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::template(resolver);
-        if settings.memoria.allows_self_hosted_master_fallback()
-            && let Some(master_key) = settings.memoria.master_key.clone()
-        {
-            port = port.with_self_hosted_fallback(settings.memoria.base_url.clone(), master_key);
-        }
-        Arc::new(port) as Arc<dyn astra_memoria::MemoriaPort>
-    });
     let matrix_rt = Arc::new(
         crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(shared_pool.clone(), "default")
             .with_encryptor(Arc::clone(run_encryptor), memoria_port),
@@ -268,4 +259,21 @@ pub(super) fn default_agent_profile_registry() -> astra_services::AgentProfileRe
     let _ = profile_registry.register(writer);
 
     profile_registry
+}
+
+/// One authority template for prompt recall, session writes and observation.
+pub(super) fn build_memoria_port(
+    settings: &AppSettings,
+    state: &AppState,
+) -> Option<Arc<dyn astra_memoria::MemoriaPort>> {
+    state.auth_service.memoria_credentials().map(|resolver| {
+        let mut port =
+            crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::template(resolver);
+        if settings.memoria.allows_self_hosted_master_fallback()
+            && let Some(master_key) = settings.memoria.master_key.clone()
+        {
+            port = port.with_self_hosted_fallback(settings.memoria.base_url.clone(), master_key);
+        }
+        Arc::new(port) as Arc<dyn astra_memoria::MemoriaPort>
+    })
 }

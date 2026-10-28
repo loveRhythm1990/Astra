@@ -5896,25 +5896,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             return Err(e);
         }
         AgenticIngestIterationControl::BreakLoop => {
-            // A successful provider response with neither tool calls nor text
-            // is not a completed user turn while budget remains. Retry once in
-            // an explicitly text-only settlement mode. This handles transient
-            // empty provider responses inside the runtime instead of exposing
-            // an internal `empty_completion` reason and asking the user to
-            // manually drive a continuation.
-            if should_retry_textless_response(state, &turn_result) {
-                begin_textless_response_retry(state);
-                record_early_exit_llm_round(
-                    state,
-                    &turn_result,
-                    prep.turn_start_time,
-                    Some("textless_response_retry"),
-                );
-                state.step_recorder.end_turn(false);
-                try_write_heavy_checkpoint(state);
-                return Ok(TurnExecutionControl::ContinueLoop);
-            }
-
             // An authoritative interruption is a terminal boundary for this
             // turn.  Do not let user-intent polling or completion obligations
             // reopen another provider call after the host has already
@@ -5970,6 +5951,29 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     Some("runtime_input_arrived_before_settlement"),
                 );
                 state.step_recorder.end_turn(false);
+                return Ok(TurnExecutionControl::ContinueLoop);
+            }
+
+            // Child results, replies and newly accepted guidance must reach
+            // the model before spending its one final-answer recovery. A blank
+            // response while a child is running is an input wait, not a reason
+            // to hide coordination tools or consume the synthesis retry.
+            // A successful provider response with neither tool calls nor text
+            // is not a completed user turn while budget remains. Retry once in
+            // an explicitly text-only settlement mode. This handles transient
+            // empty provider responses inside the runtime instead of exposing
+            // an internal `empty_completion` reason and asking the user to
+            // manually drive a continuation.
+            if should_retry_textless_response(state, &turn_result) {
+                begin_textless_response_retry(state);
+                record_early_exit_llm_round(
+                    state,
+                    &turn_result,
+                    prep.turn_start_time,
+                    Some("textless_response_retry"),
+                );
+                state.step_recorder.end_turn(false);
+                try_write_heavy_checkpoint(state);
                 return Ok(TurnExecutionControl::ContinueLoop);
             }
 
@@ -9039,6 +9043,122 @@ mod tests {
                 "budget {remaining:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn textless_parent_waits_for_child_before_spending_final_answer_recovery() {
+        let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "parent-run",
+            "child-agent",
+        );
+        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            applied_user_intents: Vec::new(),
+            agent_id: "child-agent".into(),
+            run_id: "child-run".into(),
+            parent_agent_id: "parent-agent".into(),
+            status: crate::orchestration::AgentStatus::Running {
+                activity: "reading workspace".into(),
+            },
+        });
+        let mut host = MockHost::new(vec![
+            text_result("", 10, 0, Some(1)),
+            text_result("", 10, 0, Some(1)),
+            text_result("2024, from the child's workspace evidence.", 10, 8, Some(1)),
+        ]);
+        host.direct_child_owner = Some(Arc::clone(&owner));
+        let mut state = make_state();
+        state.current_run_id = Some("parent-run".into());
+
+        let control = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(false))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(control, TurnExecutionControl::WaitForInput),
+            "an outstanding child owns the next input; final-answer recovery must wait"
+        );
+        assert!(
+            !state.hooks.completion_settlement.text_only,
+            "waiting for a child must not hide coordination tools needed to answer its questions"
+        );
+        assert_eq!(
+            state.hooks.completion_settlement.textless_response_retries,
+            0
+        );
+        assert!(owner.has_pending_direct_children());
+
+        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            applied_user_intents: Vec::new(),
+            agent_id: "child-agent".into(),
+            run_id: "child-run".into(),
+            parent_agent_id: "parent-agent".into(),
+            status: crate::orchestration::AgentStatus::Completed {
+                result: "2024, from Cargo.toml [workspace.package].".into(),
+                finish_reason: None,
+            },
+        });
+        let control = execute_turn_and_ingest_phase(&mut host, &mut state, 1, prep(false))
+            .await
+            .unwrap();
+        assert!(matches!(control, TurnExecutionControl::ContinueLoop));
+        assert_eq!(
+            state.hooks.completion_settlement.textless_response_retries,
+            1
+        );
+        assert!(state.hooks.completion_settlement.text_only);
+        assert!(!owner.has_pending_direct_children());
+        assert!(host.executed_volatile[1].iter().any(|entry| {
+            entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+                && entry.payload["children"][0]["result"]
+                    == "2024, from Cargo.toml [workspace.package]."
+        }));
+
+        let control = execute_turn_and_ingest_phase(&mut host, &mut state, 2, prep(false))
+            .await
+            .unwrap();
+        assert!(matches!(
+            control,
+            TurnExecutionControl::Return(AgenticLoopOutcome::Completed)
+        ));
+        assert_eq!(host.text_only_turns, vec![false, false, true]);
+        super::super::finalization::finalize_and_render(&mut host, &mut state).await;
+        assert!(state.interruption.is_none());
+        assert_eq!(
+            state.final_text,
+            "2024, from the child's workspace evidence."
+        );
+        assert_eq!(
+            host.rendered_final_text,
+            vec!["2024, from the child's workspace evidence."]
+        );
+    }
+
+    #[tokio::test]
+    async fn textless_parent_waits_for_pending_reply_without_consuming_recovery() {
+        let mut state = make_state();
+        state.current_run_id = Some("parent-run".into());
+        state
+            .messaging
+            .reply_obligations
+            .reserve(
+                "parent-run",
+                "question",
+                astra_messaging::AgentAddress::new("child-run", "child-agent"),
+            )
+            .unwrap();
+        let mut host = MockHost::new(vec![text_result("", 10, 0, Some(1))]);
+
+        let control = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(false))
+            .await
+            .unwrap();
+
+        assert!(matches!(control, TurnExecutionControl::WaitForInput));
+        assert_eq!(
+            state.hooks.completion_settlement.textless_response_retries,
+            0
+        );
+        assert!(!state.hooks.completion_settlement.text_only);
+        assert!(state.messaging.reply_obligations.has_pending("parent-run"));
     }
 
     #[tokio::test]

@@ -203,6 +203,12 @@ retain the canonical identity files alongside any isolated cache. A writable
 existing identity preflight reports this prerequisite before turn admission;
 do not delete identity files or login credentials as a repair step.
 
+`ASTRA_LOCAL_STATE_ROOT` relocates user-level state, including the user
+configuration, permissions and workspace trust, so it must be set in the
+launching shell. The CLI exits with an error when a workspace `.env` supplies it,
+as it does for `MOI_AUTH_DIR`. The same applies to `HOME`, the fallback root for
+all of these state locations, when the launching environment does not set it.
+
 The configuration editor saves user defaults under `ASTRA_LOCAL_STATE_ROOT/config/runtime.toml`
 when that root is set, otherwise under `~/.astra/config/runtime.toml`; local versions
 live in the adjacent `versions` directory. Saving defaults retains invocation CLI settings
@@ -285,6 +291,71 @@ Diagnostic DB history is controlled through `runtime.toml` trace categories, not
 Provider admission is intentionally configured by capacity inputs only. Scope is fixed at provider level; window size, retention, cleanup cadence, burst, and fail-closed behavior are internal runtime policy rather than deployment knobs.
 
 Server-loop Memoria observer and post-loop memory cleanup are fixed internal async best-effort side effects with bounded in-process concurrency. They are intentionally not environment-configurable; they must not hold run admission slots or become deployment-specific tuning surfaces.
+
+### Local `web_fetch` behind fake-IP DNS
+
+Edge/CLI `web_fetch` and `web_search` block destinations that resolve to a
+known private or reserved address, including `198.18.0.0/15`. Local VPN/proxy tools
+in fake-IP mode (Clash/mihomo, Surge, sing-box) answer every lookup from that
+range, so every fetch is blocked. Users on such a network can relax the
+private-network boundary for fake-IP answers in the user-level
+`~/.astra/config/runtime.toml`:
+
+```toml
+[web_fetch]
+fake_ip = "allow_doh_screened"                   # block (default) or allow_doh_screened
+doh_resolvers = ["https://1.12.12.12/dns-query"] # required, tried in order
+# fake_ip_ranges = ["198.18.0.0/16"]             # optional, within 198.18.0.0/15
+```
+
+This is a relaxation, not a verification. When every address from the local
+DNS lies in an IPv4 fake range, the fetch goes to the fake address and the VPN
+resolves the hostname and picks the real destination; Astra cannot see or
+check it. Before allowing the fetch, Astra screens the hostname by asking the
+resolvers (RFC 8484) for A and AAAA records and blocks it if any falls in
+Astra's blocked address ranges. The list is not an exhaustive registry of all
+special-purpose addresses; broader classification is tracked in #1140.
+Resolvers are tried in order when one is unreachable, gives
+an unusable response, or returns no address. Literal fake addresses and hosts
+with no usable resolver answer stay blocked, and a private address reported for either
+record type blocks the fetch even if the other query failed. There is no
+built-in resolver: pick one your network does not block, because many networks
+that use fake-IP DNS also block well-known DoH endpoints. Resolver URLs must
+not contain userinfo; paths and query parameters may contain sensitive values,
+and errors name a resolver only by its position and host.
+The `0.0.0.0/8` this-network range is also blocked, including when embedded in
+IPv4-mapped or NAT64 IPv6 addresses.
+
+Only IPv4 fake answers are supported. IPv6 fake-IP ranges (for example
+`2001:2::/48`, used in sing-box's documented configuration) and answers that mix
+fake addresses with real ones, such as an IPv4 fake address next to a public
+IPv6 address, are rejected with an "unsupported" error whether or not the option
+is enabled. Configure the VPN to answer with IPv4 fake addresses only if you
+need this option.
+
+Only the user-level file and an explicit `--settings` overlay can set this
+section. A project `.astra/config/runtime.toml` cannot; the section is ignored
+with a warning, and the config editor omits it when saving project defaults.
+If the project and user file are the same file, save as user defaults instead.
+User defaults and local config-version blobs are written with private file
+permissions on Unix. There is intentionally no environment variable, because the CLI
+loads `.env` from the working directory. For the same reason a workspace `.env`
+cannot set `ASTRA_LOCAL_STATE_ROOT` or a missing `HOME`, which locate the
+user-level file. Server
+`web_fetch` never reads the section. An invalid resolver or fake-IP range
+keeps the default block and reports the configuration error when a fake-IP
+host is fetched. A syntactically invalid user file is rejected as a whole;
+use `--diagnostic-log` to see the configuration-loader warning.
+
+Screening does not bind the VPN's destination. A hostname that answers the
+resolver with a public address and the VPN's DNS with a private one (DNS
+rebinding by an attacker-controlled domain, or split-horizon DNS) passes the
+screen, and the VPN then connects to the private address. With this option on,
+Edge/CLI `web_fetch` therefore no longer guarantees that requests stay off
+private networks for hosts answered with fake addresses; it relies on the VPN's
+routing instead. Keep it at `block` unless fake-IP DNS blocks web access. Like other Astra
+configuration, the file is protected from agent writes only by the permission
+mode: Bypass, or Auto with `allow_sensitive_path_writes`, lets the agent edit it.
 
 ### Observability
 

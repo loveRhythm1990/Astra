@@ -7,6 +7,9 @@
 //! `tests/system_matrix_http_e2e.rs` setup; journey logic lives in `journey_*.rs`. See
 //! `docs/testing/system-e2e-matrix.md` for the capability ↔ route ↔ test mapping.
 
+#[path = "../support/memoria_observer_auth.rs"]
+mod memoria_observer_auth;
+
 use std::sync::Arc;
 
 use astra_core::SharedPool;
@@ -172,6 +175,13 @@ pub fn build_e2e_access_token(user_id: &str, username: &str, exp_unix: u64) -> S
     )
 }
 
+const MOCK_MEMORIA_MASTER_KEY: &str = "system-e2e-mock-master-key";
+
+fn bind_mock_memoria(settings: &mut astra_core::MemoriaSettings, base_url: String) {
+    settings.base_url = base_url;
+    settings.master_key = Some(MOCK_MEMORIA_MASTER_KEY.to_owned());
+}
+
 async fn build_state(
     memoria: Arc<E2eMemoriaStub>,
     memoria_base_url: String,
@@ -186,7 +196,7 @@ async fn build_state(
     // independently of the forwarder replaced below. Bind every client to
     // the fixture before construction; never let this mock-provider suite
     // observe or mutate the Memoria service configured in a developer's env.
-    settings.memoria.base_url = memoria_base_url;
+    bind_mock_memoria(&mut settings.memoria, memoria_base_url);
     let matrixone_database = settings.matrixone.database.clone();
     let url = settings.matrixone.database_url_with_password();
     let state = build_server_state(settings).await;
@@ -253,7 +263,18 @@ impl MemoriaForwarder for E2eMemoriaStub {
 
 async fn start_mock_memoria() -> String {
     let app = Router::new()
-        .route("/v1/observe", post(|| async { StatusCode::NO_CONTENT }))
+        .route(
+            "/v1/observe",
+            post(|headers: axum::http::HeaderMap| async move {
+                memoria_observer_auth::validate_observer_auth(
+                    &headers,
+                    MOCK_MEMORIA_MASTER_KEY,
+                    None,
+                )
+                .err()
+                .unwrap_or(StatusCode::NO_CONTENT)
+            }),
+        )
         .route(
             "/v1/health/storage",
             get(|| async move {
@@ -309,10 +330,22 @@ async fn mock_memoria_accepts_production_observer_without_blanket_success() {
     use astra_runtime::{DatabaseTurnObserverWorker, TurnObserverRequest, TurnObserverWorker};
 
     let base_url = start_mock_memoria().await;
-    let observer = DatabaseTurnObserverWorker::new(
-        base_url.clone(),
-        Some("system-e2e-mock-master-key".to_string()),
-    );
+    // Mirror build_state: credentials inherited from CI/developer settings
+    // belong to the replaced upstream, not to this strict local mock.
+    let mut settings = astra_core::MemoriaSettings {
+        base_url: "http://127.0.0.1:1".to_owned(),
+        master_key: Some("different-upstream-test-key".to_owned()),
+        self_hosted_master_access: true,
+        issuer: None,
+        web_url: None,
+    };
+    bind_mock_memoria(&mut settings, base_url.clone());
+    let observer = DatabaseTurnObserverWorker::new(Some(Arc::new(
+        astra_runtime::turn::cloud::memoria_compact::HttpMemoriaPort::self_hosted(
+            settings.base_url,
+            settings.master_key.unwrap(),
+        ),
+    )));
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
         observer.run(TurnObserverRequest {
@@ -331,6 +364,33 @@ async fn mock_memoria_accepts_production_observer_without_blanket_success() {
     .await
     .expect("local observer deadline")
     .expect("production observer reaches fixture");
+
+    let rejected = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("{base_url}/v1/observe"))
+        .header(
+            "Authorization",
+            format!("Memoria-Owner {MOCK_MEMORIA_MASTER_KEY}"),
+        )
+        .header("X-Impersonate-User", "fixture-user")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    let foreign_credential = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("{base_url}/v1/observe"))
+        .header("Authorization", "Memoria-Owner different-upstream-test-key")
+        .header("X-User-Id", "fixture-user")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign_credential.status(), StatusCode::UNAUTHORIZED);
 
     let response = reqwest::Client::builder()
         .no_proxy()
@@ -788,41 +848,60 @@ impl MatrixE2eCtx {
     /// assertion pool leaks the `SharedPool` global connection reservation
     /// across subsequent journeys in the same system-E2E binary.
     pub async fn close(&self) {
+        let started = tokio::time::Instant::now();
+        let phase = |name: &str| {
+            eprintln!(
+                "fixture_close_phase={name} elapsed_ms={}",
+                started.elapsed().as_millis()
+            )
+        };
+        phase("heartbeat");
         self.stop_fixture_heartbeat().await;
         // Mirror the production shutdown contract: passive drain owns normal
         // completion and checkpoint persistence; forced stop is only the
         // bounded fallback. Calling stop directly violates its documented
         // precondition and can abort a finalizer while it still owns a pooled
         // database connection.
+        phase("drain_runs");
         if !self
             .app_state
             .drain_background_runs(std::time::Duration::from_secs(2))
             .await
         {
-            let _ = self
-                .app_state
-                .stop_background_runs(std::time::Duration::from_secs(2))
-                .await;
+            phase("stop_runs");
+            assert!(
+                self.app_state
+                    .stop_background_runs(std::time::Duration::from_secs(2))
+                    .await,
+                "fixture background tasks must stop before deleting their session"
+            );
         }
+        phase("delete_session");
         cleanup_session_data(&self.shared_pool, &self.user_id, &self.session_id).await;
+        phase("delete_edge");
         cleanup_edge_registry(&self.pool, &self.user_id, &self.edge_agent_id).await;
         // Each bootstrap creates an isolated mock Offering. Remove it before
         // closing the pool so later memory-extraction/model-resolution paths
         // do not fan out across every stale E2E fixture left in MatrixOne.
+        phase("delete_offering");
         let offering_cleanup = sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
             .bind(&self.model_offering_id)
             .execute(&self.pool)
             .await;
         astra_services::models::invalidate_active_llm_model_resolution_cache();
+        phase("close_assertion_pool");
         self.pool.close().await;
+        phase("close_app_pools");
         self.app_state.close_database_pools().await;
         offering_cleanup.expect("remove Matrix E2E fixture Offering");
+        phase("verify_providers");
         for gateway in self.native_providers.lock().await.iter() {
             gateway.assert_complete();
         }
         if let Some(error) = self.fixture_heartbeat_error.lock().await.take() {
             panic!("Matrix E2E fixture heartbeat failed before cleanup: {error}");
         }
+        phase("completed");
     }
 }
 

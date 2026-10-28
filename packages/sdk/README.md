@@ -161,6 +161,53 @@ already accepted frame to other subscribed callbacks.
 
 ### Browser apps and the BFF pattern
 
+Within one `AstraClient`, concurrent REST, live streams and buffered run-event requests share
+one token refresh. A delayed 401 reuses the rotated token. Refresh responses
+started before `setTokens`, successful login/registration, or logout cannot
+restore the previous credentials or retry an old request under a new account.
+`setTokens(accessToken)` clears any previous refresh token; pass both tokens
+when replacing a credential pair. Pending login and logout operations cannot
+overwrite a newer authentication decision.
+This coordination is per client instance, not across separate BFF requests.
+
+`onTokenRefresh` may be asynchronous and call the same client. Requests already
+awaiting its rotation still wait for the callback, so the callback must not
+await a request that has already joined that rotation. A delayed old-token 401
+returns its original error while that notification is pending or has failed
+without a recovery in progress, so it cannot use credentials whose persistence
+is uncertain. Callback failure
+preserves the rotated credentials in memory. Requests made during notification
+can use the current token, but a 401 does not start another refresh until the
+notification finishes. This prevents overlapping persistence callbacks from
+storing a superseded refresh token. A delayed 401 joins a newer in-flight
+rotation when no notification is active.
+If credentials can be replaced while a callback writes to external storage,
+that storage must use an atomic conditional write or another ordering mechanism
+to prevent an older callback from overwriting newer credentials. Checking
+`getTokens()` before an asynchronous write alone is not sufficient.
+The Web runtime client persists a captured pair only if it still matches that
+instance's current credentials after asynchronous cookie acquisition.
+
+The Web runtime's raw HTTP requests share this SDK refresh owner. Its API URL
+is origin-relative: a pathname suffix is not a gateway prefix. Standalone SDK
+`baseUrl` and `pathPrefix` routing are unchanged. Web refresh or notification
+failure returns the original 401, which its typed adapter converts to a runtime
+error; initial transport errors still propagate.
+
+`fetchResponse(path, init, { auth })` returns an unconsumed response, including
+non-2xx responses, without inferring a JSON content type. Its default auth is
+`"optional"`; `"none"` suppresses default authorization and automatic refresh.
+Explicit request headers still override defaults and are not automatically
+refreshed using the client's credentials. Raw mutation requests are not retried
+unless `retryUnauthorized` is explicitly enabled for an endpoint that rejects
+authentication before admitting the operation. Streams and one-shot bodies
+are never replayed after acceptance. `getTokens()` returns a
+detached snapshot of current credentials, not the initial configuration.
+Bodies must remain replayable for the single automatic retry.
+
+Buffered `getRunEvents` uses the same authenticated request and structured
+`AstraApiError` decoding as REST, including error codes and action hints.
+
 Do not expose long-lived **refresh tokens** in browser-accessible JavaScript.
 The dashboard (`web/`) keeps tokens in **httpOnly cookies** and routes browser
 requests through explicit **Next.js Route Handlers** such as `/api/chats`,

@@ -428,11 +428,30 @@ describe("AstraClient — Runs", () => {
       'data: {"type":"turn_complete"}\n\n';
     globalThis.fetch = mockFetch(200, sse);
 
-    const events = await createClient().getRunEvents("r1", 5);
+    const client = new AstraClient({
+      baseUrl: "http://localhost:8000", pathPrefix: "/api", accessToken: "current-token",
+      headers: { accept: "application/json", AUTHORIZATION: "Bearer stale-token", "X-Custom": "preserved" },
+    });
+    const events = await client.getRunEvents("r1", 5);
     expect(events).toHaveLength(2);
     expect(
       (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
-    ).toContain("last_index=5");
+    ).toBe("http://localhost:8000/api/chat/runs/r1/stream?last_index=5");
+    const headers = new Headers((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].headers);
+    expect(headers.get("Accept")).toBe("text/event-stream");
+    expect(headers.get("Authorization")).toBe("Bearer current-token");
+    expect(headers.get("X-Custom")).toBe("preserved");
+  });
+
+  test("getRunEvents preserves structured API errors", async () => {
+    globalThis.fetch = mockFetch(429, {
+      detail: "Try later", code: "rate_limited", category: "capacity",
+      retryable: true, action_hints: ["retry_later"],
+    }, { "Content-Type": "application/json" });
+    await expect(createClient().getRunEvents("r1")).rejects.toMatchObject({
+      status: 429, body: "Try later", path: "/chat/runs/r1/stream?last_index=0",
+      code: "rate_limited", category: "capacity", retryable: true, actionHints: ["retry_later"],
+    });
   });
 
   test("getSessionConversation preserves typed input identity and raw cursors", async () => {

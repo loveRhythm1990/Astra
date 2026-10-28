@@ -1932,7 +1932,18 @@ async fn execute_cli_command_impl(
                     .magenta()
                     .bold()
             );
-            if args.username.is_some() || args.password.is_some() {
+            if args.device_code {
+                if profile.is_some() {
+                    return Err(
+                        "Device code sign-in requires MOI UC login without --profile".into(),
+                    );
+                }
+                let method = crate::cli::auth_flow::discover_login_method(api, None).await?;
+                let crate::cli::auth_flow::LoginMethod::Uc(discovery) = method else {
+                    return Err("This server does not support MOI device code sign-in".into());
+                };
+                crate::cli::auth_flow::uc::login_device_code(api, discovery).await?;
+            } else if args.username.is_some() || args.password.is_some() {
                 let username = prompt_or("Username", args.username)?;
                 let password = prompt_password_masked("Password", args.password)?;
                 do_login(api, profile.as_deref(), &username, &password).await?;

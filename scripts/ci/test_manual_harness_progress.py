@@ -23,6 +23,12 @@ def supervised(command):
             "--identity", "manual-progress-test", "--", *command]
 
 
+def execution_diagnostic():
+    return {"final_state":None, "interruption_kind":None, "error_kind":None,
+            "error_code":None, "server_admission_not_dispatched":False,
+            "stream":None, "journal":None}
+
+
 def row(name, status="passed"):
     checks = [{"type":"judger", "severity":"quality", "score":None,
                "passed":None, "evaluation":"unscored", "diagnostic":None},
@@ -32,8 +38,9 @@ def row(name, status="passed"):
             "has_warnings":False, "failure_class":None if status == "passed" else "Unknown",
             "exit_code":0 if status == "passed" else 1, "criteria":checks,
             "steps":[{"step_index":0, "passed":status == "passed", "duration_ms":100,
-                      "criteria":[dict(c) for c in checks]}],
-            "token_usage_coverage":None, "terminal_reported":dict.fromkeys(h.METRICS, 10)}
+                      "criteria":[dict(c) for c in checks], "execution_diagnostic":execution_diagnostic()}],
+            "token_usage_coverage":None, "terminal_reported":dict.fromkeys(h.METRICS, 10),
+            "execution_diagnostic":execution_diagnostic()}
 
 
 def events(statuses=("passed", "passed")):
@@ -58,6 +65,106 @@ def write_events(root, data, tail=b""):
 
 
 class ManualHarnessProgressTests(unittest.TestCase):
+    def test_execution_diagnostics_survive_failed_summary_without_regrading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = events(("failed",))
+            result = next(e["row"] for e in data if e["type"] == "case_completed")
+            diagnostic = result["execution_diagnostic"]
+            diagnostic.update(final_state="failed", error_kind="contract_violation",
+                              error_code="canonical_persistence_failed")
+            diagnostic["stream"] = {"identity_verified":True, "has_diagnostics":False, "last_event":"terminated_completed",
+                                    "event_counts":{"run_started":1, "terminated_completed":1}}
+            diagnostic["journal"] = {"skipped_lines":0, "dropped_lines":0, "integrity_errors":0,
+                                     "last_event":"turn_error", "event_counts":{"turn_error":1},
+                                     "loop_boundaries":{"llm_round":{"root":{"textless_response_retry":1}}, "child_barrier":{"root":{"results_adopted":1}}},
+                                     "last_provider_failure":{
+                                         "event":"llm_round_failed", "run_scope":"root",
+                                         "error_kind":"provider_deadline", "failure_stage":"provider",
+                                         "deadline_phase":"waiting_provider_response",
+                                         "dispatch_started":True, "provider_completed":False}}
+            write_events(root, data)
+            (root / "report.json").write_text("private-sentinel")
+            (root / "execution.json").write_text(json.dumps({"exit_code":1, "termination":"finished"}))
+            code, summary = self.publish(root, "failure", cli=True)
+            self.assertEqual(code, 1)
+            self.assertIsNone(summary["observation_error"])
+            self.assertEqual(summary["runs"][0]["execution_diagnostic"], diagnostic)
+            self.assertEqual(summary["runs"][0]["status"], "failed")
+            self.assertEqual(summary["runs"][0]["exit_code"], 1)
+            self.assertIn("contract_violation", (root / "job-summary").read_text())
+            self.assertIn("terminated_completed", (root / "job-summary").read_text())
+            self.assertIn("waiting_provider_response", (root / "job-summary").read_text())
+            self.assertIn("results_adopted", (root / "job-summary").read_text())
+            self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
+
+    def test_step_journal_diagnostics_survive_summary_without_borrowing_root_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = events(("failed",))
+            result = next(e["row"] for e in data if e["type"] == "case_completed")
+            journal = {"skipped_lines":0, "dropped_lines":0, "integrity_errors":0,
+                       "last_event":"llm_round_failed", "event_counts":{"llm_round_failed":1},
+                       "loop_boundaries":{"llm_round":{}, "child_barrier":{}},
+                       "last_provider_failure":{
+                           "event":"llm_round_failed", "run_scope":"root", "error_kind":"provider_deadline",
+                           "failure_stage":"provider", "deadline_phase":"waiting_provider_response",
+                           "dispatch_started":True, "provider_completed":False}}
+            result["steps"][0]["execution_diagnostic"]["journal"] = journal
+            result["execution_diagnostic"]["error_kind"] = "auth"
+            unknown = {**journal, "last_provider_failure":None, "integrity_errors":1, "skipped_lines":1}
+            result["steps"].append({**result["steps"][0], "step_index":1,
+                "execution_diagnostic":{**execution_diagnostic(), "journal":unknown}})
+            write_events(root, data)
+            (root / "execution.json").write_text(json.dumps({"exit_code":1, "termination":"finished"}))
+            code, summary = self.publish(root, "failure", cli=True)
+            self.assertEqual(code, 1)
+            self.assertIsNone(summary["observation_error"])
+            projected = summary["runs"][0]
+            self.assertEqual(projected["execution_diagnostic"]["error_kind"], "auth")
+            self.assertEqual(projected["steps"][0]["execution_diagnostic"]["journal"], journal)
+            self.assertEqual(projected["steps"][1]["execution_diagnostic"]["journal"], unknown)
+            self.assertIn("waiting_provider_response", (root / "job-summary").read_text())
+
+    def test_execution_diagnostics_reject_private_tags_and_extra_payload(self):
+        h.safe_execution_diagnostic(execution_diagnostic())
+        for key in ("final_state", "interruption_kind", "error_kind", "error_code", "detail"):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                h.safe_execution_diagnostic({**execution_diagnostic(), key:"private-sentinel"})
+        stream = {"identity_verified":True, "has_diagnostics":False, "last_event":"terminated_completed",
+                  "event_counts":{"terminated_completed":1}}
+        for changes in ({"last_event":"private-sentinel"}, {"reason":"private-sentinel"},
+                        {"event_counts":{"private-sentinel":1}},
+                        {"event_counts":{"terminated_completed":True}}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                h.safe_execution_diagnostic({**execution_diagnostic(), "stream":{**stream, **changes}})
+        result = row("case", "failed")
+        result["steps"][0]["execution_diagnostic"]["error_code"] = "private-sentinel"
+        with self.assertRaises(ValueError):
+            h.safe_row(result)
+        failure = {"event":"llm_round_failed", "run_scope":"root", "error_kind":"provider_deadline",
+                   "failure_stage":"provider", "deadline_phase":"waiting_provider_response",
+                   "dispatch_started":True, "provider_completed":False}
+        journal = {"skipped_lines":0, "dropped_lines":0, "integrity_errors":0,
+                   "last_event":"llm_round_failed", "event_counts":{"llm_round_failed":1},
+                   "last_provider_failure":failure, "loop_boundaries":{"llm_round":{}, "child_barrier":{}}}
+        for key in ("run_scope", "error_kind", "failure_stage", "deadline_phase", "message"):
+            with self.subTest(provider_field=key), self.assertRaises(ValueError):
+                h.safe_execution_diagnostic({**execution_diagnostic(), "journal":{
+                    **journal, "last_provider_failure":{**failure, key:"private-sentinel"}}})
+
+    def test_loop_boundaries_reject_private_scopes_reasons_and_invalid_counts(self):
+        valid = {"llm_round":{"root":{"textless_response_retry":1}},
+                 "child_barrier":{"other_run":{"results_adopted":1}}}
+        h.safe_loop_boundaries(valid)
+        for changes in ({"llm_round":{"private-sentinel":{"stop":1}}},
+                        {"llm_round":{"root":{"private-sentinel":1}}},
+                        {"child_barrier":{"root":{"results_adopted":True}}},
+                        {"child_barrier":{"root":{"results_adopted":-1}}},
+                        {"detail":"private-sentinel"}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                h.safe_loop_boundaries({**valid, **changes})
+
     def test_cache_scope_evidence_survives_summary_without_regrading(self):
         diagnostic = {"kind":"cache_scope", "scope":"conversation_turns",
                       "observations":None, "post_cold_cache_read_tokens":None,
@@ -95,6 +202,49 @@ class ManualHarnessProgressTests(unittest.TestCase):
                         {"executions":[{"capture":"private-sentinel"}]}]:
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 h.safe_diagnostic(dict(valid, **changes), 0)
+
+    def test_journal_diagnostics_survive_public_summary_without_raw_payload(self):
+        diagnostics = [
+            ("journal_tool_call_count", {"kind":"journal_count", "min":1, "max":1,
+             "actual":2, "considered":5, "outcome_matches":5, "missing":1,
+             "type_mismatch":1, "value_mismatch":1}, "observed 2"),
+            ("journal_tool_success_ratio", {"kind":"journal_ratio", "min":0.9,
+             "min_calls":3, "allowed_failures":1, "terminal":4, "succeeded":2,
+             "failed":2, "pending":1, "adjusted_terminal":3}, "adjusted ratio=2/3"),
+        ]
+        for kind, diagnostic, expected in diagnostics:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                data = events(("failed",))
+                result = next(e["row"] for e in data if e["type"] == "case_completed")
+                result["criteria"] = [{"type":kind, "severity":"hard", "score":None,
+                    "passed":False, "evaluation":"reported", "diagnostic":diagnostic}]
+                write_events(root, data)
+                (root / "report.json").write_text("private-sentinel")
+                (root / "execution.json").write_text(json.dumps({"exit_code":1,"termination":"finished"}))
+                code, summary = self.publish(root, "failure", cli=True)
+                self.assertEqual(code, 1)
+                self.assertIsNone(summary["observation_error"])
+                self.assertEqual(summary["runs"][0]["criteria"][0]["diagnostic"], diagnostic)
+                self.assertIn(expected, (root / "job-summary").read_text())
+                self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
+                for changes in ({"raw":"private-sentinel"}, {"actual":"private-sentinel"},
+                                {"min":True}, {"considered":-1}):
+                    with self.assertRaises(ValueError):
+                        h.safe_diagnostic(dict(diagnostic, **changes), 0)
+
+    def test_journal_diagnostics_reject_inconsistent_accounting(self):
+        count = {"kind":"journal_count", "min":1, "max":1, "actual":0,
+                 "considered":1, "outcome_matches":1, "missing":1,
+                 "type_mismatch":0, "value_mismatch":0}
+        ratio = {"kind":"journal_ratio", "min":0.9, "min_calls":3,
+                 "allowed_failures":1, "terminal":4, "succeeded":2,
+                 "failed":2, "pending":0, "adjusted_terminal":3}
+        for value, changes in [(count, {"actual":1}), (count, {"considered":0}),
+                               (ratio, {"terminal":3}), (ratio, {"adjusted_terminal":4}),
+                               (ratio, {"min":float("nan")}), (ratio, {"min_calls":0})]:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                h.safe_diagnostic(dict(value, **changes), 0)
 
     def test_judge_failure_accepts_only_fixed_typed_metadata(self):
         base = {"kind":"judge", "assessment":"unavailable", "threshold":0.8,

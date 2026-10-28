@@ -12,6 +12,135 @@ use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::prelude::*;
 
+/// The run drain does not own the detached observer. Its completion counter is
+/// published only after the production worker has finished all of its SQL.
+async fn wait_for_chat_observers(
+    registry: Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>,
+    expected_observers: u64,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let metrics = registry.render_prometheus();
+            let mut completed = 0;
+            let mut scheduled = 0;
+            for line in metrics.lines().filter(|line| {
+                line.starts_with("astra_turn_observer_runs_total{")
+                    || line.starts_with("astra_turn_observer_dispatches_total{")
+            }) {
+                let (series, value) = line.rsplit_once(' ').unwrap();
+                let value: u64 = value.parse().unwrap();
+                if value == 0 {
+                    continue;
+                }
+                if series.starts_with("astra_turn_observer_runs_total{") {
+                    assert_eq!(
+                        series,
+                        "astra_turn_observer_runs_total{mode=\"async\",outcome=\"success\"}",
+                        "authorized SQL budget requires successful observation, not skipped or failed work: {line}"
+                    );
+                    completed += value;
+                } else {
+                    assert_eq!(
+                        series,
+                        "astra_turn_observer_dispatches_total{mode=\"async\",outcome=\"scheduled\"}",
+                        "authorized SQL budget requires scheduled observation: {line}"
+                    );
+                    scheduled += value;
+                }
+            }
+            assert!(
+                scheduled <= expected_observers,
+                "unexpected extra scheduled observer"
+            );
+            assert!(completed <= expected_observers, "unexpected extra observer");
+            if scheduled == expected_observers && completed == expected_observers {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("each chat must finish its detached observer before ending SQL capture");
+}
+
+fn observer_metrics(
+    scheduled: u64,
+    successes: u64,
+) -> Arc<astra_turn_core::pipeline_metrics::MetricsRegistry> {
+    let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+    registry.register_counter("astra_turn_observer_dispatches_total", "observer test");
+    registry.register_counter("astra_turn_observer_runs_total", "observer test");
+    registry.increment_counter(
+        "astra_turn_observer_dispatches_total",
+        &[("mode", "async"), ("outcome", "scheduled")],
+        scheduled,
+    );
+    registry.increment_counter(
+        "astra_turn_observer_runs_total",
+        &[("mode", "async"), ("outcome", "success")],
+        successes,
+    );
+    registry
+}
+
+#[tokio::test]
+async fn sql_budget_requires_the_expected_successful_observations() {
+    wait_for_chat_observers(observer_metrics(2, 2), 2).await;
+}
+
+#[tokio::test]
+async fn sql_budget_rejects_extra_scheduled_but_pending_observer() {
+    let result = tokio::spawn(wait_for_chat_observers(observer_metrics(2, 1), 1)).await;
+    assert!(
+        result.is_err_and(|error| error.is_panic()),
+        "the first success must not end capture while a duplicate scheduled observer can still issue SQL"
+    );
+}
+
+#[tokio::test]
+async fn sql_budget_rejects_skipped_failed_or_dropped_observations() {
+    for (metric, outcome) in [
+        ("astra_turn_observer_runs_total", "not_configured"),
+        ("astra_turn_observer_runs_total", "access_disabled"),
+        ("astra_turn_observer_runs_total", "empty"),
+        ("astra_turn_observer_runs_total", "error"),
+        ("astra_turn_observer_dispatches_total", "dropped_full"),
+        ("astra_turn_observer_dispatches_total", "skipped_empty"),
+    ] {
+        for successes in [0, 1] {
+            let registry = observer_metrics(1, successes);
+            registry.increment_counter(metric, &[("mode", "async"), ("outcome", outcome)], 1);
+            let result = tokio::spawn(wait_for_chat_observers(registry, 1)).await;
+            assert!(
+                result.is_err_and(|error| error.is_panic()),
+                "{outcome} must fail the authorized probe, including with {successes} successful observations"
+            );
+        }
+    }
+}
+
+/// Measure request SQL on an initialized pool, not timing-dependent SQLx
+/// connection setup. Every statement after this boundary still counts.
+async fn prime_chat_pool(ctx: &MatrixE2eCtx) {
+    let pool = ctx.shared_pool.get();
+    // This serial probe needs only a small warm reserve, not the deployment's
+    // full connection limit. Additional connections opened during a request
+    // remain visible to the raw SQL budget.
+    let reserve = pool.options().get_max_connections().min(4);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut connections = Vec::new();
+        for _ in 0..reserve {
+            connections.push(pool.acquire().await.unwrap());
+        }
+        drop(connections);
+        while pool.num_idle() < reserve as usize {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("initialize and return the chat-pool reserve before SQL capture");
+}
+
 #[derive(Default)]
 struct Statement(String, f64);
 
@@ -104,6 +233,23 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SqlCapture {
 }
 
 const CONTROL_OBSERVATION_SQL: &str = "SELECT requested.ordinal, run_id, session_id, status, waiting_for, parent_run_id, ancestor_path, run_generation, last_event_idx, CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested, CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at IS NOT NULL AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live FROM (VALUES ROW(0,?,?)) requested(ordinal, requested_user_id, requested_run_id) LEFT JOIN agent_runs ON user_id = requested_user_id AND run_id = requested_run_id AND run_id IN (?)";
+
+// The account/session snapshot is cached for 30 seconds. A slow fixture can
+// cross that boundary independently of readonly tool rounds. Attribute only
+// this exact query, at most once per request, while retaining the raw total.
+const AUTHENTICATION_SNAPSHOT_SQL: &str = "SELECT u.user_id, u.username, u.email, u.display_name, u.is_active, CAST(UNIX_TIMESTAMP(s.session_expires_at) AS SIGNED) AS session_expires_at_unix, m.provider_id AS memoria_provider_id, m.external_subject AS memoria_subject FROM (SELECT MAX(expires_at) AS session_expires_at FROM auth_refresh_tokens WHERE user_id = ? AND session_id = ? AND is_revoked = 0 AND expires_at > NOW()) s LEFT JOIN auth_users u ON u.user_id = ? LEFT JOIN (SELECT astra_user_id, provider_id, external_subject FROM auth_external_identities WHERE astra_user_id = ? AND provider_id LIKE 'memoria:%' ORDER BY CASE WHEN provider_id = ? THEN 0 ELSE 1 END, updated_at DESC, provider_id ASC LIMIT 1) m ON m.astra_user_id = u.user_id";
+
+fn authentication_snapshot_count(statements: &[String]) -> usize {
+    let count = statements
+        .iter()
+        .filter(|sql| sql.as_str() == AUTHENTICATION_SNAPSHOT_SQL)
+        .count();
+    assert!(
+        count <= 1,
+        "a request must not repeat its authentication snapshot"
+    );
+    count
+}
 
 fn answer(message: Value, reason: &str) -> ProviderResponse {
     ProviderResponse::OpenAi(json!({
@@ -422,7 +568,11 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                 "{body}"
             );
             assert!(body.contains("Warm context ready."), "{body}");
+            // Shutdown drain would reject the measured turn. The complete SSE
+            // response settles the warm-up turn; separately await its observer.
+            wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
         }
+        prime_chat_pool(&b.ctx).await;
         let message = if executes_agent {
             "List agent status."
         } else if readonly_rounds == 0 {
@@ -515,6 +665,11 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                 .drain_background_runs(std::time::Duration::from_secs(5))
                 .await
         );
+        wait_for_chat_observers(
+            b.ctx.app_state.metrics_registry(),
+            1 + u64::from(warm_context),
+        )
+        .await;
         let samples = capture.0.lock().unwrap().take().unwrap();
         let execution_ms = execution_started.elapsed().as_secs_f64() * 1000.0;
         // Explicit cold-replay verification follows the ordinary request's
@@ -773,6 +928,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             statements.len(),
             statements.join("\n")
         );
+        let authentication_reads = authentication_snapshot_count(statements);
         if *scenario == "ordinary" {
             continue;
         }
@@ -780,13 +936,15 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             .iter()
             .find(|(name, _, warm, _, _)| *name == "ordinary" && warm == warm_context)
             .unwrap();
-        // Explain only the exact observed periodic reads; the independent
-        // raw total budget above never deducts a query.
-        let expected = baseline.4.len() as i64 + *polls as i64 - baseline.3 as i64;
+        // Explain exact periodic reads and at most one request-auth cache
+        // miss. The independent raw total budget above never deducts a query.
+        let expected = baseline.4.len() as i64 + *polls as i64 - baseline.3 as i64
+            + authentication_reads as i64
+            - authentication_snapshot_count(&baseline.4) as i64;
         assert_eq!(
             statements.len() as i64,
             expected,
-            "{scenario} {rounds} readonly rounds (warm={warm_context}, polls={polls}) must add no SQL beyond the exact observed periodic controls"
+            "{scenario} {rounds} readonly rounds (warm={warm_context}, polls={polls}) must add no SQL beyond exact periodic controls and one request-auth cache miss"
         );
     }
 }

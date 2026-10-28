@@ -10,6 +10,11 @@ All protected endpoints require a JWT. The public authentication exceptions
 are `/live`, `/ready`, `/health`, `/auth/register`, `/auth/login`, `GET /auth/methods`, `POST /auth/memoria`, `/auth/refresh`, and
 `/auth/logout` (refresh/logout authenticate the supplied refresh token):
 
+Logout revokes the token's session, including a successor issued by a
+concurrent refresh. A signed, unexpired refresh token can terminate its own
+session even after rotation; it cannot be used to refresh again. A valid proof
+for a session already gone is an idempotent success. Other sessions are unaffected.
+
 ```
 Authorization: Bearer <access_token>
 ```

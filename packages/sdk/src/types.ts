@@ -1209,6 +1209,8 @@ export type AstraClientConfig = {
 
 export type SSEClientOptions = {
   url: string;
+  /** Optional request transport for clients that own authentication. */
+  transport?: (url: string, init: RequestInit) => Promise<Response>;
   token?: string;
   headers?: Record<string, string>;
   onEvent: (event: StreamEvent) => void;

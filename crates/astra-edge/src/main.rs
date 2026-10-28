@@ -812,7 +812,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
             config.edge_id.clone(),
             session_id,
         )
-        .with_local_network(),
+        .with_local_network(astra_tools::web_fetch::configured_fake_ip_policy()),
     );
     astra_edge::serve_connection(
         socket,

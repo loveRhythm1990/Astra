@@ -29,7 +29,6 @@ struct SnapshotBarrier {
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Queries {
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         if event.metadata().target() == "sqlx::query" {
-            self.count.fetch_add(1, Ordering::SeqCst);
             #[derive(Default)]
             struct Fields(String);
             impl tracing::field::Visit for Fields {
@@ -39,6 +38,11 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Queries {
             }
             let mut fields = Fields::default();
             event.record(&mut fields);
+            // Pool expansion can initialize a new connection alongside an
+            // auth query; count application statements, not session setup.
+            if !fields.0.contains("SET sql_mode=") {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
             if fields.0.contains("SELECT u.user_id, u.username")
                 && self.snapshot.armed.swap(false, Ordering::SeqCst)
             {
@@ -175,6 +179,26 @@ async fn jwt_authentication_uses_one_cold_query_and_zero_warm_queries_with_local
         .current_principal(&second)
         .await
         .expect("logout does not revoke another device");
+    assert_eq!(
+        count.swap(0, Ordering::SeqCst),
+        0,
+        "another session stays warm"
+    );
+    for _ in 0..3 {
+        service
+            .logout(AuthRefreshRequestData {
+                refresh_token: tokens[0].refresh_token.clone(),
+            })
+            .await
+            .unwrap();
+        count.store(0, Ordering::SeqCst);
+        service.current_principal(&second).await.unwrap();
+        assert_eq!(
+            count.swap(0, Ordering::SeqCst),
+            0,
+            "replayed logout must not flush unrelated sessions"
+        );
+    }
 
     sqlx::query("UPDATE auth_users SET is_active = 0 WHERE user_id = ?")
         .bind(&user.user_id)
@@ -246,8 +270,8 @@ async fn jwt_authentication_uses_one_cold_query_and_zero_warm_queries_with_local
         let subsequent = observer.current_principal(&second).await;
         assert_eq!(
             count.swap(0, Ordering::SeqCst),
-            1,
-            "invalidated fill cannot re-enter cache"
+            usize::from(same_session),
+            "only the revoked session's in-flight fill must be fenced"
         );
         if same_session {
             assert_eq!(

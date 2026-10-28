@@ -2347,7 +2347,7 @@ export async function resolveModelOfferingSelection(
     runtime instanceof WebRuntimeClient
       ? runtime
       : new WebRuntimeClient(runtime);
-  const accessToken = client.config.accessToken;
+  const { accessToken } = client.sdk.getTokens();
   if (!accessToken) {
     throw new ModelOfferingSelectionError(
       "authentication_required",

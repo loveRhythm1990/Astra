@@ -886,7 +886,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
     "auth_refresh_tokens": TableMetadata(
         semantic_owner="astra_services::auth",
         state_class="durable refresh-session credential fact",
-        primary_query="refresh/logout lookup by token_hash, session_id, user_id, is_revoked, and expires_at",
+        primary_query="refresh compare-and-replace by token_hash and session; logout revokes by signed user/session claims",
         retention_policy="cleanup_expired_data prunes expired or revoked rows after refresh_token_days default 7 in ordered bounded batches; logout and refresh revoke specific token hashes",
         rebuildability="not rebuildable after token_hash/session binding is lost because refresh/logout idempotency and external session linkage depend on it",
         merge_guidance="keep separate from auth_users; refresh credentials are high-churn secrets with TTL/revocation lifecycle",

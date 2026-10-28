@@ -24,7 +24,7 @@ use astra_runtime::{
     HealthChecker, ServiceInfo, SessionActivityRecord, SessionCreateRequestData, SessionListFilter,
     SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
     TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnHookDbPersistPlan, TurnHookDbWriter,
-    TurnObserverRequest, TurnObserverWorker, build_app,
+    TurnObserverOutcome, TurnObserverRequest, TurnObserverWorker, build_app,
 };
 use astra_services::skills::{
     SkillInfoRecord, SkillListCursor, SkillListItem, SkillListRecord, SkillPublishRequestData,
@@ -313,9 +313,9 @@ struct RecordingObserverWorker {
 
 #[async_trait]
 impl TurnObserverWorker for RecordingObserverWorker {
-    async fn run(&self, request: TurnObserverRequest) -> Result<(), String> {
+    async fn run(&self, request: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {
         self.requests.lock().await.push(request);
-        Ok(())
+        Ok(TurnObserverOutcome::Observed)
     }
 }
 

@@ -67,6 +67,12 @@ child. A user cancellation must close descendant admission and converge the
 child tree; an ordinary parent status answer must not cancel it. These are
 verification obligations, not guarantees established by launch/list support.
 
+An empty parent response while a direct child or requested reply is outstanding
+uses that same input wait. It must not spend the bounded empty-final-answer
+recovery or enter text-only synthesis before the required input is available.
+Once the child result is delivered, an empty synthesis response retains the
+ordinary one-retry contract within the existing execution budget.
+
 The launch mode is not an authority change. It preserves the same admitted
 model, tool permissions, execution deadline, lineage, and cancellation owner
 that a joined child would have. Explicit background handoff below transfers

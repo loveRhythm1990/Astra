@@ -8060,9 +8060,20 @@ pub(crate) async fn run_tui_session(
     );
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let result: Result<(), String> = 'main: loop {
-        guard
-            .ensure_tui_modes()
-            .map_err(|e| format!("failed to restore terminal input mode: {e}"))?;
+        // Preserve teardown when the event loop reports an error.
+        macro_rules! loop_try {
+            ($result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(error) => break 'main Err(error),
+                }
+            };
+        }
+        loop_try!(
+            guard
+                .ensure_tui_modes()
+                .map_err(|e| format!("failed to restore terminal input mode: {e}"))
+        );
         if let Some(request) = take_restore_input_request(&restore_input_queue) {
             if apply_restore_input_request(
                 &request,
@@ -8131,7 +8142,7 @@ pub(crate) async fn run_tui_session(
                     Ok(LoginEffect::Discovered { method, .. }) => {
                         // No model/tool work can start while the login task owns input.
                         // Retire the old owner before the browser publishes credentials.
-                        auth_flow::begin_browser_session_login(&mut state).await?;
+                        loop_try!(auth_flow::begin_browser_session_login(&mut state).await);
                         if external_skill_discovery_pending {
                             external_skill_discovery.abort();
                             let _ = (&mut external_skill_discovery).await;
@@ -8960,7 +8971,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board)?;
+                                    loop_try!(do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board));
                                 }
 
                                 // Browsing the model catalog is remote I/O, but the command
@@ -10395,7 +10406,7 @@ pub(crate) async fn run_tui_session(
                                                                 .map(|s| s.width)
                                                                 .unwrap_or(80);
                                                             if let TuiEvent::Resize { cursor, size, interrupted } = event {
-                                                                guard.reconcile_resize(cursor, size, interrupted).map_err(|err| err.to_string())?;
+                                                                loop_try!(guard.reconcile_resize(cursor, size, interrupted).map_err(|err| err.to_string()));
                                                                 refresh_open_transcript_view(
                                                                     &chat_widget,
                                                                     &mut bottom_pane,
@@ -12063,7 +12074,7 @@ pub(crate) async fn run_tui_session(
                         frame_requester.schedule_frame();
                     }
                     TuiEvent::Resize { cursor, size, interrupted } => {
-                        guard.reconcile_resize(cursor, size, interrupted).map_err(|err| err.to_string())?;
+                        loop_try!(guard.reconcile_resize(cursor, size, interrupted).map_err(|err| err.to_string()));
                         {
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                     refresh_open_transcript_view(
@@ -12081,7 +12092,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board)?;
+                                    loop_try!(do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board));
                                 }
                     }
                     TuiEvent::Draw => {
@@ -12097,7 +12108,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board)?;
+                                    loop_try!(do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board));
                                 }
                     }
                     TuiEvent::Paste(text) => {
@@ -12770,8 +12781,9 @@ pub(crate) async fn run_tui_session(
         tracing::debug!("aborted deferred turn-post-commit worker during TUI shutdown");
     }
     model_catalog_tasks.abort_all();
-    login_tasks.abort_all();
-    while login_tasks.join_next().await.is_some() {}
+    // Once exchange starts, the login owns credential publication. Joining it
+    // prevents a blocking writer from committing after the workbench exits.
+    login_phase.shutdown(&mut login_tasks).await;
     while model_catalog_tasks.join_next().await.is_some() {}
     for task in startup_observation_tasks {
         task.abort();

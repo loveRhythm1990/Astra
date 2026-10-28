@@ -55,9 +55,11 @@ is retained in the cache.
 
 The cache is shared by service clones and bounded to 1,024 entries, 4 MiB of
 accounted storage and 16 KiB per entry. Reconfiguring a service's pool, issuer or
-encryptor starts a new namespace. Logout, disconnect and Memoria binding changes
-invalidate local observations and fence in-flight fills, including uncertain
-commits. Other processes and out-of-band account/session mutations can take up
+encryptor starts a new namespace. Logout invalidates only its session's local
+observations and fences matching in-flight fills; account-wide changes still
+invalidate all observations, including on uncertain commits. Session fences are
+bounded within the cache; overflow conservatively fences older in-flight fills.
+Other processes and out-of-band account/session mutations can take up
 to 30 seconds to affect ordinary request admission. Expired observations require
 a successful fresh lookup; database errors do not enable stale fallback.
 
@@ -66,6 +68,26 @@ cache invalidation prevents retaining that observation and does not reject an
 unrelated principal. Absolute token, observed Session and Memoria access expiry
 are checked again after awaited validation. A request starting after a local
 logout cannot reuse an invalidated observation.
+
+Refresh and logout serialize on the account lock. Refresh atomically replaces
+the active token hash in its existing session row; the consumed hash cannot
+refresh again. Logout uses a signed, strictly unexpired refresh token's user and
+session claims to revoke that session, even after the old hash is replaced or
+cleaned up. A valid proof with no remaining session is an idempotent success;
+it cannot revoke another session. This relies on unique session IDs and trusted
+JWT signing keys: removing an old hash alone no longer revokes its logout proof.
+Expired or revoked rows remain eligible for the existing bounded cleanup.
+Do not mix this version with older servers: an old server may report logout
+success after a new server has already replaced the hash, leaving the session
+active. For upgrade or rollback, stop admission to all API replicas, drain or
+terminate their in-flight requests, and wait until every old process has exited
+before starting any replica of the other version. This cutover interrupts
+service; ordinary rolling updates and session affinity do not provide the
+required ordering. Keep all API replicas on the same side of the cutover.
+After rollback, an older server cannot use a token already consumed by the
+newer version to revoke its successor; it rejects that logout. Draining
+requests does not restore replaced hashes, so clients must use their current
+refresh tokens or the affected sessions must be revoked separately.
 
 This cache observes identity, not operation permissions. Memory operations
 continue resolving scoped credentials through the canonical credential resolver;
@@ -318,6 +340,49 @@ make test-memoria-auth-online-contract
 ```
 
 The test issues and revokes upstream keys; never point it at a production service.
+
+## MOI device authorization
+
+`astra login --device-code` is an explicit native UC alternative for terminals
+without a browser. It shares discovery/environment validation, nonce-verified
+ID tokens, product preparation, atomic login publication, refresh and logout
+with the existing UC browser login. It has no new local credential schema.
+Discovery's device endpoint is optional; its absence leaves browser login
+unchanged and rejects only the explicit device command.
+
+UC admits the fixed `astra-cli` scope set and S256 PKCE request. The CLI prints
+the manual verification URI and user code, never the grant secret or a complete
+verification URI. Keycloak owns grant state and the final consent. UC's typed
+identity continuation must return to the original Keycloak device session,
+without opening a fresh authorization-code flow. The UC implementation and
+rollout are tracked in [Matrixflow #17972](https://github.com/matrixorigin/matrixflow/issues/17972).
+
+Polling obeys the issuer interval, increases it permanently for `slow_down`,
+backs off proven connection failures, and
+stops at a bounded wait of `min(expires_in, 600)` seconds. Longer server lifetimes remain valid;
+the local wait limit is reported separately from server grant expiry. No final
+poll bypasses the issuer interval or retry delay. Authorization creation errors
+distinguish HTTP 429, HTTP 5xx and rejection without rendering upstream bodies.
+A token request with an unconfirmed outcome is terminal and is not replayed,
+including ambiguous transport failures, HTTP 429/5xx, and
+`temporarily_unavailable` responses. New credentials are
+published only after existing MOI and Astra preparation succeeds. No implicit
+browser/manual fallback is introduced.
+
+An in-flight token request gets an independent bounded settlement period after
+the local deadline or cancellation. An unconfirmed response is reported as such,
+rather than claiming the grant expired. The shared native credential owner
+arbitrates cancellation against rename admission, polls contended publication locks for up
+to ten seconds, and distinguishes pre-rename failure from visible publication
+whose directory durability is unconfirmed. Callers join the writer after
+cancellation, revoke new credentials only on definite pre-commit failure, and
+attempt old-session revocation for both durable and visible-but-unconfirmed
+publication. Filesystem operations themselves cannot be forcibly interrupted;
+no caller timeout may leave a detached writer behind. This publication contract
+is shared by browser and device login; there is no device-only auth.json writer.
+Optional workspace selection uses the same bounded publication owner after login.
+Refresh sends the one-time token only after its pending intent is durably synced;
+a visible replacement with unconfirmed directory durability is never revoked.
 
 ## CLI in-flight credential ownership
 

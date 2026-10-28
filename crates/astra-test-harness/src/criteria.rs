@@ -1011,6 +1011,33 @@ pub struct CriterionResult {
     pub score: Option<f64>,
 }
 
+// Numeric evidence produced by the same evaluator that decides the verdict.
+// Never carry tool names, JSON paths/values, commands, or response text here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum JournalDiagnostic {
+    JournalCount {
+        min: u32,
+        max: u32,
+        actual: u32,
+        considered: u32,
+        outcome_matches: u32,
+        missing: u32,
+        type_mismatch: u32,
+        value_mismatch: u32,
+    },
+    JournalRatio {
+        min: f64,
+        min_calls: u32,
+        allowed_failures: u32,
+        terminal: u32,
+        succeeded: u32,
+        failed: u32,
+        pending: u32,
+        adjusted_terminal: u32,
+    },
+}
+
 fn default_severity() -> CriterionSeverity {
     CriterionSeverity::Hard
 }
@@ -3493,22 +3520,43 @@ fn evaluate_one_with_primary_cache(
                     score: None,
                 };
             }
+            let mut considered = 0;
+            let mut outcome_matches = 0;
+            let mut missing = 0;
+            let mut type_mismatch = 0;
+            let mut value_mismatch = 0;
             let count = calls
                 .iter()
                 .filter(|call| {
                     if *root_only && call.run_id.as_deref() != outcome.run_id.as_deref() {
                         return false;
                     }
-                    if call.name != *name || ok.is_some_and(|expected| call.ok != Some(expected)) {
+                    if call.name != *name {
                         return false;
                     }
+                    considered += 1;
+                    if ok.is_some_and(|expected| call.ok != Some(expected)) {
+                        return false;
+                    }
+                    outcome_matches += 1;
                     let (Some(document), Some(path), Some(equals)) =
                         (document, path.as_deref(), equals)
                     else {
                         return true;
                     };
-                    let value = journal_tool_document(call, *document);
-                    value.and_then(|value| value.pointer(path)) == Some(equals)
+                    let actual = journal_tool_document(call, *document)
+                        .and_then(|value| value.pointer(path));
+                    match actual {
+                        None => missing += 1,
+                        Some(value) if value == equals => return true,
+                        Some(value)
+                            if std::mem::discriminant(value) != std::mem::discriminant(equals) =>
+                        {
+                            type_mismatch += 1;
+                        }
+                        Some(_) => value_mismatch += 1,
+                    }
+                    false
                 })
                 .count() as u32;
             let passed = count >= *min && count <= *max;
@@ -3527,7 +3575,19 @@ fn evaluate_one_with_primary_cache(
                     "journal tool {name}{outcome_filter}{predicate}{} full-call count={count}, expected {min}..={max}",
                     if *root_only { " root-only" } else { "" }
                 ),
-                full_detail: None,
+                full_detail: Some(
+                    serde_json::to_string(&JournalDiagnostic::JournalCount {
+                        min: *min,
+                        max: *max,
+                        actual: count,
+                        considered,
+                        outcome_matches,
+                        missing,
+                        type_mismatch,
+                        value_mismatch,
+                    })
+                    .expect("numeric journal count diagnostic"),
+                ),
                 score: None,
             }
         }
@@ -3535,11 +3595,7 @@ fn evaluate_one_with_primary_cache(
             let Some(session) = session else {
                 return missing_required_session(c, "journal_tool_outcome_count");
             };
-            let count = session
-                .journal_tool_calls()
-                .iter()
-                .filter(|call| call.name == *name && call.ok == Some(*ok))
-                .count() as u32;
+            let count = session.journal_tool_outcome_count(name, *ok) as u32;
             let passed = count >= *min && count <= *max;
             CriterionResult {
                 criterion: c.clone(),
@@ -3587,7 +3643,19 @@ fn evaluate_one_with_primary_cache(
                     adjusted_ratio = adjusted_ratio * 100.0,
                     min = min * 100.0,
                 ),
-                full_detail: None,
+                full_detail: Some(
+                    serde_json::to_string(&JournalDiagnostic::JournalRatio {
+                        min: *min,
+                        min_calls: *min_calls,
+                        allowed_failures: *allowed_failures,
+                        terminal,
+                        succeeded,
+                        failed: failures,
+                        pending: calls.len() as u32 - terminal,
+                        adjusted_terminal,
+                    })
+                    .expect("numeric journal ratio diagnostic"),
+                ),
                 score: None,
             }
         }
@@ -8231,6 +8299,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workspace_child_read_requires_successful_causal_completion() {
+        let criterion = Criterion::JournalChildToolCallCount {
+            parent: "agent_fanout".into(),
+            child: "read_file".into(),
+            min: 1,
+            max: 1,
+            min_distinct_child_runs: 1,
+        };
+        for (is_error, run, linked, expected) in [
+            (Some(false), "child", true, true),
+            (Some(true), "child", true, false),
+            (None, "child", true, false),
+            (Some(false), "root", true, false),
+            (Some(false), "child", false, false),
+        ] {
+            let capture = mk_session(&[
+                (
+                    "ToolCallStarted",
+                    serde_json::json!({
+                        "event_type": "ToolCallStarted", "event_id": "fanout",
+                        "run_id": "root", "payload": {"tool_name": "agent_fanout"},
+                    }),
+                ),
+                (
+                    "ToolCallCompleted",
+                    serde_json::json!({
+                        "event_type": "ToolCallCompleted", "event_id": "read",
+                        "run_id": run, "caused_by": if linked { vec!["fanout"] } else { vec![] },
+                        "payload": {"tool_name": "read_file", "is_error": is_error},
+                    }),
+                ),
+            ]);
+            let results = evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome_with_tools(&[]),
+                Some(&capture),
+            );
+            assert_eq!(
+                results[0].passed, expected,
+                "is_error={is_error:?}, run={run}, linked={linked}"
+            );
+        }
+    }
+
     fn pipeline_feedback_event(
         round: u32,
         cache_identity: &str,
@@ -9885,6 +9998,60 @@ mod tests {
     }
 
     #[test]
+    fn journal_call_diagnostics_partition_candidates_without_exposing_values() {
+        let sess = mk_session(&[
+            (
+                "turn",
+                serde_json::json!({"run_id":"root", "tool_calls":[
+                    {"tool_call_id":"match","name":"introspect","ok":true,
+                     "run_id":"root","args_full":r#"{"facet":"private-expected"}"#},
+                    {"tool_call_id":"value","name":"introspect","ok":true,
+                     "run_id":"root","args_full":r#"{"facet":"private-actual"}"#},
+                    {"tool_call_id":"missing","name":"introspect","ok":true,
+                     "run_id":"root","args_full":"{}"},
+                    {"tool_call_id":"type","name":"introspect","ok":true,
+                     "run_id":"root","args_full":r#"{"facet":7}"#},
+                    {"tool_call_id":"failed","name":"introspect","ok":false,
+                     "run_id":"root","args_full":"{}"}
+                ]}),
+            ),
+            (
+                "turn",
+                serde_json::json!({"run_id":"child", "tool_calls":[
+                    {"tool_call_id":"child","name":"introspect","ok":true,"args_full":"{}"}
+                ]}),
+            ),
+        ]);
+        let criterion = Criterion::JournalToolCallCount {
+            name: "introspect".into(),
+            min: 2,
+            max: 2,
+            root_only: true,
+            document: Some(JournalToolDocument::Arguments),
+            path: Some("/facet".into()),
+            equals: Some(serde_json::json!("private-expected")),
+            ok: Some(true),
+        };
+        let mut outcome = outcome_with_tools(&[]);
+        outcome.run_id = Some("root".into());
+        let results = evaluate_deterministic_with_session(&[criterion], &outcome, Some(&sess));
+        assert!(!results[0].passed);
+        let raw = results[0].full_detail.as_deref().unwrap();
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "kind":"journal_count", "min":2, "max":2, "actual":1,
+                "considered":5, "outcome_matches":4, "missing":1,
+                "type_mismatch":1, "value_mismatch":1
+            })
+        );
+        assert!(!raw.contains("private-"));
+        assert!(!raw.contains("facet"));
+        assert!(serde_json::from_str::<JournalDiagnostic>(raw).is_ok());
+    }
+
+    #[test]
     fn durable_tool_success_ratio_reports_raw_execution_health() {
         let sess = mk_session(&[(
             "turn",
@@ -9910,6 +10077,15 @@ mod tests {
         assert!(results[0].passed, "{results:?}");
         assert!(results[0].detail.contains("raw=3/4 (75.0%)"));
         assert!(results[0].detail.contains("adjusted=3/3 (100.0%)"));
+        let diagnostic: serde_json::Value =
+            serde_json::from_str(results[0].full_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            diagnostic,
+            serde_json::json!({
+                "kind":"journal_ratio", "min":1.0, "min_calls":4, "allowed_failures":1,
+                "terminal":4, "succeeded":3, "failed":1, "pending":1, "adjusted_terminal":3
+            })
+        );
 
         let strict = evaluate_deterministic_with_session(
             &[Criterion::JournalToolSuccessRatio {
