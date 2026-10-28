@@ -77,7 +77,11 @@ fn longer_server_lifetimes_limit_waiting_without_claiming_expiry() {
         assert_eq!(value.wait_duration().as_secs(), lifetime.min(600));
         assert_eq!(
             value.deadline_error(),
-            if lifetime > 600 { WAIT_TIMEOUT } else { EXPIRED }
+            if lifetime > 600 {
+                WAIT_TIMEOUT
+            } else {
+                EXPIRED
+            }
         );
     }
 }
