@@ -292,7 +292,7 @@ pub(crate) fn validate_reasoning_control(
         Ok(())
     } else {
         Err(format!(
-            "Offering '{}' cannot execute requested reasoning control '{}' (capability: {}, protocol: {:?}). If the task permits the Offering default instead of this explicit control, retry /chat with {{\"context\":{{\"thinking\":{{\"mode\":\"model_default\"}}}}}}; for agent use {{\"reasoning\":{{\"mode\":\"model_default\"}}}}; for agent_fanout use {{\"defaults\":{{\"reasoning\":{{\"mode\":\"model_default\"}}}}}}. If slots[i].reasoning is explicitly set, replace that slot's reasoning with {{\"mode\":\"model_default\"}} instead: defaults does not override explicit slot controls. These explicit model_default controls suppress parent reasoning inheritance. The requested control was not changed or executed. If this client cannot represent the supported reasoning control, run `astra update` before selecting that control.",
+            "Offering '{}' cannot execute requested reasoning control '{}' (capability: {}, protocol: {:?}). If the task permits the Offering default instead of this explicit control, retry /chat with {{\"context\":{{\"thinking\":{{\"mode\":\"model_default\"}}}}}}; for agent use {{\"reasoning\":{{\"mode\":\"model_default\"}}}}; for agent_fanout use {{\"defaults\":{{\"reasoning\":{{\"mode\":\"model_default\"}}}}}}. If slots[i].reasoning is explicitly set, replace that slot's reasoning with {{\"mode\":\"model_default\"}} instead: defaults does not override explicit slot controls. These explicit model_default controls suppress parent reasoning inheritance. The requested control was not changed or executed.",
             execution.offering_id,
             thinking,
             capability.map_or("unknown", |capability| capability.as_str()),
@@ -475,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn published_reasoning_controls_are_admitted_without_silent_translation() {
+    fn published_reasoning_controls_preserve_protocol_admission() {
         use astra_core::model_wire::thinking::ThinkingProtocol;
         use astra_services::models::ThinkingCapability;
         use astra_turn_core::thinking_config::ThinkingConfig;
@@ -503,7 +503,7 @@ mod tests {
         for protocol in [ThinkingProtocol::EnableThinking, ThinkingProtocol::Moonshot] {
             execution.thinking_protocol = Some(protocol);
             let error = validate_reasoning_control(&execution, &old_control).unwrap_err();
-            assert!(error.contains("astra update"));
+            assert!(error.contains("cannot execute requested reasoning control"));
             assert!(validate_reasoning_control(&execution, &ThinkingConfig::On {}).is_ok());
             let mut wire = serde_json::json!({});
             ThinkingConfig::On {}.apply_openai_protocol(&mut wire, protocol);

@@ -1603,11 +1603,22 @@ async fn control_batch_preserves_database_identity_positions_and_isolates_corrup
         )
         .await;
     }
+    // MatrixOne inputRows counts storage rows before filtering, including
+    // unrelated rows sharing a candidate block. Bound scans by the population
+    // before injecting history, rather than by the number of requested keys.
+    let candidate_population: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+    assert!(candidate_population >= 2);
+    // More history than the entire initial population ensures a missing
+    // candidate filter cannot pass the scan bound by reading that history.
+    let history_count = candidate_population + 256;
     // Historical runs must not become work for unrelated active observations.
     let mut history = sqlx::QueryBuilder::<sqlx::MySql>::new(
         "INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,ancestor_path,status) ",
     );
-    history.push_values(0..256, |mut row, i| {
+    history.push_values(0..history_count, |mut row, i| {
         let id = format!("control-history-{nonce}-{i}");
         row.push_bind(&other)
             .push_bind(format!("session-{bad}"))
@@ -1761,8 +1772,8 @@ async fn control_batch_preserves_database_identity_positions_and_isolates_corrup
         assert!(!scans.is_empty(), "missing base scan counters: {plan:?}");
         let scanned = scans.iter().sum::<u64>();
         assert!(
-            (1..=size as u64).contains(&scanned),
-            "{size} lookups scanned {scanned} rows including unrelated history: {plan:?}"
+            (1..=candidate_population as u64).contains(&scanned),
+            "{size} lookups scanned {scanned} rows, exceeding the pre-history population {candidate_population}: {plan:?}"
         );
         eprintln!("control_batch requests={size} base_scan_rows={scanned}");
     }

@@ -174,14 +174,21 @@ never silently translated to a default, toggle, effort, or budget.
 
 Current `ModelListItemResponse`, `ModelListPageResponse`, and
 `ModelAccessProjectionResponse` readers tolerate additive metadata at those
-object boundaries. Their nested access/status, default-resolution, cursor,
+object boundaries. This is defensive reader behavior for non-authoritative
+metadata, independent of the producer's frozen response obligations; it does
+not replace the historical decoder tests. Their nested access/status, default-resolution, cursor,
 required-field, and typed enum contracts remain strict. This reader tolerance
 is not permission to extend v2 responses: the published 0.2.12 decoder is
 strict, and an independent frozen fixture protects its complete response
 shape. New response fields, type changes, or enum/state values require a new
 explicitly negotiated format while unversioned responses retain the 0.2.12
-contract. Authentication, execution requests, approvals, and Edge
-advertisements are not made permissive.
+contract. Future clients may continue requesting v2 when its semantics suffice;
+requesting a newer format from an older Server is an explicit compatibility
+failure. A generic HTTP 400 must not trigger automatic downgrade. Any future
+negotiation strategy must recognize the version-specific machine code and
+verify that the selected format can represent the required semantics.
+Authentication, execution requests, approvals, and Edge advertisements are not
+made permissive.
 
 Historical fixtures and binary identities do not move with the producer.
 Support changes must be reviewed separately and document affected features
