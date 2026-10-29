@@ -124,9 +124,13 @@ and keeps external-fork behavior part of the repository's delivery contract.
 
 The static author-ID allowlist in `scripts/ci/ci_scope.py` makes the eleven
 selected contributors (including Dependabot) eligible for a mini attempt.
-Trusted main/develop pushes and release builds remain on hosted runners, so
-unmerged PR state in the mini's HOME/Cargo/rustup directories is not reused by
-trusted builds. Other or unknown PR authors run on hosted macOS immediately; GitHub's existing fork approval remains in effect. Every Mac
+Pushes to upstream main/develop also prefer the same mini, without a PR-author
+allowlist. No develop branch is required; the route applies if one is created.
+PR and push jobs share the persistent account, HOME/Cargo/rustup state and local
+caches. Push permission does not make that environment clean; use separate
+accounts/runners or disposable macOS VMs if trusted-build isolation is required.
+Release builds retain their existing platforms and do not use this route.
+Other or unknown PR authors run on hosted macOS immediately; GitHub's existing fork approval remains in effect. Every Mac
 job re-executed on attempts greater than one runs hosted, even when its planner's
 old output is reused. GitHub may retain successful Mac jobs on a failed-only
 rerun; those checks still refer to the original tested merge. Required-check names retain
@@ -135,17 +139,39 @@ rerun; those checks still refer to the original tested merge. Required-check nam
 The ordinary Test Suite owns all required checks. Linux jobs depend only on
 scope and start without waiting for the mini. `Resolve macOS execution` has
 Actions/Pull requests read access and waits for a worker bound to its exact run
-ID, attempt and recorded merge SHA. Missing controller, API errors or missing
-routing output select real hosted tests, never a successful skip.
+ID, attempt and tested SHA (a PR merge or an upstream push commit). Missing
+controller, API errors or missing routing output select real hosted tests,
+never a successful skip. Transient GET failures (network/timeouts, 429, 5xx)
+get at most three attempts with short backoff; authorization failures and
+dispatch POSTs are not retried.
+
+PR admission verifies the merge's actual two parents, with the PR head as its
+second parent and its first parent equal to or an ancestor of the current
+target branch tip. The event's base SHA may be stale and is not the authority
+for this check. The PR head repository and current author ID are still verified.
+Upstream push admission requires main/develop, matching source/head/checkout
+SHAs and repository IDs, and the current branch tip. Workers execute the exact
+validated SHA, not a moving branch checkout.
+
+Both readers recheck current PR/head or push-tip status while queued/running.
+A changed head or closed PR, superseded push or ended source attempt produces
+`obsolete`, not `hosted`. The trusted scheduler requests cancellation of that
+source attempt and its owned worker; it rechecks the attempt before cancelling
+so a delayed controller cannot cancel a rerun. If cancellation/control access
+is unavailable, native Mac result gates run on Ubuntu and fail on `obsolete`;
+they neither allocate hosted Macs nor report missing tests as successful.
+An unexpected repository mismatch remains an unavailable-source error, not an
+assumed obsolete PR. Initial source validation and worker admission also apply
+these rules, covering PR updates before a worker starts.
 
 `macos-scheduler.yml` runs on the default branch on Test Suite's `workflow_run`
-start/completion events. It uses the built-in token's Actions write permission
+start/completion events for both PRs and pushes. It uses the built-in token's Actions write permission
 to dispatch/cancel `macos-mini.yml`; it never checks out PR code. No App,
 organization membership query, additional secret, custom required context or
 admission hook is needed. These workflows must exist on main before dispatch
 works. Before that, Test Suite falls back to hosted execution.
 
-A mini attempt gets a 180-second queue/discovery budget, with bounded API
+A mini attempt gets a 900-second (15-minute) queue/discovery budget, with bounded API
 requests, then falls back to the original hosted jobs in parallel. The
 reader/controller enforce a 60-minute execution budget even if the runner
 disappears; the worker has a separate 65-minute hard backstop. Thus single-machine
@@ -153,6 +179,9 @@ unavailability does not hold a
 required check for GitHub's 24-hour queue limit. API/control outages can prevent
 immediate child cancellation; the completion observer retries cleanup, and a
 late worker rejects an ended parent gate before candidate checkout.
+The parent gate has an 82-minute job timeout; the controller has 100 minutes
+to cover delayed gate startup plus queue/execution/cleanup. These are backstops,
+not an extension of the worker's 60-minute execution budget.
 
 The worker performs one candidate checkout, toolchain setup and cache restore,
 then runs default reader/Bash, reflow, coordination, vendored units and dev-tty
@@ -162,8 +191,8 @@ reported as failure, without hosted retry. Failed runs with incomplete test
 metadata also stay failed rather than hiding a possible test failure. Checkout,
 low-disk/toolchain setup,
 agent cancellation/loss or the execution budget select hosted fallback. The
-worker gets a read-only token and cache-mode read; PR work cannot save default
-branch Actions/sccache cache entries.
+worker gets a read-only token and cache-mode read for PRs and pushes; neither
+route saves default-branch Actions/sccache cache entries.
 
 The runner must match `[self-hosted, macOS, ARM64, mac-arm64-mini]`, be available
 to Astra (including public repository access), and support the pinned Actions,
@@ -175,15 +204,21 @@ the hosted fallback proceeds while operators restore mini capacity.
 
 One registration runs one bundle at a time. Other eligible runs use hosted Macs
 when their queue budget expires. Measure mini execution time, fallback rate,
-queue delay, API usage and hosted minutes; running attempts poll once per minute
+queue delay, API usage and hosted minutes; queued attempts poll every 30 seconds,
+running attempts poll once per minute
 and filter worker history by source creation time. Bundling reduces repeated
 preparation, but
 neither creates physical capacity nor guarantees the previous hosted elapsed
 time. The initial 60-minute budget needs qualification against actual load.
+The one-page fixture for a full 15-minute queue plus one hour of execution
+uses fewer than 900 combined reader/controller REST calls, excluding transient
+retries and extra pages. API failures still select hosted recovery, so actual
+load and quota headroom must be measured. Both polling jobs occupy Ubuntu
+runners while waiting; this change does not remove that control-plane cost.
 
 If the old App/controller design was staged, retire its unused App required
 contexts and admission hook, and permit the new `macos-mini.yml@main` worker in
 the runner group. Preserve existing GitHub Actions checks and fork approval.
-Rollback through a PR by routing all authors to hosted macOS; existing reruns
+Rollback through a PR by routing all events to hosted macOS; existing reruns
 already take that recovery path. No remote runner/group or protection settings
 are changed by the implementation PR.

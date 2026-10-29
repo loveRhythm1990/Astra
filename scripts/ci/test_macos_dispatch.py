@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 
 import macos_dispatch as dispatch
 
@@ -40,9 +41,12 @@ class ApiFixture:
             "head_repository": {"id": 42}, "repository": {"id": 7}}
         self.run["name"] = self.run["display_title"]
         self.pr = {"state": "open", "user": {"id": 52204121},
-                   "head": {"sha": HEAD, "repo": {"id": 42}}}
+                   "head": {"sha": HEAD, "repo": {"id": 42}},
+                   "base": {"ref": "main", "repo": {"id": 7}}}
         self.parents = [BASE, HEAD]
-        self.src = dispatch.Source(1, 1, MERGE)
+        self.tip = BASE
+        self.compare_status = "ahead"
+        self.src = dispatch.Source(1, 1, MERGE, pr_number=1126, head_sha=HEAD, head_repo_id=42)
         self.enabled = True
         self.assign_at, self.finish_at = 0, 30
         self.run_conclusion, self.test_conclusion = "success", "success"
@@ -51,6 +55,7 @@ class ApiFixture:
         self.gate_start_at = 0
         self.gate_conclusion = "success"
         self.source_end_at = None
+        self.pr_change_at = None
         self.other_runs = []
         self.posts, self.cancelled = [], []
         self.calls = []
@@ -63,9 +68,16 @@ class ApiFixture:
                 run["status"] = "completed"
             return run
         if path.endswith("/pulls/1126"):
-            return deepcopy(self.pr)
+            pr = deepcopy(self.pr)
+            if self.pr_change_at is not None and self.clock() >= self.pr_change_at:
+                pr["head"]["sha"] = "f" * 40
+            return pr
         if path.endswith("/commits/" + MERGE):
             return {"parents": [{"sha": sha} for sha in self.parents]}
+        if "/git/ref/heads/" in path:
+            return {"object": {"sha": self.tip}}
+        if "/compare/" in path:
+            return {"status": self.compare_status}
         raise AssertionError(path)
 
     def worker(self):
@@ -106,6 +118,41 @@ class ApiFixture:
 
 
 class SourceTests(unittest.TestCase):
+    def test_transient_reads_retry_but_permissions_and_dispatch_do_not(self):
+        for error in (URLError("temporary"), TimeoutError(),
+                      HTTPError("https://api.github.com/fixture", 503, "temporary", {}, None),
+                      HTTPError("https://api.github.com/fixture", 429, "temporary", {}, None)):
+            api = dispatch.Api("fixture")
+            with self.subTest(error=type(error).__name__), \
+                 patch.object(api, "_request", side_effect=[error, (b'{"id": 1}', {})]) as request, \
+                 patch.object(dispatch.time, "sleep") as sleep:
+                self.assertEqual(api.get("fixture"), {"id": 1})
+                self.assertEqual(request.call_count, 2)
+                sleep.assert_called_once_with(2)
+        for code in (401, 403, 404):
+            api = dispatch.Api("fixture")
+            with patch.object(api, "_request", side_effect=HTTPError("https://api.github.com/fixture", code, "denied", {}, None)) as request:
+                with self.assertRaises(HTTPError):
+                    api.get("fixture")
+                self.assertEqual(request.call_count, 1)
+        api = dispatch.Api("fixture")
+        with patch.object(api, "_request", side_effect=URLError("temporary")) as request:
+            with self.assertRaises(URLError):
+                api.post("dispatches", {})
+            self.assertEqual(request.call_count, 1)
+
+    def test_transient_read_retries_are_bounded_and_cover_collections(self):
+        api = dispatch.Api("fixture")
+        with patch.object(api, "_request", side_effect=URLError("temporary")) as request, \
+             patch.object(dispatch.time, "sleep") as sleep:
+            with self.assertRaises(URLError):
+                api.collection("fixture", "workflow_runs")
+            self.assertEqual(request.call_count, 3)
+            self.assertEqual(sleep.call_count, 2)
+        with patch.object(api, "_request", side_effect=[URLError("temporary"), (b'{"workflow_runs": []}', {})]), \
+             patch.object(dispatch.time, "sleep"):
+            self.assertEqual(api.collection("fixture", "workflow_runs"), [])
+
     def test_dispatch_serializes_json_through_the_shared_origin_checked_client(self):
         api = dispatch.Api("fixture")
         data = {"ref": "main", "inputs": {"source_run_id": "1"}}
@@ -149,11 +196,49 @@ class SourceTests(unittest.TestCase):
                 with self.assertRaises(dispatch.Unavailable):
                     dispatch.source(api, REPO, 1, 1)
 
-    def test_main_develop_pushes_cannot_enter_the_pr_runner(self):
+    def test_outdated_event_base_uses_real_merge_parent_on_target_branch(self):
+        api = ApiFixture()
+        api.parents[0] = "d" * 40
+        api.tip = "e" * 40
+        self.assertEqual(dispatch.source(api, REPO, 1, 1), api.src)
+        self.assertTrue(any(f"/compare/{'d' * 40}...{'e' * 40}" in c for c in api.calls))
+        api.compare_status = "diverged"
+        with self.assertRaises(dispatch.Unavailable):
+            dispatch.source(api, REPO, 1, 1)
+
+    def test_merge_parent_on_another_branch_or_wrong_base_repository_is_rejected(self):
+        for status in ("behind", "diverged", None):
+            api = ApiFixture()
+            api.tip = "e" * 40
+            api.compare_status = status
+            with self.assertRaises(dispatch.Unavailable):
+                dispatch.source(api, REPO, 1, 1)
+        api = ApiFixture()
+        api.pr["base"]["repo"]["id"] = 8
+        with self.assertRaises(dispatch.Unavailable):
+            dispatch.source(api, REPO, 1, 1)
+
+    def test_main_develop_pushes_use_the_current_upstream_commit(self):
         for branch in ("main", "develop"):
             api = ApiFixture()
             api.run.update(event="push", head_branch=branch, head_repository={"id": 7},
                 display_title=f"Test Suite pr=0 base={BASE} head={HEAD} merge={HEAD}")
+            api.tip = HEAD
+            src = dispatch.source(api, REPO, 1, 1)
+            self.assertEqual(src.sha, HEAD)
+            self.assertEqual(src.branch, branch)
+            self.assertFalse(any("/pulls/" in c for c in api.calls))
+            api.tip = "d" * 40
+            with self.assertRaises(dispatch.Superseded):
+                dispatch.source(api, REPO, 1, 1)
+
+    def test_fork_feature_and_inconsistent_pushes_are_rejected(self):
+        for changes in ({"head_branch": "feature"}, {"head_repository": {"id": 42}},
+                        {"display_title": f"Test Suite pr=0 base={BASE} head={HEAD} merge={MERGE}"}):
+            api = ApiFixture()
+            api.run.update(event="push", head_branch="main", head_repository={"id": 7},
+                display_title=f"Test Suite pr=0 base={BASE} head={HEAD} merge={HEAD}")
+            api.run.update(changes)
             with self.assertRaises(dispatch.Unavailable):
                 dispatch.source(api, REPO, 1, 1)
 
@@ -176,8 +261,23 @@ class WaitTests(unittest.TestCase):
 
     def test_assigned_worker_may_complete_after_queue_deadline(self):
         api = ApiFixture()
-        api.assign_at, api.finish_at = 170, 200
+        api.assign_at, api.finish_at = 890, 950
         self.assertEqual(self.wait(api), "success")
+
+    def test_queue_budget_is_fifteen_minutes_not_three(self):
+        self.assertEqual(dispatch.QUEUE_SECONDS, 15 * 60)
+        api = ApiFixture()
+        api.assign_at, api.finish_at = 600, 660
+        self.assertEqual(self.wait(api), "success")
+
+    def test_updated_pr_stops_while_queued_or_running(self):
+        for assigned in (0, 100000):
+            api = ApiFixture()
+            api.assign_at, api.finish_at = assigned, 100000
+            api.pr_change_at = 120
+            with self.assertRaises(dispatch.Superseded):
+                self.wait(api)
+            self.assertLessEqual(api.clock(), 120 + dispatch.RUNNING_POLL_SECONDS)
 
     def test_execution_deadline_and_agent_loss_use_hosted(self):
         api = ApiFixture()
@@ -185,15 +285,17 @@ class WaitTests(unittest.TestCase):
         self.assertEqual(self.wait(api), "hosted")
         self.assertEqual(api.clock(), dispatch.EXECUTION_SECONDS)
 
-    def test_one_hour_attempt_stays_below_half_the_default_rest_budget(self):
+    def test_full_queue_plus_one_hour_attempt_stays_below_default_rest_budget(self):
         api = ApiFixture()
+        api.assign_at = 890
         api.finish_at = 100000
         self.assertEqual(self.wait(api), "hosted")
         read_calls = len(api.calls)
         api = ApiFixture()
+        api.assign_at = 890
         api.finish_at = 100000
         dispatch.schedule(api, REPO, api.src, clock=api.clock, sleep=api.clock.sleep)
-        self.assertLess(read_calls + len(api.calls), 500)
+        self.assertLess(read_calls + len(api.calls), 900)
 
     def test_actual_test_failure_never_becomes_hosted_retry(self):
         api = ApiFixture()
@@ -315,7 +417,11 @@ class SchedulerTests(unittest.TestCase):
             api = ApiFixture()
             api.finish_at = 100000
             setattr(api, field, 20)
-            self.run_scheduler(api)
+            if field == "source_end_at":
+                with self.assertRaises(dispatch.Superseded):
+                    self.run_scheduler(api)
+            else:
+                self.run_scheduler(api)
             self.assertEqual(api.cancelled, [10])
             self.assertLessEqual(api.clock(), 20 + dispatch.RUNNING_POLL_SECONDS)
 
@@ -348,6 +454,81 @@ class EntrypointTests(unittest.TestCase):
         api.finish_at = 0
         api.run_conclusion = api.test_conclusion = "failure"
         self.assertEqual(self.invoke(api, "wait"), (0, "result=failure\n"))
+
+    def test_updated_or_closed_pr_does_not_start_hosted_tests(self):
+        for change in ({"state": "closed"}, {"state": "closed", "head": {"sha": HEAD, "repo": None}},
+                       {"head": {"sha": "d" * 40, "repo": {"id": 42}}}):
+            api = ApiFixture()
+            api.pr.update(change)
+            self.assertEqual(self.invoke(api, "wait"), (0, "result=obsolete\n"))
+            self.assertEqual(self.invoke(api, "schedule")[0], 0)
+            self.assertIn(1, api.cancelled)
+            self.assertIn(10, api.cancelled)
+            self.assertEqual(self.invoke(api, "admit")[0], 1)
+            self.assertEqual(api.posts, [])
+
+    def test_unknown_pr_state_keeps_hosted_recovery_instead_of_cancelling(self):
+        api = ApiFixture()
+        api.pr.pop("state")
+        self.assertEqual(self.invoke(api, "wait"), (0, "result=hosted\n"))
+        self.assertEqual(api.cancelled, [])
+
+    def test_obsolete_controller_never_cancels_a_new_attempt(self):
+        api = ApiFixture()
+        original = api.get
+        calls = 0
+
+        def get(path):
+            nonlocal calls
+            if path.endswith("/actions/runs/1"):
+                calls += 1
+                if calls == 2:
+                    api.run["run_attempt"] = 2
+            return original(path)
+
+        api.pr["state"] = "closed"
+        api.get = get
+        self.assertEqual(self.invoke(api, "schedule")[0], 0)
+        self.assertNotIn(1, api.cancelled)
+        self.assertIn(10, api.cancelled)
+
+    def test_obsolete_parent_cancel_failure_still_cleans_up_child(self):
+        api = ApiFixture()
+        api.pr["state"] = "closed"
+        original = api.cancel_run
+
+        def cancel(repo, run_id):
+            if run_id == 1:
+                raise URLError("temporary")
+            return original(repo, run_id)
+
+        api.cancel_run = cancel
+        self.assertEqual(self.invoke(api, "schedule")[0], 1)
+        self.assertIn(10, api.cancelled)
+        self.assertEqual(self.invoke(api, "wait"), (0, "result=obsolete\n"))
+
+    def test_main_push_dispatches_the_exact_commit_and_uses_same_result_gate(self):
+        api = ApiFixture()
+        api.run.update(event="push", head_branch="main", head_repository={"id": 7},
+            display_title=f"Test Suite pr=0 base={BASE} head={HEAD} merge={HEAD}")
+        api.tip = HEAD
+        api.src = dispatch.Source(1, 1, HEAD, branch="main")
+        api.finish_at = 0
+        self.assertEqual(self.invoke(api, "wait"), (0, "result=success\n"))
+        api.enabled = False
+        self.assertEqual(self.invoke(api, "schedule")[0], 0)
+        self.assertEqual(api.posts[0][1]["inputs"]["source_sha"], HEAD)
+
+    def test_scheduler_and_parent_timeouts_cover_queue_plus_execution(self):
+        import re
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        gate = workflow.split("\n  macos-plan:\n")[1].split("    steps:\n")[0]
+        scheduler = (ROOT / ".github/workflows/macos-scheduler.yml").read_text()
+        self.assertGreater(int(re.search(r"timeout-minutes: (\d+)", gate)[1]) * 60,
+                           dispatch.QUEUE_SECONDS + dispatch.EXECUTION_SECONDS)
+        self.assertGreater(int(re.search(r"timeout-minutes: (\d+)", scheduler)[1]) * 60,
+                           2 * dispatch.QUEUE_SECONDS + dispatch.EXECUTION_SECONDS)
+        self.assertIn('["pull_request","push"]', scheduler)
 
     def test_completion_cancels_orphan_even_after_pr_close_or_attempt_change(self):
         api = ApiFixture()

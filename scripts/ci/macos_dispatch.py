@@ -10,10 +10,11 @@ import os
 from pathlib import Path
 import re
 import time
-from urllib.parse import urlencode
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
 
 from cancel_stale_pr_runs import GitHubApi, MAX_PAGES
-from ci_scope import MACOS_SELF_HOSTED_LABELS, select_macos_runner
+from ci_scope import MACOS_PUSH_BRANCHES, MACOS_SELF_HOSTED_LABELS, select_macos_runner
 
 
 WORKFLOW = "macos-mini.yml"
@@ -22,9 +23,9 @@ WAIT_STEP = "Wait for a bounded mini attempt"
 TEST_STEP = "Run all macOS lanes"
 PREFLIGHT_STEPS = {"Set up job", "Checkout control policy", "Validate mini dispatch",
                    "Checkout candidate", "Prepare Rust", "Prepare Node"}
-QUEUE_SECONDS = 180
+QUEUE_SECONDS = 900
 EXECUTION_SECONDS = 3600
-POLL_SECONDS = 20
+POLL_SECONDS = 30
 RUNNING_POLL_SECONDS = 60
 TITLE = re.compile(r"Test Suite pr=(\d+) base=([0-9a-f]{40}) head=([0-9a-f]{40}) merge=([0-9a-f]{40})")
 
@@ -33,9 +34,31 @@ class Unavailable(RuntimeError):
     pass
 
 
+class Superseded(Unavailable):
+    """An obsolete source needs cancellation, not another executor."""
+
+    def __init__(self, reason, src):
+        super().__init__(reason)
+        self.src = src
+
+
 class Api(GitHubApi):
+    def _read(self, path):
+        # Retry only idempotent reads. Retrying dispatch could create duplicate
+        # workers; authorization failures must still fall back immediately.
+        for attempt in range(3):
+            try:
+                return self._request("GET", path)
+            except (URLError, TimeoutError) as error:
+                if isinstance(error, HTTPError):
+                    error.close()
+                if (isinstance(error, HTTPError) and error.code != 429 and error.code < 500) or attempt == 2:
+                    raise
+                print("::notice::Retrying a transient mini API read")
+                time.sleep(2 * (attempt + 1))
+
     def get(self, path):
-        return self._get_json(path)
+        return json.loads(self._read(path)[0])
 
     def post(self, path, data):
         self._request("POST", path, data=data)
@@ -46,7 +69,7 @@ class Api(GitHubApi):
             if path in visited or len(visited) >= MAX_PAGES:
                 raise Unavailable("pagination bound exceeded")
             visited.add(path)
-            body, headers = self._request("GET", path)
+            body, headers = self._read(path)
             page = json.loads(body)
             if not isinstance(page.get(key), list):
                 raise Unavailable("missing API collection")
@@ -61,10 +84,36 @@ class Source:
     attempt: int
     sha: str
     created_at: str | None = None
+    pr_number: int = 0
+    head_sha: str = ""
+    head_repo_id: int | None = None
+    branch: str = ""
 
     @property
     def title(self):
         return f"Mac mini for Test Suite {self.run_id}/{self.attempt} {self.sha}"
+
+
+def check_current(api, repo, src, run=None):
+    run = run if run is not None else api.get(f"repos/{repo}/actions/runs/{src.run_id}")
+    if run.get("run_attempt") != src.attempt or run.get("status") == "completed":
+        raise Superseded("source attempt ended", src)
+    if src.pr_number:
+        pr = api.get(f"repos/{repo}/pulls/{src.pr_number}")
+        if pr.get("state") == "closed":
+            raise Superseded("PR was closed", src)
+        if pr.get("state") != "open":
+            raise Unavailable("unknown PR state")
+        if (pr.get("head", {}).get("repo") or {}).get("id") != src.head_repo_id:
+            raise Unavailable("PR head repository changed")
+        if pr["head"]["sha"] != src.head_sha:
+            raise Superseded("PR was updated", src)
+        return pr
+    if src.branch:
+        tip = api.get(f"repos/{repo}/git/ref/heads/{quote(src.branch, safe='')}")["object"]["sha"]
+        if tip != src.sha:
+            raise Superseded("push was superseded", src)
+    return None
 
 
 def source(api, repo, run_id, attempt):
@@ -73,28 +122,45 @@ def source(api, repo, run_id, attempt):
     # GitHub may populate name with the dynamic run-name as well. The workflow
     # path is the identity; the title carries the immutable event tuple.
     if (run.get("id") != run_id or run.get("path") != ".github/workflows/test.yml"
-            or run.get("run_attempt") != attempt or attempt != 1
-            or run.get("status") == "completed" or not match):
+            or run.get("run_attempt") != attempt or attempt != 1 or not match):
         raise Unavailable("source run is not a current mini candidate")
-    pr_number, base, head, merge = match.groups()
+    pr_number, event_base, head, merge = match.groups()
     if run.get("head_sha") != head:
         raise Unavailable("source head mismatch")
     if run.get("event") == "pull_request" and int(pr_number) > 0:
         # Fork run.pull_requests can be empty. The event title records the PR
         # and immutable merge tuple, rather than relying on that association.
-        pr = api.get(f"repos/{repo}/pulls/{pr_number}")
-        if (pr["head"]["sha"] != head or pr["state"] != "open"
-                or pr["head"]["repo"]["id"] != run["head_repository"]["id"]):
-            raise Unavailable("PR source changed")
+        src = Source(run_id, attempt, merge, run.get("created_at"),
+                     int(pr_number), head, run["head_repository"]["id"])
+        pr = check_current(api, repo, src, run)
         parents = api.get(f"repos/{repo}/commits/{merge}")["parents"]
-        if [parent["sha"] for parent in parents] != [base, head]:
+        if len(parents) != 2 or parents[1]["sha"] != head:
             raise Unavailable("unverified merge tuple")
+        # The PR event's base SHA can lag the actual synthetic merge. Validate
+        # its real first parent against the target branch, not that stale field.
+        if pr["base"]["repo"]["id"] != run["repository"]["id"]:
+            raise Unavailable("unexpected PR base repository")
+        target = api.get(f"repos/{repo}/git/ref/heads/{quote(pr['base']['ref'], safe='')}")["object"]["sha"]
+        actual_base = parents[0]["sha"]
+        if actual_base != target:
+            comparison = api.get(f"repos/{repo}/compare/{actual_base}...{target}")
+            if comparison.get("status") not in {"ahead", "identical"}:
+                raise Unavailable("merge base is not on the target branch")
+        if actual_base != event_base:
+            print("::notice::Validated actual merge parents despite an outdated event base SHA")
         labels = select_macos_runner("pull_request", {"pull_request": {"user": pr["user"]}})
+    elif (run.get("event") == "push" and int(pr_number) == 0
+          and run.get("head_branch") in MACOS_PUSH_BRANCHES and head == merge
+          and run["head_repository"]["id"] == run["repository"]["id"]):
+        branch = run["head_branch"]
+        src = Source(run_id, attempt, head, run.get("created_at"), branch=branch)
+        check_current(api, repo, src, run)
+        labels = select_macos_runner("push", {"ref": f"refs/heads/{branch}"})
     else:
         raise Unavailable("unsupported source event")
     if labels != MACOS_SELF_HOSTED_LABELS:
         raise Unavailable("source does not prefer mini")
-    return Source(run_id, attempt, merge, run.get("created_at"))
+    return src
 
 
 def jobs(api, repo, run_id, attempt):
@@ -104,8 +170,7 @@ def jobs(api, repo, run_id, attempt):
 
 def gate_active(api, repo, src):
     run = api.get(f"repos/{repo}/actions/runs/{src.run_id}")
-    if run.get("run_attempt") != src.attempt or run.get("status") == "completed":
-        return False
+    check_current(api, repo, src, run)
     return any(job.get("name") == GATE and job.get("status") == "in_progress"
                and any(step.get("name") == WAIT_STEP and step.get("status") == "in_progress"
                        for step in job.get("steps", []))
@@ -158,9 +223,7 @@ def wait_for_mini(api, repo, src, *, clock=time.monotonic, sleep=time.sleep):
     queued_at, assigned_at = clock(), None
     announced = None
     while True:
-        run = api.get(f"repos/{repo}/actions/runs/{src.run_id}")
-        if run.get("run_attempt") != src.attempt or run.get("status") == "completed":
-            raise Unavailable("source attempt ended")
+        check_current(api, repo, src)
         candidates = workers(api, repo, src)
         if len(candidates) > 1:
             raise Unavailable("duplicate mini dispatch")
@@ -272,6 +335,24 @@ def main():
                 raise Unavailable("dispatch expired before execution")
             return 0
         outcome = wait_for_mini(api, repo, src)
+    except Superseded as error:
+        print(f"::notice::Obsolete mini source ({error}); no hosted retry")
+        outcome = "obsolete"
+        if args.mode == "schedule":
+            # Only the trusted controller has Actions write. Bind cancellation
+            # to the same attempt; a delayed old controller cannot cancel a rerun.
+            try:
+                try:
+                    run = api.get(f"repos/{repo}/actions/runs/{error.src.run_id}")
+                    if run.get("run_attempt") == error.src.attempt and run.get("status") != "completed":
+                        api.cancel_run(repo, error.src.run_id)
+                finally:
+                    cancel_workers(api, repo, error.src)
+            except Exception:
+                print("::warning::Obsolete-run cancellation incomplete; no hosted retry")
+                return 1
+        if args.mode == "admit":
+            return 1
     except Exception as error:
         # Do not print API bodies, credential-bearing URLs or private config.
         reason = str(error) if isinstance(error, Unavailable) else type(error).__name__
