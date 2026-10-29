@@ -2,6 +2,9 @@
 """Exercise dispatch/queue/fallback against the production entrypoints."""
 
 from copy import deepcopy
+from contextlib import contextmanager
+from http.client import IncompleteRead
+from io import BytesIO, StringIO
 import json
 import os
 from pathlib import Path
@@ -29,6 +32,15 @@ class Clock:
 
     def sleep(self, seconds):
         self.now += seconds
+
+
+@contextmanager
+def api_clock():
+    clock = Clock()
+    with patch.object(dispatch.time, "monotonic", side_effect=clock), \
+         patch.object(dispatch.time, "time", side_effect=lambda: 1000 + clock()), \
+         patch.object(dispatch.time, "sleep", side_effect=clock.sleep):
+        yield clock
 
 
 class ApiFixture:
@@ -59,9 +71,15 @@ class ApiFixture:
         self.other_runs = []
         self.posts, self.cancelled = [], []
         self.calls = []
+        self.timed_calls = []
+        self.deadline = None
+
+    def set_deadline(self, deadline):
+        self.deadline = deadline
 
     def get(self, path):
         self.calls.append(path)
+        self.timed_calls.append(self.clock())
         if path.endswith("/actions/runs/1"):
             run = deepcopy(self.run)
             if self.source_end_at is not None and self.clock() >= self.source_end_at:
@@ -88,6 +106,7 @@ class ApiFixture:
 
     def collection(self, path, key):
         self.calls.append(path)
+        self.timed_calls.append(self.clock())
         if "/workflows/macos-mini.yml/runs?" in path:
             return ([self.worker()] if self.enabled else []) + deepcopy(self.other_runs)
         if "/runs/1/attempts/1/jobs?" in path:
@@ -110,6 +129,7 @@ class ApiFixture:
 
     def post(self, path, data):
         self.posts.append((path, data))
+        self.dispatch_time, self.dispatch_deadline = self.clock(), self.deadline
         self.enabled = True
 
     def cancel_run(self, repo, run_id):
@@ -118,39 +138,139 @@ class ApiFixture:
 
 
 class SourceTests(unittest.TestCase):
+    def test_conditional_get_uses_only_a_server_validated_cached_body(self):
+        api = dispatch.Api("fixture")
+        headers = {"ETag": '"version-1"'}
+        responses = [(b'{"id": 1}', headers),
+                     HTTPError("https://api.github.com/fixture", 304, "unchanged", {}, None),
+                     (b'{"id": 2}', {"ETag": '"version-2"'})]
+        with patch.object(dispatch.GitHubApi, "_request", side_effect=responses) as request:
+            self.assertEqual(api.get("fixture"), {"id": 1})
+            self.assertEqual(api.get("fixture"), {"id": 1})
+            self.assertEqual(request.call_args.kwargs["etag"], '"version-1"')
+            self.assertEqual(api.get("fixture"), {"id": 2})
+        with patch.object(dispatch.GitHubApi, "_request", side_effect=URLError("offline")), api_clock():
+            with self.assertRaises(URLError):
+                api.get("fixture")
+        self.assertEqual(api._conditional["fixture"][0], b'{"id": 2}')
+
+    def test_conditional_collection_keeps_pagination_and_rejects_uncached_304(self):
+        api = dispatch.Api("fixture")
+        first = {"ETag": '"page-1"', "Link": '<https://api.github.com/page2>; rel="next"'}
+        second = {"ETag": '"page-2"'}
+        responses = [(b'{"workflow_runs": [{"id": 1}]}', first),
+                     (b'{"workflow_runs": [{"id": 2}]}', second),
+                     HTTPError("https://api.github.com/page1", 304, "unchanged", {}, None),
+                     HTTPError("https://api.github.com/page2", 304, "unchanged", {}, None)]
+        with patch.object(dispatch.GitHubApi, "_request", side_effect=responses):
+            self.assertEqual(api.collection("page1", "workflow_runs"), [{"id": 1}, {"id": 2}])
+            self.assertEqual(api.collection("page1", "workflow_runs"), [{"id": 1}, {"id": 2}])
+        with patch.object(dispatch.GitHubApi, "_request", side_effect=HTTPError("https://api.github.com/unknown", 304, "unchanged", {}, None)):
+            with self.assertRaises(dispatch.Unavailable):
+                api.get("unknown")
+
+    def test_rate_limits_obey_headers_and_secondary_limit_backoff(self):
+        cases = [
+            (429, {"Retry-After": "75"}, b"", 75),
+            (403, {"Retry-After": "95"}, b"", 95),
+            (403, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1100"}, b"", 101),
+            (429, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1100", "Retry-After": "150"}, b"", 150),
+            (429, {"Retry-After": "Thu, 01 Jan 1970 00:18:20 GMT"}, b"", 101),
+            (403, {}, b'{"message": "You have exceeded a secondary rate limit."}', 60),
+        ]
+        for code, headers, body, expected in cases:
+            api = dispatch.Api("fixture")
+            error = HTTPError("https://api.github.com/fixture", code, "limited", headers, BytesIO(body))
+            with self.subTest(code=code, headers=headers), api_clock() as clock, \
+                 patch.object(dispatch.GitHubApi, "_request", side_effect=[error, (b'{"id": 1}', {})]):
+                api.set_deadline(900)
+                self.assertEqual(api.get("fixture"), {"id": 1})
+                self.assertEqual(clock(), expected)
+        api = dispatch.Api("fixture")
+        errors = [HTTPError("https://api.github.com/fixture", 429, "limited", {}, None) for _ in range(3)]
+        with api_clock() as clock, patch.object(dispatch.GitHubApi, "_request", side_effect=errors) as request:
+            with self.assertRaises(HTTPError):
+                api.get("fixture")
+            self.assertEqual(clock(), 180)
+            self.assertEqual(request.call_count, 3)
+
+    def test_backoff_cannot_overrun_budget_or_skip_a_source_update(self):
+        api = dispatch.Api("fixture")
+        error = HTTPError("https://api.github.com/fixture", 429, "limited", {"Retry-After": "100"}, None)
+        with api_clock() as clock, patch.object(dispatch.GitHubApi, "_request", side_effect=error) as request:
+            api.set_deadline(90)
+            with self.assertRaises(dispatch.Unavailable):
+                api.get("fixture")
+            self.assertEqual(clock(), 0)
+            self.assertEqual(request.call_count, 1)
+
+        fixture = ApiFixture()
+        fixture.finish_at = 0
+        original = fixture.collection
+
+        def collection(path, key):
+            result = original(path, key)
+            if "/runs/10/attempts/1/jobs?" in path:
+                fixture.pr["head"]["sha"] = "d" * 40
+            return result
+
+        fixture.collection = collection
+        with self.assertRaises(dispatch.Superseded):
+            dispatch.wait_for_mini(fixture, REPO, fixture.src, clock=fixture.clock, sleep=fixture.clock.sleep)
+
+    def test_quota_diagnostic_outputs_only_numeric_selected_headers(self):
+        api = dispatch.Api("fixture")
+        headers = {"X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "998", "X-RateLimit-Reset": "2000",
+                   "Set-Cookie": "private-fixture", "Authorization": "private-fixture"}
+        from contextlib import redirect_stdout
+        stream = StringIO()
+        with patch.object(dispatch.GitHubApi, "_request", return_value=(b'{}', headers)), redirect_stdout(stream):
+            api.get("fixture")
+            api.get("fixture")
+        self.assertEqual(stream.getvalue().count("GitHub API quota:"), 1)
+        self.assertIn("limit=1000, remaining=998, reset=2000", stream.getvalue())
+        self.assertNotIn("private-fixture", stream.getvalue())
+        api = dispatch.Api("fixture")
+        with patch.object(dispatch.GitHubApi, "_request", return_value=(b'{}', headers)), \
+             patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": "fixture"}), \
+             patch.object(Path, "open", side_effect=OSError("unwritable")), redirect_stdout(StringIO()):
+            self.assertEqual(api.get("fixture"), {})
+
     def test_transient_reads_retry_but_permissions_and_dispatch_do_not(self):
-        for error in (URLError("temporary"), TimeoutError(),
-                      HTTPError("https://api.github.com/fixture", 503, "temporary", {}, None),
-                      HTTPError("https://api.github.com/fixture", 429, "temporary", {}, None)):
+        for error in (URLError("temporary"), TimeoutError(), ConnectionResetError(),
+                      IncompleteRead(b"partial"),
+                      HTTPError("https://api.github.com/fixture", 503, "temporary", {}, None)):
             api = dispatch.Api("fixture")
             with self.subTest(error=type(error).__name__), \
-                 patch.object(api, "_request", side_effect=[error, (b'{"id": 1}', {})]) as request, \
-                 patch.object(dispatch.time, "sleep") as sleep:
+                 patch.object(dispatch.GitHubApi, "_request", side_effect=[error, (b'{"id": 1}', {})]) as request, \
+                 api_clock() as clock:
                 self.assertEqual(api.get("fixture"), {"id": 1})
                 self.assertEqual(request.call_count, 2)
-                sleep.assert_called_once_with(2)
+                self.assertEqual(clock(), 2)
         for code in (401, 403, 404):
             api = dispatch.Api("fixture")
-            with patch.object(api, "_request", side_effect=HTTPError("https://api.github.com/fixture", code, "denied", {}, None)) as request:
+            with patch.object(dispatch.GitHubApi, "_request", side_effect=HTTPError("https://api.github.com/fixture", code, "denied", {}, None)) as request:
                 with self.assertRaises(HTTPError):
                     api.get("fixture")
                 self.assertEqual(request.call_count, 1)
         api = dispatch.Api("fixture")
-        with patch.object(api, "_request", side_effect=URLError("temporary")) as request:
+        with patch.object(dispatch.GitHubApi, "_request", side_effect=URLError("temporary")) as request:
             with self.assertRaises(URLError):
                 api.post("dispatches", {})
             self.assertEqual(request.call_count, 1)
 
     def test_transient_read_retries_are_bounded_and_cover_collections(self):
         api = dispatch.Api("fixture")
-        with patch.object(api, "_request", side_effect=URLError("temporary")) as request, \
-             patch.object(dispatch.time, "sleep") as sleep:
+        with patch.object(dispatch.GitHubApi, "_request", side_effect=URLError("temporary")) as request, \
+             api_clock() as clock:
             with self.assertRaises(URLError):
                 api.collection("fixture", "workflow_runs")
             self.assertEqual(request.call_count, 3)
-            self.assertEqual(sleep.call_count, 2)
-        with patch.object(api, "_request", side_effect=[URLError("temporary"), (b'{"workflow_runs": []}', {})]), \
-             patch.object(dispatch.time, "sleep"):
+            self.assertEqual(clock(), 6)
+        # Use a fresh client after the exhausted client's cooldown.
+        api = dispatch.Api("fixture")
+        with patch.object(dispatch.GitHubApi, "_request", side_effect=[URLError("temporary"), (b'{"workflow_runs": []}', {})]), \
+             api_clock():
             self.assertEqual(api.collection("fixture", "workflow_runs"), [])
 
     def test_dispatch_serializes_json_through_the_shared_origin_checked_client(self):
@@ -166,6 +286,18 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(json.loads(request.data), data)
             self.assertEqual(request.get_header("Content-type"), "application/json")
             self.assertEqual(opener.open.call_args.kwargs["timeout"], 10)
+
+    def test_conditional_header_keeps_the_shared_origin_checked_transport(self):
+        api = dispatch.Api("fixture")
+        with patch.object(api, "_opener") as opener:
+            response = opener.open.return_value.__enter__.return_value
+            response.read.return_value = b'{}'
+            response.headers = {}
+            api._request("GET", f"repos/{REPO}/fixture", etag='"etag"')
+            self.assertEqual(opener.open.call_args.args[0].get_header("If-none-match"), '"etag"')
+            with self.assertRaises(RuntimeError):
+                api._request("GET", "https://example.invalid/fixture", etag='"etag"')
+            self.assertEqual(opener.open.call_count, 1)
 
     def test_empty_fork_pr_association_uses_verified_merge_tuple(self):
         api = ApiFixture()
@@ -295,7 +427,23 @@ class WaitTests(unittest.TestCase):
         api.assign_at = 890
         api.finish_at = 100000
         dispatch.schedule(api, REPO, api.src, clock=api.clock, sleep=api.clock.sleep)
-        self.assertLess(read_calls + len(api.calls), 900)
+        self.assertLess(read_calls + len(api.calls), 400)
+
+    def test_repository_budget_for_one_active_and_four_queued_prs(self):
+        # Count the rolling repository load, assuming every response is 200
+        # (no ETag savings), and include 20 startup/admission/write requests per
+        # source. This is a stated workload envelope, not unlimited concurrency.
+        calls = []
+        for index in range(5):
+            for role in (dispatch.wait_for_mini, dispatch.schedule):
+                api = ApiFixture()
+                api.assign_at = 0 if index == 0 else 100000
+                api.finish_at = 100000
+                role(api, REPO, api.src, clock=api.clock, sleep=api.clock.sleep)
+                calls.extend(api.timed_calls)
+            calls.extend([0] * 20)
+        peak = max(sum(start <= call < start + 3600 for call in calls) for start in set(calls))
+        self.assertLess(peak, 800, "Leave quota headroom for the repository's other workflows")
 
     def test_actual_test_failure_never_becomes_hosted_retry(self):
         api = ApiFixture()
@@ -394,6 +542,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(api.cancelled, [])
         self.assertGreaterEqual(api.clock(), 300)
         self.assertLessEqual(api.clock(), 300 + dispatch.RUNNING_POLL_SECONDS)
+        self.assertEqual(api.dispatch_deadline, api.dispatch_time + dispatch.QUEUE_SECONDS)
 
     def test_cancel_failure_does_not_prevent_other_owned_workers_from_cancelling(self):
         api = ApiFixture()

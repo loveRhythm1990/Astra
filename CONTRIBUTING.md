@@ -116,6 +116,8 @@ can attempt one self-hosted ARM bundle containing all five Mac lanes.
 Main/develop pushes also prefer the mini without a PR-author allowlist; release
 builds retain their existing hosted platforms. PR and push jobs share the
 persistent mini environment; this does not provide a clean trusted-build boundary.
+Main includes merged external contributions and dependency install/build scripts;
+the PR allowlist does not constrain the origins of all code executed on the mini.
 A 15-minute queue/discovery or setup failure falls back to hosted jobs in parallel;
 real test failures remain failures. Updated/closed PRs and superseded pushes
 request cancellation instead of starting hosted Mac tests. Other authors and reruns use hosted macOS. Linux

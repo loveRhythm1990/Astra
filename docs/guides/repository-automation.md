@@ -127,7 +127,10 @@ selected contributors (including Dependabot) eligible for a mini attempt.
 Pushes to upstream main/develop also prefer the same mini, without a PR-author
 allowlist. No develop branch is required; the route applies if one is created.
 PR and push jobs share the persistent account, HOME/Cargo/rustup state and local
-caches. Push permission does not make that environment clean; use separate
+caches. Main includes merged contributions from authors outside the PR allowlist
+and dependency build/install scripts; the allowlist limits unmerged PR execution,
+not every origin of code that can eventually run on this host. Dependabot is
+already in the PR allowlist. Push permission does not make that environment clean; use separate
 accounts/runners or disposable macOS VMs if trusted-build isolation is required.
 Release builds retain their existing platforms and do not use this route.
 Other or unknown PR authors run on hosted macOS immediately; GitHub's existing fork approval remains in effect. Every Mac
@@ -141,9 +144,30 @@ scope and start without waiting for the mini. `Resolve macOS execution` has
 Actions/Pull requests read access and waits for a worker bound to its exact run
 ID, attempt and tested SHA (a PR merge or an upstream push commit). Missing
 controller, API errors or missing routing output select real hosted tests,
-never a successful skip. Transient GET failures (network/timeouts, 429, 5xx)
-get at most three attempts with short backoff; authorization failures and
-dispatch POSTs are not retried.
+never a successful skip. GETs use authenticated ETag revalidation when the
+server supplies an ETag. A 304 reuses only the exact previously fetched body
+and pagination links; network/API failures never authorize a stale cached result.
+GitHub does not charge correctly authenticated 304 responses against the primary
+rate limit. This is an optimization, not a prerequisite for the request budget.
+
+Transient GET failures (network/timeouts, connection resets, incomplete response
+bodies and 5xx) get at most three attempts. Rate-limit 403/429 responses respect
+Retry-After and primary reset headers; secondary limits without timing headers
+back off for at least 60 seconds and then exponentially. Permission-denied 403s
+and dispatch POSTs are not retried. Backoff is bounded by the remaining queue
+or execution budget, and initial source validation counts toward the queue
+budget. Thus a short API outage can recover without restarting healthy tests,
+but an outage that outlasts the budget can still require hosted recovery.
+Source freshness is checked again before publishing a worker outcome after
+potentially delayed reads.
+
+The first response with valid X-RateLimit-Limit/Remaining/Reset headers records
+only those numeric values in the job log and summary, using the actual workflow
+token. It never logs raw headers, tokens or response bodies. The default quota
+is 1,000 requests/hour per repository shared across workflows (15,000 for
+Enterprise Cloud), not an allowance for each PR. Do not infer this quota from
+a developer's PAT. See GitHub's [rate limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)
+and [conditional-request guidance](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api).
 
 PR admission verifies the merge's actual two parents, with the PR head as its
 second parent and its first parent equal to or an ancestor of the current
@@ -204,16 +228,20 @@ the hosted fallback proceeds while operators restore mini capacity.
 
 One registration runs one bundle at a time. Other eligible runs use hosted Macs
 when their queue budget expires. Measure mini execution time, fallback rate,
-queue delay, API usage and hosted minutes; queued attempts poll every 30 seconds,
-running attempts poll once per minute
+queue delay, API usage and hosted minutes; queued attempts poll every 90 seconds,
+running attempts poll every 120 seconds
 and filter worker history by source creation time. Bundling reduces repeated
 preparation, but
 neither creates physical capacity nor guarantees the previous hosted elapsed
 time. The initial 60-minute budget needs qualification against actual load.
 The one-page fixture for a full 15-minute queue plus one hour of execution
-uses fewer than 900 combined reader/controller REST calls, excluding transient
-retries and extra pages. API failures still select hosted recovery, so actual
-load and quota headroom must be measured. Both polling jobs occupy Ubuntu
+uses fewer than 400 combined reader/controller REST reads, excluding transient
+retries and extra pages. A rolling-hour fixture with one active and four queued
+sources, charging every response as 200 plus 20 startup/admission/write requests
+per source, stays below 800 requests. This leaves some repository quota headroom;
+it is not a guarantee for unlimited concurrency, extra pages, retries or unrelated
+workflow traffic. Measure real headers and fallback rates under load rather than
+assuming an Enterprise Cloud quota. Both polling jobs occupy Ubuntu
 runners while waiting; this change does not remove that control-plane cost.
 
 If the old App/controller design was staged, retire its unused App required
