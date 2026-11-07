@@ -16,7 +16,7 @@ use astra_tools::detach::{
 };
 use astra_tools::exit_semantics::{self, ExitSemantics};
 use astra_tools::shell_output_capture::{BashOutputCapture, BlockingCaptureWriter};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
 
@@ -415,45 +415,6 @@ fn empty_nonzero_exit_output(command: &str, exit_code: i32) -> String {
 
 fn should_append_exit_code(command: &str, exit_code: i32) -> bool {
     exit_semantics::classify_exit(command, exit_code).is_tool_error()
-}
-
-fn require_explicit_workspace_verification_receipt(
-    mut outcome: super::ToolExecutionOutcome,
-    explicit_verification: bool,
-    fingerprint_unavailable: bool,
-) -> super::ToolExecutionOutcome {
-    if explicit_verification && !outcome.is_error {
-        outcome.is_error = true;
-        if fingerprint_unavailable {
-            let evidence = astra_tools::workspace_observation::
-                explicit_workspace_verification_unavailable_evidence();
-            let fields = outcome
-                .tool_result_fields
-                .get_or_insert_with(serde_json::Map::new);
-            fields.insert(
-                "error_kind".to_string(),
-                Value::String(evidence.kind.as_str().to_string()),
-            );
-            fields.insert("retryable".to_string(), Value::Bool(false));
-            fields.insert(
-                "workspace_observation_retry_scope".to_string(),
-                Value::String("workspace_generation".to_string()),
-            );
-            fields.insert(
-                "recovery_evidence".to_string(),
-                serde_json::to_value(evidence).expect("verification evidence must serialize"),
-            );
-            outcome.output.push_str("\n\n");
-            outcome.output.push_str(
-                astra_tools::workspace_observation::EXPLICIT_WORKSPACE_VERIFICATION_UNAVAILABLE_MESSAGE,
-            );
-        } else {
-            outcome.output.push_str(
-                "\n\nError: verify-mode command did not produce an authoritative unchanged-workspace observation receipt.",
-            );
-        }
-    }
-    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -3310,7 +3271,6 @@ struct ShellRunConfig {
     command: String,
     timeout_secs: f64,
     harden_command: bool,
-    explicit_verification: bool,
     effective_project_root: PathBuf,
     workdir: Option<astra_tools::shell_ops::PreparedBashWorkdir>,
     sandbox_policy: Option<SandboxPolicy>,
@@ -3408,49 +3368,24 @@ struct ShellRunError {
     scope_ownership: Option<astra_sandbox::ScopeOwnership>,
 }
 
-// The lease owns the settlement fence even if the async caller is dropped.
+// Keep the workspace lease until the blocking shell worker returns.
 struct ShellScopeLease {
     attribution: astra_tools::workspace_observation::WorkspaceAttributionState,
     observation: Option<astra_tools::workspace_observation::WorkspaceObservationLease>,
     _workspace: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
-    ownership: Option<astra_sandbox::ScopeOwnership>,
-    unsettled: bool,
-}
-
-impl ShellScopeLease {
-    fn record(&mut self, result: &Result<ScopedShellOutput, ShellRunError>, command: &str) {
-        match result {
-            Ok(output) => {
-                self.ownership = output.scope_ownership;
-                self.unsettled = output.scope_ownership.is_none()
-                    && !astra_tools::workspace_observation::bash_command_is_detachable_safe(
-                        command,
-                    );
-            }
-            Err(error) if error.execution_started => {
-                self.ownership = error.scope_ownership;
-                self.unsettled = error.ownership_unsettled;
-            }
-            Err(_) => self.unsettled = false,
-        }
-    }
 }
 
 impl Drop for ShellScopeLease {
     fn drop(&mut self) {
-        if self.unsettled
-            || self
-                .observation
-                .as_ref()
-                .is_some_and(|lease| !lease.coordination_integrity_valid())
+        if self
+            .observation
+            .as_ref()
+            .is_some_and(|lease| !lease.coordination_integrity_valid())
         {
             self.attribution.mark_unsettled();
             if let Some(lease) = &self.observation {
                 lease.mark_unsettled();
             }
-        } else if astra_tools::shell_ops::bash_scope_requires_attribution_quarantine(self.ownership)
-        {
-            self.attribution.quarantine();
         }
     }
 }
@@ -3514,11 +3449,6 @@ fn run_shell_output_with_config(
             "Error: unable to establish Bash invocation owner: {error}"
         ))
     })?;
-    if config.explicit_verification && !invocation_owner.can_authoritatively_observe() {
-        return Err(ShellRunError::new(
-            "Error: bash mode=verify is unavailable: this executor cannot prove that all child processes have settled. No command was run. A typed workspace observer can check file state, but cannot replace a required script or test result.",
-        ));
-    }
     child_cmd.current_dir(&config.effective_project_root);
     if config.discard_output {
         child_cmd.stdout(Stdio::null()).stderr(Stdio::null());
@@ -3598,8 +3528,6 @@ fn run_shell_output_with_config(
     let progress_sink = config.progress_sink;
 
     let deadline = std::time::Instant::now() + Duration::from_secs_f64(config.timeout_secs);
-    let exit_status;
-    let scope_settlement;
     let (mut stdout_buf, mut stderr_buf) = match config.output_capture {
         Some((stdout, stderr)) => (
             ShellOutputBuffer::Captured(stdout),
@@ -3610,7 +3538,7 @@ fn run_shell_output_with_config(
             ShellOutputBuffer::Inline(Vec::new()),
         ),
     };
-    loop {
+    let completion = loop {
         let leader_pid = child.id();
         // Drain whatever's currently available on each pipe
         // without blocking. Updates the progress sink so the
@@ -3620,7 +3548,7 @@ fn run_shell_output_with_config(
 
         if stdout_buf.failed() || stderr_buf.failed() {
             let ownership = settle_owned_shell_after_termination(&mut child, &mut invocation_owner);
-            return Err(ShellRunError::after_process_started(
+            break Err(ShellRunError::after_process_started(
                 "Error: Bash output capture failed; command terminated with incomplete output",
                 astra_core::ErrorKind::ToolOutcomeUnknown,
                 ownership,
@@ -3629,10 +3557,10 @@ fn run_shell_output_with_config(
 
         match child.try_wait() {
             Ok(Some(status)) => {
-                scope_settlement = invocation_owner.settle_after_exit_detailed(Some(leader_pid));
+                let scope_settlement =
+                    invocation_owner.settle_after_exit_detailed(Some(leader_pid));
                 sync_sigkill_process_group_id(leader_pid);
-                exit_status = status;
-                break;
+                break Ok((status, scope_settlement));
             }
             Ok(None) => {
                 if config
@@ -3642,7 +3570,7 @@ fn run_shell_output_with_config(
                 {
                     let scope_ownership =
                         settle_owned_shell_after_termination(&mut child, &mut invocation_owner);
-                    return Err(ShellRunError::after_process_started(
+                    break Err(ShellRunError::after_process_started(
                         "Error: command cancelled by user",
                         astra_core::ErrorKind::Cancelled,
                         scope_ownership,
@@ -3651,7 +3579,7 @@ fn run_shell_output_with_config(
                 if std::time::Instant::now() > deadline {
                     let scope_ownership =
                         settle_owned_shell_after_termination(&mut child, &mut invocation_owner);
-                    return Err(ShellRunError::after_process_started(
+                    break Err(ShellRunError::after_process_started(
                         format!("Error: command timed out after {}s", config.timeout_secs),
                         astra_core::ErrorKind::ToolTimeout,
                         scope_ownership,
@@ -3662,14 +3590,14 @@ fn run_shell_output_with_config(
             Err(e) => {
                 let scope_ownership =
                     settle_owned_shell_after_termination(&mut child, &mut invocation_owner);
-                return Err(ShellRunError::after_process_started(
+                break Err(ShellRunError::after_process_started(
                     format!("Error: {e}"),
                     astra_core::ErrorKind::ToolOutcomeUnknown,
                     scope_ownership,
                 ));
             }
         }
-    }
+    };
 
     // Final drain: post-exit pipes may still have a trailing
     // chunk not yet read. Use the same `read_timeout` budget as
@@ -3687,6 +3615,33 @@ fn run_shell_output_with_config(
     }
     let stdout_buf = stdout_buf.into_bytes();
     let stderr_buf = stderr_buf.into_bytes();
+    let (exit_status, scope_settlement) = match completion {
+        Ok(completion) => completion,
+        Err(mut error) => {
+            let mut stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
+            let mut stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+            finalize_raw_streaming_capture(&mut stdout, true, false);
+            finalize_raw_streaming_capture(&mut stderr, true, false);
+            let stdout =
+                astra_text_utils::credential_redaction::redact_credentials_for_display(&stdout).0;
+            let stderr =
+                astra_text_utils::credential_redaction::redact_credentials_for_display(&stderr).0;
+            error.message.push_str(
+                ". Earlier effects may remain; inspect the current state before retrying.",
+            );
+            if !stdout.is_empty() {
+                error
+                    .message
+                    .push_str(&format!("\n\nstdout before interruption:\n{stdout}"));
+            }
+            if !stderr.is_empty() {
+                error
+                    .message
+                    .push_str(&format!("\n\nstderr before interruption:\n{stderr}"));
+            }
+            return Err(error);
+        }
+    };
     #[cfg(all(test, target_os = "linux"))]
     let stdout_buf = {
         let mut stdout_buf = stdout_buf;
@@ -4311,7 +4266,6 @@ impl ToolExecutor {
             command: command.to_string(),
             timeout_secs,
             harden_command,
-            explicit_verification: false,
             effective_project_root,
             workdir: None,
             sandbox_policy,
@@ -4674,7 +4628,7 @@ impl ToolExecutor {
         };
         if descendants_terminated {
             outcome.output.push_str(
-                "\n\nLive descendant processes were terminated when this foreground Bash call ended. They are not running now.",
+                "\n\nLive processes observed in this Bash execution scope were terminated when the call ended. Processes that escaped the scope may still run.",
             );
             if environment_background_authorized() && !self.read_only_execution {
                 outcome.output.push_str(
@@ -4706,7 +4660,6 @@ impl ToolExecutor {
         );
         if descendants_terminated {
             fields.insert("background_children_reaped".to_string(), Value::Bool(true));
-            fields.insert("descendant_persistence".to_string(), Value::Bool(false));
         }
         if outcome.is_error {
             let evidence = astra_tools::exit_semantics::command_failed_evidence();
@@ -4723,136 +4676,29 @@ impl ToolExecutor {
         outcome
     }
 
-    async fn capture_bash_workspace_before_async(
+    fn finish_bash_ownership(
         &self,
-        command: &str,
-    ) -> Option<astra_tools::workspace_observation::WorkspaceFingerprint> {
-        if command.trim().is_empty() {
-            return None;
-        }
-        let root = self.effective_project_root();
-        tokio::task::spawn_blocking(move || {
-            astra_tools::workspace_observation::WorkspaceFingerprint::capture(&root)
-        })
-        .await
-        .ok()
-        .flatten()
-    }
-
-    async fn attach_bash_workspace_observation_async(
-        &self,
-        outcome: super::ToolExecutionOutcome,
-        before: Option<astra_tools::workspace_observation::WorkspaceFingerprint>,
-        ownership_unsettled: bool,
-        scope_ownership: Option<astra_sandbox::ScopeOwnership>,
-        explicit_verification: bool,
-        observation_lease: Option<&astra_tools::workspace_observation::WorkspaceObservationLease>,
-    ) -> super::ToolExecutionOutcome {
-        let root = self.effective_project_root();
-        let quarantine_root = root.clone();
-        if ownership_unsettled
-            || observation_lease.is_some_and(|lease| {
-                !astra_tools::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid(lease)
-            })
-        {
-            astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                &quarantine_root,
-            );
-            return require_explicit_workspace_verification_receipt(
-                outcome,
-                explicit_verification,
-                false,
-            );
-        }
-        let Some(before) = before else {
-            return require_explicit_workspace_verification_receipt(
-                outcome,
-                explicit_verification,
-                true,
-            );
-        };
-        let after = tokio::task::spawn_blocking(move || {
-            astra_tools::workspace_observation::WorkspaceFingerprint::capture(&root)
-        })
-        .await
-        .ok()
-        .flatten();
-        Self::finish_bash_workspace_observation(
-            outcome,
-            before,
-            after,
-            scope_ownership,
-            explicit_verification,
-            observation_lease,
-        )
-    }
-
-    fn finish_bash_workspace_observation(
         mut outcome: super::ToolExecutionOutcome,
-        before: astra_tools::workspace_observation::WorkspaceFingerprint,
-        after: Option<astra_tools::workspace_observation::WorkspaceFingerprint>,
-        scope_ownership: Option<astra_sandbox::ScopeOwnership>,
-        explicit_verification: bool,
-        observation_lease: Option<&astra_tools::workspace_observation::WorkspaceObservationLease>,
+        ownership_unsettled: bool,
+        lease: Option<&astra_tools::workspace_observation::WorkspaceObservationLease>,
     ) -> super::ToolExecutionOutcome {
-        let after_captured = after.is_some();
-        let workspace_comparison = before.compare_with(after.as_ref());
-        let workspace_unchanged = matches!(
-            workspace_comparison,
-            astra_tools::workspace_observation::WorkspaceFingerprintComparison::Unchanged
-        );
-        // A completed owner-side fingerprint is useful even when the shell
-        // exits unsuccessfully.  Preserve the no-change fact separately from
-        // the explicit verify contract so a failed diagnostic probe cannot be
-        // mistaken for a workspace writer, while validation obligations still
-        // remain strict at the runtime boundary.
-        if workspace_unchanged
-            && scope_ownership.is_some_and(|ownership| ownership.is_authoritative())
-            && observation_lease.is_none_or(
-                astra_tools::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
-            )
-        {
-            if let Some(ownership) = scope_ownership {
-                outcome
-                    .tool_result_fields
-                    .get_or_insert_with(serde_json::Map::new)
-                    .extend(
-                        astra_tools::workspace_observation::
-                            unchanged_bash_observation_receipt_with_ownership(
-                                ownership.as_str(),
-                            ),
-                    );
-            }
-        }
-        if explicit_verification
-            && !outcome.is_error
-            && outcome
-                .tool_result_fields
-                .as_ref()
-                .and_then(|fields| fields.get("exit_code"))
-                .and_then(Value::as_i64)
-                == Some(0)
-            && workspace_unchanged
-            && scope_ownership.is_some_and(|ownership| ownership.is_authoritative())
-            && observation_lease.is_none_or(
-                astra_tools::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
-            )
-        {
-            outcome
-                .tool_result_fields
-                .get_or_insert_with(serde_json::Map::new)
-                .extend(
-                    astra_tools::workspace_observation::explicit_workspace_verification_receipt(),
-                );
-        } else if explicit_verification && !outcome.is_error {
-            outcome = require_explicit_workspace_verification_receipt(
-                outcome,
-                explicit_verification,
-                !after_captured,
+        let coordination_unsettled =
+            lease.is_some_and(|lease| !lease.coordination_integrity_valid());
+        if coordination_unsettled {
+            astra_tools::workspace_observation::mark_workspace_observation_unsettled(
+                &self.effective_project_root(),
             );
         }
-        // A changed snapshot does not identify the writer: another session or
-        // an editor may have modified the workspace while the shell ran.
+        if ownership_unsettled || coordination_unsettled {
+            outcome.is_error = true;
+            outcome.output.push_str("\n\nThe command's final outcome could not be confirmed; a child process may still be running. Inspect the current state before retrying.");
+            let fields = outcome
+                .tool_result_fields
+                .get_or_insert_with(Default::default);
+            fields.insert("execution_fact".into(), json!("unknown"));
+            fields.insert("side_effects_maybe".into(), json!(true));
+            fields.insert("retryable".into(), json!(false));
+        }
         outcome
     }
 
@@ -5210,16 +5056,6 @@ impl ToolExecutor {
         if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
             return super::cancelled_tool_execution_outcome("bash", false);
         }
-        let explicit_verification =
-            astra_tools::workspace_observation::is_explicit_workspace_verification_request(
-                "bash", args,
-            );
-        if explicit_verification && environment_background_requested(args) {
-            return bash_preparation_rejection(
-                "Error: bash verification requires a foreground executor-owned observation window"
-                    .to_string(),
-            );
-        }
         if environment_background_requested(args) {
             if nested_in_run_script {
                 return bash_preparation_rejection(
@@ -5284,14 +5120,6 @@ impl ToolExecutor {
                     return bash_preparation_rejection(format!("Error: {message}"));
                 }
             };
-        let workspace_before = if explicit_verification && !nested_in_run_script {
-            self.capture_bash_workspace_before_async(&command).await
-        } else {
-            None
-        };
-        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-            return super::cancelled_tool_execution_outcome("bash", false);
-        }
         let tool_cancel = cancel_token
             .map(tokio_util::sync::CancellationToken::child_token)
             .unwrap_or_default();
@@ -5304,7 +5132,6 @@ impl ToolExecutor {
             true,
             Some(&tool_cancel),
         );
-        config.explicit_verification = explicit_verification;
         config.workdir = Some(workdir.clone());
         let output_limit = self.scaled_output_limit_for("bash");
         let capture_limit =
@@ -5334,17 +5161,13 @@ impl ToolExecutor {
                 "Error: workspace changed before execution".to_string(),
             );
         }
-        let command_for_settlement = command.clone();
         // The worker owns observation leases until its process group settles,
         // including when the caller is cancelled while awaiting the join.
         let shell_result = tokio::task::spawn_blocking(move || {
-            let mut scope = ShellScopeLease {
+            let scope = ShellScopeLease {
                 attribution,
                 observation: _observation_lease,
                 _workspace: workspace_guard,
-                ownership: None,
-                // A panic after process start has no reliable settlement fact.
-                unsettled: true,
             };
             let config = config;
             let result = if scope
@@ -5358,7 +5181,6 @@ impl ToolExecutor {
             } else {
                 run_shell_output_with_config(config)
             };
-            scope.record(&result, &command_for_settlement);
             (result, scope)
         })
         .await;
@@ -5379,52 +5201,60 @@ impl ToolExecutor {
                         && !astra_tools::workspace_observation::bash_command_is_detachable_safe(
                             &command,
                         ));
-                self.attach_bash_workspace_observation_async(
+                self.finish_bash_ownership(
                     self.render_bash_outcome(
                         &command,
                         output.output,
                         output.descendants_terminated,
                         &workdir,
                     ),
-                    workspace_before,
                     ownership_unsettled,
-                    scope_ownership,
-                    explicit_verification,
                     observation_lease,
                 )
-                .await
             }
             Ok(Err(error)) => {
                 if !error.execution_started {
                     return bash_preparation_rejection(error.message);
                 }
+                let outcome_unknown = error.kind == astra_core::ErrorKind::ToolOutcomeUnknown
+                    || error.ownership_unsettled
+                    || coordination_unsettled;
                 // Preserve the worker's cause; a cancellation arriving after
                 // settlement must not relabel a timeout or lost process result.
                 let mut outcome = if error.kind == astra_core::ErrorKind::Cancelled {
-                    super::cancelled_tool_execution_outcome("bash", true)
+                    let mut cancelled = super::cancelled_tool_execution_outcome("bash", true);
+                    cancelled.output = error.message;
+                    cancelled
                 } else {
                     super::ToolExecutionOutcome::error_with_evidence(
                         error.message,
                         astra_core::ToolFailureEvidence::new(
                             error.kind,
-                            astra_core::ToolFailureCause::OutcomeUnknown,
+                            if outcome_unknown {
+                                astra_core::ToolFailureCause::OutcomeUnknown
+                            } else {
+                                astra_core::ToolFailureCause::CommandFailed
+                            },
                             false,
-                            vec![astra_core::ToolRecoveryAction::ReconcileOutcome],
+                            vec![if outcome_unknown {
+                                astra_core::ToolRecoveryAction::ReconcileOutcome
+                            } else {
+                                astra_core::ToolRecoveryAction::InspectStructuredFailure
+                            }],
                         ),
                     )
                 };
                 let fields = outcome.tool_result_fields.get_or_insert_default();
                 fields.insert("retryable".into(), Value::Bool(false));
                 astra_tools::execution_outcome::insert_started_execution_fact(fields);
-                self.attach_bash_workspace_observation_async(
+                if outcome_unknown {
+                    fields.insert("execution_fact".into(), json!("unknown"));
+                }
+                self.finish_bash_ownership(
                     outcome,
-                    workspace_before,
                     coordination_unsettled || error.ownership_unsettled,
-                    error.scope_ownership,
-                    explicit_verification,
                     observation_lease,
                 )
-                .await
             }
             Err(error) => {
                 let mut outcome = super::ToolExecutionOutcome::error(format!(
@@ -5445,18 +5275,14 @@ impl ToolExecutor {
                 fields.insert("execution_fact".into(), Value::String("unknown".into()));
                 fields.insert("side_effects_maybe".into(), Value::Bool(true));
                 fields.insert("retryable".into(), Value::Bool(false));
-                self.attach_bash_workspace_observation_async(
+                self.finish_bash_ownership(
                     outcome,
-                    workspace_before,
                     coordination_unsettled
                         || !astra_tools::workspace_observation::bash_command_is_detachable_safe(
                             &command,
                         ),
-                    None,
-                    explicit_verification,
                     observation_lease,
                 )
-                .await
             }
         };
         let mut outcome = attach_bash_workdir_outcome(
@@ -5537,15 +5363,6 @@ impl ToolExecutor {
                 }
             };
         let outcome = async {
-            if astra_tools::workspace_observation::is_explicit_workspace_verification_request(
-                "bash", args,
-            ) {
-                // Verify mode requires the foreground lease/fingerprint fence;
-                // never let TUI detach handling turn it into a best-effort shell
-                // call or an adoptable background task.
-                self.restore_bash_detach_handle(slot, handle).await;
-                return None;
-            }
             // A detached child has no foreground post-execution observation
             // window yet. Refuse to detach commands that are not proven
             // cache-safe, so a background writer cannot mutate the workspace after
@@ -5579,16 +5396,7 @@ impl ToolExecutor {
             match outcome {
                 Ok(DetachableShellOutput::Completed(out)) => {
                     self.restore_bash_detach_handle(slot, handle).await;
-                    let mut outcome = self
-                        .attach_bash_workspace_observation_async(
-                            self.render_bash_outcome(&command, out, false, &workdir),
-                            None,
-                            false,
-                            None,
-                            false,
-                            None,
-                        )
-                        .await;
+                    let mut outcome = self.render_bash_outcome(&command, out, false, &workdir);
                     outcome.output = self.finalize_tool_output(outcome.output, "bash");
                     self.record_output_size(outcome.output.len());
                     Some(outcome)
@@ -5659,17 +5467,7 @@ impl ToolExecutor {
                 }
                 Err(error) => {
                     self.restore_bash_detach_handle(slot, handle).await;
-                    Some(
-                        self.attach_bash_workspace_observation_async(
-                            super::ToolExecutionOutcome::error(error),
-                            None,
-                            false,
-                            None,
-                            false,
-                            None,
-                        )
-                        .await,
-                    )
+                    Some(super::ToolExecutionOutcome::error(error))
                 }
             }
         }.await;
@@ -5835,6 +5633,59 @@ mod tests {
         assert_eq!(fields["side_effects_maybe"], false);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupted_bash_preserves_safe_output_and_allows_next_command() {
+        for cancel in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let executor = std::sync::Arc::new(test_executor_in(dir.path()));
+            let token = tokio_util::sync::CancellationToken::new();
+            let run_token = token.clone();
+            let run_executor = executor.clone();
+            let run = tokio::spawn(async move {
+                run_executor.bash_outcome_with_cancel_async(
+                    &serde_json::json!({"command": "printf 'checkpoint\\n'; printf 'ghp_abcdefghijklmnopqrst'; printf ready > started; sleep 5", "timeout": if cancel { 5 } else { 1 }}),
+                    astra_tools::tool_engine::ToolInvocationMetadata::default(),
+                    Some(&run_token),
+                ).await
+            });
+            if cancel {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !dir.path().join("started").exists() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("command started");
+                token.cancel();
+            }
+            let interrupted = tokio::time::timeout(Duration::from_secs(8), run)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(interrupted.is_error);
+            assert!(
+                interrupted.output.contains("checkpoint"),
+                "{}",
+                interrupted.output
+            );
+            assert!(
+                !interrupted.output.contains("ghp_"),
+                "incomplete sensitive lines must be omitted"
+            );
+            assert!(
+                interrupted.output.contains("effects may remain"),
+                "{}",
+                interrupted.output
+            );
+            let next = executor
+                .execute_with_metadata("bash", &serde_json::json!({"command":"printf next > next"}))
+                .await;
+            assert!(!next.is_error, "{}", next.output);
+            assert!(dir.path().join("next").is_file());
+        }
+    }
+
     #[tokio::test]
     async fn read_only_child_rejects_shell_before_any_process_starts() {
         let dir = tempfile::tempdir().unwrap();
@@ -5917,32 +5768,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn failed_shell_settlement_is_fenced_before_lease_release() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = Err(super::ShellRunError::after_process_started(
-            "descendants not settled",
-            astra_core::ErrorKind::ToolOutcomeUnknown,
-            None,
-        ));
-        let mut scope = super::ShellScopeLease {
-            attribution: astra_tools::workspace_observation::WorkspaceAttributionState::capture(
-                dir.path(),
-            )
-            .unwrap(),
-            observation: None,
-            _workspace: None,
-            ownership: None,
-            unsettled: true,
-        };
-        scope.record(&result, "touch marker");
-        drop(scope);
-        assert_eq!(
-            astra_tools::workspace_observation::workspace_ownership_is_unsettled(dir.path()),
-            Some(true)
-        );
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_shell_settlement_fences_the_original_workspace_after_retarget() {
@@ -5970,40 +5795,12 @@ mod tests {
             .unwrap(),
             observation: Some(lease),
             _workspace: None,
-            ownership: Some(astra_sandbox::ScopeOwnership::InvocationCgroup),
-            unsettled: false,
         };
         std::fs::remove_file(&root).unwrap();
         symlink(&replacement, &root).unwrap();
         drop(scope);
         assert_eq!(
             astra_tools::workspace_observation::workspace_ownership_is_unsettled(&original),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn completed_shell_without_ownership_is_fenced_before_lease_release() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = Ok(super::ScopedShellOutput {
-            output: std::process::Command::new("true").output().unwrap(),
-            scope_ownership: None,
-            descendants_terminated: true,
-        });
-        let mut scope = super::ShellScopeLease {
-            attribution: astra_tools::workspace_observation::WorkspaceAttributionState::capture(
-                dir.path(),
-            )
-            .unwrap(),
-            observation: None,
-            _workspace: None,
-            ownership: None,
-            unsettled: true,
-        };
-        scope.record(&result, "touch marker");
-        drop(scope);
-        assert_eq!(
-            astra_tools::workspace_observation::workspace_ownership_is_unsettled(dir.path()),
             Some(true)
         );
     }
@@ -6065,25 +5862,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unavailable_verify_fingerprint_is_typed_and_generation_scoped() {
-        let outcome = super::require_explicit_workspace_verification_receipt(
-            super::super::ToolExecutionOutcome::ok("verified".to_string()),
-            true,
-            true,
-        );
-        assert!(outcome.is_error);
-        assert!(outcome.output.contains("typed observer"));
-        let fields = outcome.tool_result_fields.expect("typed failure fields");
-        assert_eq!(fields["error_kind"], "tool_unavailable");
-        assert_eq!(fields["retryable"], false);
-        assert_eq!(
-            fields["workspace_observation_retry_scope"],
-            "workspace_generation"
-        );
-        assert_eq!(fields["recovery_evidence"]["cause"], "scope_too_broad");
-    }
-
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn git_inspection_survives_unavailable_workspace_verification() {
@@ -6128,11 +5906,8 @@ mod tests {
             astra_tools::workspace_observation::WorkspaceFingerprint::capture(dir.path()).is_none()
         );
         let executor = test_executor_in(dir.path());
-        for verification in [false, true] {
-            let mut args = serde_json::json!({"command":"git log -1 --format=%s", "force":true});
-            if verification {
-                args["mode"] = serde_json::json!("verify");
-            }
+        {
+            let args = serde_json::json!({"command":"git log -1 --format=%s", "force":true});
             let outcome = executor
                 .execute_with_invocation_metadata_cancelable(
                     "bash",
@@ -6145,7 +5920,7 @@ mod tests {
                 outcome.output.contains("inspection-evidence"),
                 "{outcome:?}"
             );
-            assert_eq!(outcome.is_error, verification, "{outcome:?}");
+            assert!(!outcome.is_error, "{outcome:?}");
             assert!(outcome.tool_result_fields.as_ref().is_none_or(|fields| {
                 fields
                     .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
@@ -6154,38 +5929,28 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn overlarge_non_git_verify_returns_typed_observer_recovery() {
+    async fn large_non_git_workspace_does_not_require_command_observation() {
         let dir = tempfile::tempdir().expect("workspace");
-        for index in 0..=16_384 {
-            std::fs::write(dir.path().join(format!("entry-{index}")), "x").expect("fixture");
-        }
+        std::fs::File::create(dir.path().join("artifact"))
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
         let outcome = test_executor_in(dir.path())
             .execute_with_invocation_metadata_cancelable(
                 "bash",
-                &serde_json::json!({"command": "true", "mode": "verify"}),
+                &serde_json::json!({"command": "printf 'command complete'"}),
                 astra_tools::tool_engine::ToolInvocationMetadata::default(),
                 None,
             )
             .await;
+        assert!(!outcome.is_error, "{outcome:?}");
+        assert!(outcome.output.contains("command complete"));
+        let fields = outcome.tool_result_fields.expect("typed execution facts");
+        assert_eq!(fields["exit_code"], 0);
+        assert_eq!(fields["result_class"], "success");
         assert!(
-            outcome.is_error,
-            "no fingerprint must fail closed: {outcome:?}"
-        );
-        assert!(outcome.output.contains("typed observer"));
-        let fields = outcome.tool_result_fields.expect("typed failure fields");
-        assert_eq!(fields["error_kind"], "tool_unavailable");
-        assert_eq!(fields["retryable"], false);
-        assert_eq!(
-            fields["workspace_observation_retry_scope"],
-            "workspace_generation"
-        );
-        assert!(
-            fields
-                .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-                .is_none(),
-            "unavailable verification must not mint authority"
+            !fields.contains_key(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
         );
     }
 
@@ -6865,7 +6630,7 @@ mod tests {
         );
         assert_eq!(
             astra_tools::workspace_observation::workspace_observation_is_quarantined(root),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
             astra_tools::workspace_observation::workspace_ownership_is_unsettled(root),
@@ -6881,23 +6646,18 @@ mod tests {
             .expect("settled process group releases the coordination lease");
         assert!(lease.coordination_integrity_valid());
         assert!(
-            !lease.receipt_authority_valid(),
-            "quarantine forbids receipt authority"
+            lease.receipt_authority_valid(),
+            "a normal call must not poison later workspace access"
         );
     }
 
     #[tokio::test]
-    async fn edge_bash_writer_respects_platform_receipt_authority() {
+    async fn edge_bash_writer_reports_its_result_without_a_workspace_scan() {
         let dir = tempfile::tempdir().unwrap();
-        let executor = test_executor_in(dir.path());
-        let outcome = executor
-            .execute_with_invocation_metadata_cancelable(
+        let outcome = test_executor_in(dir.path())
+            .execute_with_metadata(
                 "bash",
-                &serde_json::json!({
-                    "command": "python3 -c 'open(\"generated.txt\", \"w\").write(\"x\")'"
-                }),
-                astra_tools::tool_engine::ToolInvocationMetadata::default(),
-                None,
+                &serde_json::json!({"command": "printf x > generated.txt"}),
             )
             .await;
         assert!(!outcome.is_error, "{outcome:?}");
@@ -6931,6 +6691,14 @@ mod tests {
             outcome.tool_result_fields.as_ref().unwrap()["retryable"],
             false
         );
+        let fields = outcome.tool_result_fields.as_ref().unwrap();
+        if fields
+            .get("execution_fact")
+            .and_then(serde_json::Value::as_str)
+            == Some("executed")
+        {
+            assert_eq!(fields["recovery_evidence"]["cause"], "command_failed");
+        }
         #[cfg(all(unix, not(target_os = "linux")))]
         assert_settled_shell_without_receipt(dir.path(), &outcome).await;
         assert_eq!(
@@ -6940,87 +6708,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edge_bash_verify_rejects_exit_one_without_a_receipt() {
-        let dir = tempfile::tempdir().unwrap();
-        let executor = test_executor_in(dir.path());
-        let outcome = executor
-            .execute_with_invocation_metadata_cancelable(
-                "bash",
-                &serde_json::json!({"command": "false", "mode": "verify"}),
-                astra_tools::tool_engine::ToolInvocationMetadata::default(),
-                None,
-            )
-            .await;
-
-        assert!(outcome.is_error, "verify requires exit zero: {outcome:?}");
-        assert!(outcome.tool_result_fields.as_ref().is_none_or(|fields| {
-            !fields
-                .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-                .is_some_and(
-                    astra_tools::workspace_observation::is_explicit_workspace_verification_receipt,
-                )
-        }));
-    }
-
-    #[tokio::test]
-    async fn edge_bash_verify_rejects_workspace_mutation_without_a_receipt() {
-        let dir = tempfile::tempdir().unwrap();
-        let executor = test_executor_in(dir.path());
-        let outcome = executor
-            .execute_with_invocation_metadata_cancelable(
-                "bash",
-                &serde_json::json!({"command": "printf changed > changed.txt", "mode": "verify"}),
-                astra_tools::tool_engine::ToolInvocationMetadata::default(),
-                None,
-            )
-            .await;
-
-        assert!(outcome.is_error, "verify may not mutate: {outcome:?}");
-        let rejected_before_execution = outcome.tool_result_fields.as_ref().is_some_and(|fields| {
-            fields
-                .get("disposition")
-                .is_some_and(|value| value == "rejected")
-        });
-        assert_eq!(
-            dir.path().join("changed.txt").exists(),
-            !rejected_before_execution
-        );
-        assert!(outcome.tool_result_fields.as_ref().is_none_or(|fields| {
-            !fields
-                .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-                .is_some_and(
-                    astra_tools::workspace_observation::is_explicit_workspace_verification_receipt,
-                )
-        }));
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    #[tokio::test]
-    async fn unsupported_bash_verify_is_rejected_before_shell_starts() {
+    async fn edge_bash_reports_nonzero_exit_without_a_workspace_scan() {
         let dir = tempfile::tempdir().unwrap();
         let outcome = test_executor_in(dir.path())
-            .execute_with_invocation_metadata_cancelable(
-                "bash",
-                &serde_json::json!({"command": "touch sentinel", "mode": "verify"}),
-                astra_tools::tool_engine::ToolInvocationMetadata::default(),
-                None,
-            )
+            .execute_with_metadata("bash", &serde_json::json!({"command": "false"}))
             .await;
-        assert!(outcome.is_error);
-        assert!(outcome.output.contains("No command was run"));
-        assert!(!dir.path().join("sentinel").exists());
-        let fields = outcome.tool_result_fields.unwrap();
-        assert_eq!(fields["disposition"], "rejected");
-        assert_eq!(fields["execution_started"], false);
-        assert_eq!(fields["side_effects_maybe"], false);
+        let fields = outcome.tool_result_fields.as_ref().expect("exit result");
+        assert_eq!(fields["exit_code"], 1);
         assert_ne!(
-            astra_tools::workspace_observation::workspace_observation_is_quarantined(dir.path()),
-            Some(true)
+            fields.get("exit_semantics"),
+            Some(&serde_json::json!("success"))
+        );
+        assert!(
+            !fields.contains_key(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
         );
     }
 
     #[tokio::test]
-    async fn edge_bash_cancellation_preserves_settlement_and_platform_receipt_authority() {
+    async fn edge_bash_runs_without_a_workspace_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = test_executor_in(dir.path())
+            .execute_with_metadata(
+                "bash",
+                &serde_json::json!({"command": "printf changed > changed.txt"}),
+            )
+            .await;
+        assert!(!outcome.is_error, "{outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("changed.txt")).unwrap(),
+            "changed"
+        );
+        assert!(outcome.tool_result_fields.as_ref().is_none_or(|fields| {
+            !fields.contains_key(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+        }));
+    }
+
+    #[tokio::test]
+    async fn edge_bash_cancellation_preserves_partial_effects() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("nested")).unwrap();
         let executor = test_executor_in(dir.path());
@@ -7068,7 +6792,7 @@ mod tests {
             cancellation["error_kind"],
             astra_tools::TOOL_ERROR_KIND_CANCELLED
         );
-        assert!(outcome.output.contains("cancelled before completion"));
+        assert!(!outcome.output.is_empty(), "retain cancellation context");
         assert!(!cancellation.contains_key(astra_tools::workspace_observation::RECEIPT_FIELD));
         #[cfg(all(unix, not(target_os = "linux")))]
         assert_settled_shell_without_receipt(dir.path(), &outcome).await;
@@ -7080,7 +6804,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn edge_bash_helper_crash_marks_terminal_ownership_unsettled() {
+    async fn edge_bash_helper_crash_reports_unknown_without_blocking_inspection() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
         let outcome = executor
@@ -7105,25 +6829,23 @@ mod tests {
         );
         assert_eq!(
             astra_tools::workspace_observation::workspace_ownership_is_unsettled(dir.path()),
-            Some(true),
-            "unowned descendants must become a terminal completion barrier"
+            Some(false),
+            "an unknown outcome must not quarantine later inspection"
         );
+        let fields = outcome.tool_result_fields.as_ref().unwrap();
+        assert_eq!(fields["execution_fact"], "unknown");
+        assert_eq!(fields["retryable"], false);
     }
 
     #[tokio::test]
     async fn unstarted_shell_failure_does_not_quarantine_the_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
-        let outcome = executor
-            .attach_bash_workspace_observation_async(
-                super::super::ToolExecutionOutcome::error("spawn failed".to_string()),
-                None,
-                false,
-                None,
-                false,
-                None,
-            )
-            .await;
+        let outcome = executor.finish_bash_ownership(
+            super::super::ToolExecutionOutcome::error("spawn failed".to_string()),
+            false,
+            None,
+        );
 
         assert!(outcome.is_error);
         assert_eq!(
@@ -7181,37 +6903,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_epoch_bash_probe_cannot_mint_unchanged_receipt() {
-        let dir = tempfile::tempdir().unwrap();
-        let executor = test_executor_in(dir.path());
-        let before = astra_tools::workspace_observation::WorkspaceFingerprint::capture(dir.path())
-            .expect("pre-state");
-        let writer = astra_tools::workspace_observation::begin_workspace_writer_with_options(
-            dir.path(),
-            None,
-            Duration::from_secs(120),
-        )
-        .await
-        .expect("writer registration");
-        drop(writer);
-
-        let outcome = executor
-            .attach_bash_workspace_observation_async(
-                super::super::ToolExecutionOutcome::error("diagnostic failed".to_string()),
-                Some(before),
-                false,
-                Some(astra_sandbox::ScopeOwnership::InvocationCgroup),
-                false,
-                None,
-            )
-            .await;
-
-        assert!(!outcome.tool_result_fields.as_ref().is_some_and(|fields| {
-            fields.contains_key(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-        }));
-    }
-
-    #[tokio::test]
     async fn completed_mutation_free_detach_candidate_does_not_quarantine_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let (slot, _listener) = astra_tools::detach::new_slot_with_handle();
@@ -7233,56 +6924,6 @@ mod tests {
         assert_eq!(
             astra_tools::workspace_observation::workspace_observation_is_quarantined(dir.path()),
             Some(false)
-        );
-    }
-
-    #[test]
-    fn scope_authority_controls_late_attribution() {
-        let safe_dir = tempfile::tempdir().unwrap();
-        drop(super::ShellScopeLease {
-            attribution: astra_tools::workspace_observation::WorkspaceAttributionState::capture(
-                safe_dir.path(),
-            )
-            .unwrap(),
-            observation: None,
-            _workspace: None,
-            ownership: Some(astra_sandbox::ScopeOwnership::InvocationCgroup),
-            unsettled: false,
-        });
-        assert_eq!(
-            astra_tools::workspace_observation::workspace_observation_is_quarantined(
-                safe_dir.path()
-            ),
-            Some(false),
-            "authoritative process settlement preserves future attribution"
-        );
-
-        let risky_dir = tempfile::tempdir().unwrap();
-        let _before =
-            astra_tools::workspace_observation::WorkspaceFingerprint::capture(risky_dir.path())
-                .expect("clean pre-state");
-        drop(super::ShellScopeLease {
-            attribution: astra_tools::workspace_observation::WorkspaceAttributionState::capture(
-                risky_dir.path(),
-            )
-            .unwrap(),
-            observation: None,
-            _workspace: None,
-            ownership: Some(astra_sandbox::ScopeOwnership::ForegroundProcessGroup),
-            unsettled: false,
-        });
-        assert_eq!(
-            astra_tools::workspace_observation::workspace_observation_is_quarantined(
-                risky_dir.path()
-            ),
-            Some(true),
-            "weak ownership must fail closed even without an immediate delta"
-        );
-        std::fs::write(risky_dir.path().join("late.txt"), "late").unwrap();
-        assert!(
-            astra_tools::workspace_observation::WorkspaceFingerprint::capture(risky_dir.path())
-                .is_none(),
-            "a late write cannot be attributed to a later invocation after weak settlement"
         );
     }
 
@@ -7363,8 +7004,12 @@ mod tests {
         ).await;
 
         assert!(
-            !outcome.is_error,
-            "business command still completed: {outcome:?}"
+            outcome.is_error,
+            "changed coordination cannot confirm the outcome: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.tool_result_fields.as_ref().unwrap()["execution_fact"],
+            "unknown"
         );
         assert!(dir.path().join("generated.txt").is_file());
         assert!(
@@ -7382,29 +7027,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn started_shell_with_unsettled_ownership_still_fails_closed_without_a_delta() {
+    async fn started_shell_with_unsettled_ownership_reports_unknown_without_a_delta() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
-        let outcome = executor
-            .attach_bash_workspace_observation_async(
-                super::super::ToolExecutionOutcome::error("ownership lost".to_string()),
-                None,
-                true,
-                None,
-                false,
-                None,
-            )
-            .await;
+        let outcome = executor.finish_bash_ownership(
+            super::super::ToolExecutionOutcome::error("ownership lost".to_string()),
+            true,
+            None,
+        );
 
         assert!(outcome.is_error);
         assert_eq!(
             astra_tools::workspace_observation::workspace_ownership_is_unsettled(dir.path()),
-            Some(true)
+            Some(false)
         );
+        let fields = outcome.tool_result_fields.as_ref().unwrap();
+        assert_eq!(fields["execution_fact"], "unknown");
+        assert_eq!(fields["retryable"], false);
     }
 
     #[tokio::test]
-    async fn edge_error_projection_preserves_partial_workspace_receipt() {
+    async fn edge_timeout_reports_partial_effect_without_fabricated_receipt() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
         let outcome = executor
@@ -7876,7 +7519,7 @@ mod tests {
         let start = std::time::Instant::now();
         // This command starts a long-running background process and exits immediately.
         // Without the fix, wait_with_output() would block until sleep finishes (60s).
-        let result = executor
+        let outcome = executor
             .execute_with_metadata(
                 "bash",
                 &serde_json::json!({
@@ -7884,8 +7527,8 @@ mod tests {
                     "timeout": 5.0
                 }),
             )
-            .await
-            .output;
+            .await;
+        let result = outcome.output;
         let elapsed = start.elapsed();
         // The real default pipe drain must return well before the 60s sleep completes.
         assert!(
@@ -7900,7 +7543,14 @@ mod tests {
             !result.contains("timed out"),
             "should not timeout: {result}"
         );
-        assert!(result.contains("not running now"), "{result}");
+        assert!(
+            result.contains("Processes that escaped the scope may still run"),
+            "{result}"
+        );
+        assert_eq!(
+            outcome.tool_result_fields.unwrap()["background_children_reaped"],
+            true
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -7927,7 +7577,7 @@ mod tests {
         assert!(outcome.output.contains("terminated"), "{}", outcome.output);
         let fields = outcome.tool_result_fields.expect("typed settlement fields");
         assert_eq!(fields["background_children_reaped"], true);
-        assert_eq!(fields["descendant_persistence"], false);
+        assert!(!fields.contains_key("descendant_persistence"));
         tokio::time::sleep(std::time::Duration::from_millis(450)).await;
         assert!(
             !marker.exists(),
@@ -7963,7 +7613,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn bash_background_child_is_killed_before_workspace_receipt_closes() {
+    async fn bash_background_child_is_terminated_before_return() {
         let dir = tempfile::tempdir().unwrap();
         let executor = super::ToolExecutor::new(dir.path());
         let marker = dir.path().join("late-marker");

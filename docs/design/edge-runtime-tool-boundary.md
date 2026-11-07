@@ -179,10 +179,11 @@ Command output can establish a current state, including an already-satisfied
 request or an absent directory, without claiming this invocation changed it.
 Neither a zero exit status nor a generic filesystem delta proves arbitrary task
 correctness. Domain tools and canonical Work retain their own result contracts.
-Inspection and diagnostics omit `mode`. Explicit `mode=verify` adds an unchanged-workspace proof obligation
-after edits. If bounded observation is unavailable, command output is retained
-but the requested verification fails closed; it must not mint a completion or
-no-change receipt. Command text does not select or weaken this contract.
+Inspection, diagnostics and checks use the same command tool. The executor
+reports the actual output and exit status without a whole-workspace fingerprint
+or a separate verification mode. Declared checks are explicit runtime contracts;
+a successful invocation does not prove workspace exclusivity or that no other
+process will write later.
 
 ### Rename authority
 
@@ -394,8 +395,9 @@ check receipt authority independently of the coordination check used to launch.
 Receipt-attribution quarantine is retained per workspace observation root for
 the executor process lifetime, not per conversation. It prevents new attribution
 receipts, while healthy execution coordination remains independent. Explicit
-verification still fails when the required proof is unavailable. Quarantine
-diagnostics log a root digest, not local paths or shell input. A new conversation does not clear quarantine; before restarting
+verification records the observed command result and does not require a
+fingerprint. Quarantine diagnostics log a root digest, not local paths or shell
+input. A new conversation does not clear quarantine; before restarting
 the affected Astra or astra-edge process, verify that earlier background work
 has stopped. Restart alone does not stop escaped descendants or prove safety.
 
@@ -556,14 +558,23 @@ is not a chain or batch guarantee. An explicit file undo checks the recorded
 post-state and reports conflicts or partial results; it is not atomic against
 concurrent writes from external programs.
 
-On Linux, the invocation subreaper settles ownership only after kernel
+When the Linux invocation supervisor is used for Bash, its subreaper settles
+its child ownership only after kernel
 `waitpid(-1, WNOHANG)` reports `ECHILD`. Enumerating its own proc children is an
 auxiliary means to kill adopted descendants. If that enumeration is unavailable,
 the same bounded loop continues waiting and reaping under its original deadline.
 Neither an unavailable or empty scan nor deadline expiry proves settlement; a
 live child at expiry or an unexpected wait error retains unsettled ownership.
-The helper's non-dumpable boundary and nonce-bound terminal receipt remain
-required, and Server run settlement cannot replace this local scope proof.
+The helper's non-dumpable boundary and nonce-bound terminal receipt apply to
+that path; Server run settlement cannot replace this local scope proof.
+
+Other Bash paths may execute directly in a cgroup or process group without the
+supervisor; `run_script` retains its cgroup prerequisite. Group cleanup cannot
+prove that a descendant which created a new session has stopped, and a same-user
+process may be able to move between delegated cgroups. When a script explicitly
+requests memory or CPU limits, it is rejected before starting if those limits
+cannot be enforced.
+`run_script` does not itself add filesystem or network isolation.
 
 The optional asynchronous `check-ignore` adapter retains startup binding checks;
 it does not inherit synchronous invocation ownership or post-execution binding

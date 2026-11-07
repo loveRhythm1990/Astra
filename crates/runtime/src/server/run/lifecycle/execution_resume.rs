@@ -3,6 +3,8 @@
 use super::*;
 use astra_services::SessionContextCoordinator;
 
+const PREVIOUS_TOOL_ADVISORY: &str = "Earlier tool calls have unconfirmed outcomes. A call may still be running or may have changed state. Review the previous tool history and inspect the current state before repeating it.";
+
 fn invalid_resume(detail: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
     invalid_resume_with_message(
         detail,
@@ -602,6 +604,12 @@ impl AgenticRunLifecycleService {
         host.restore_handoff_continuation(&mut state, &handoff, &canonical.prior_messages)
             .await
             .map_err(|error| invalid_resume(error.message))?;
+        if proof.prior_unresolved_tool_calls() {
+            state.push_volatile(
+                crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+                PREVIOUS_TOOL_ADVISORY.to_owned(),
+            );
+        }
         host.bind_execution_handoff(
             self.execution_handoff_requested.clone(),
             self.run_engine.clone(),

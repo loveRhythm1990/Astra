@@ -14,6 +14,9 @@ mod trace_ingestion_tests;
 
 #[path = "skill_ledger_tests.rs"]
 mod skill_ledger_tests;
+
+#[path = "provider_rejection_tests.rs"]
+mod provider_rejection_tests;
 use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 
 #[tokio::test]
@@ -3417,13 +3420,9 @@ fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_rederives_tool_
         24_000
     );
     assert_eq!(state.compaction_effectiveness.last_tokens_freed, 1_500);
-    assert_eq!(
-        state
-            .stall
-            .workspace_observation_quarantine
-            .as_ref()
-            .and_then(|quarantine| quarantine.source_tool_call_id.as_deref()),
-        Some("call-edge")
+    assert!(
+        state.stall.workspace_observation_quarantine.is_none(),
+        "a stale checkpoint must not fence a new Run"
     );
     assert!(!state.compaction_effectiveness.last_was_insufficient);
     assert_eq!(
@@ -35118,6 +35117,9 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
                         execution_timeout_ms: None,
                         command_timeout_cap_ms: Some(8_000),
                         cancel_token: None,
+
+                        traceparent: None,
+                        tracestate: None,
                     },
                 )
                 .await
@@ -35864,17 +35866,22 @@ async fn fail_started_run_before_spawn_persists_terminal_events() {
         .await
         .unwrap();
 
-    AgenticRunLifecycleService::fail_started_run_before_spawn_with_handles(
-        &svc.run_engine,
-        &svc.runs,
-        "user-1",
-        "session-1",
-        "run-pre-spawn",
-        0,
-        "server capacity timeout before agentic loop start",
-        PreSpawnFailureCode::RunAdmissionTimeout,
-    )
+    let root_outcome = crate::server::run_trace::bind(Default::default(), async {
+        AgenticRunLifecycleService::fail_started_run_before_spawn_with_handles(
+            &svc.run_engine,
+            &svc.runs,
+            "user-1",
+            "session-1",
+            "run-pre-spawn",
+            0,
+            "server capacity timeout before agentic loop start",
+            PreSpawnFailureCode::RunAdmissionTimeout,
+        )
+        .await;
+        astra_logging::trace_context::active_run_error_code()
+    })
     .await;
+    assert_eq!(root_outcome, Some("run_admission_timeout"));
 
     let durable = engine
         .load_run("user-1", "run-pre-spawn")
@@ -35907,6 +35914,47 @@ async fn fail_started_run_before_spawn_persists_terminal_events() {
         }),
         "durable run_finished must preserve the pre-spawn terminal code"
     );
+}
+
+#[tokio::test]
+async fn queued_cancellation_marks_the_root_run_only_when_committed() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("run-queued-cancel", "user-1", "session-1")
+        .await
+        .unwrap();
+    assert!(
+        svc.run_engine
+            .request_run_cancellation("user-1", "run-queued-cancel")
+            .await
+            .unwrap()
+    );
+    for (attempt, expected) in [(1, Some("cancelled")), (2, None)] {
+        let (terminal_events, root_outcome) =
+            crate::server::run_trace::bind(Default::default(), async {
+                let terminal_events =
+                    AgenticRunLifecycleService::cancel_started_run_before_admission_with_handles(
+                        &svc.run_engine,
+                        &svc.runs,
+                        "user-1",
+                        "session-1",
+                        "run-queued-cancel",
+                        0,
+                    )
+                    .await;
+                (
+                    terminal_events,
+                    astra_logging::trace_context::active_run_error_code(),
+                )
+            })
+            .await;
+        assert_eq!(
+            terminal_events.is_some(),
+            expected.is_some(),
+            "attempt {attempt}"
+        );
+        assert_eq!(root_outcome, expected, "attempt {attempt}");
+    }
 }
 
 #[tokio::test]
@@ -36005,10 +36053,7 @@ async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
             }
         );
         let json = serde_json::to_value(items).unwrap();
-        assert_eq!(
-            json.as_array().unwrap().len(),
-            if cancelled { 1 } else { 2 }
-        );
+        assert_eq!(json.as_array().unwrap().len(), 2);
         assert_eq!(json[0]["kind"], "opening");
         assert_eq!(json[0]["run_id"], run);
         assert_eq!(json[0]["content"], request.message);
@@ -36016,7 +36061,13 @@ async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
             json[0]["source_event_id"],
             persistence::server_input_source_event_id(&session, &run)
         );
-        if !cancelled {
+        if cancelled {
+            assert_eq!(json[1]["kind"], "cancellation");
+            assert_eq!(json[1]["id"], format!("cancellation:{run}"));
+            assert_eq!(json[1]["run_id"], run);
+            assert_eq!(json[1].get("context_not_saved"), Some(&Value::Null));
+            assert!(json[1].get("item_seq").is_none());
+        } else {
             assert_eq!(json[1]["kind"], "failure");
             assert_eq!(json[1]["id"], format!("failure:{run}"));
             assert_eq!(json[1]["run_id"], run);
@@ -36060,17 +36111,25 @@ async fn fail_started_run_before_spawn_transition_failure_does_not_commit_partia
         .await
         .unwrap();
 
-    AgenticRunLifecycleService::fail_started_run_before_spawn_with_handles(
-        &svc.run_engine,
-        &svc.runs,
-        "user-1",
-        "session-1",
-        "run-pre-spawn-fail",
-        0,
-        "server capacity timeout before agentic loop start",
-        PreSpawnFailureCode::RunAdmissionTimeout,
-    )
+    let root_outcome = crate::server::run_trace::bind(Default::default(), async {
+        AgenticRunLifecycleService::fail_started_run_before_spawn_with_handles(
+            &svc.run_engine,
+            &svc.runs,
+            "user-1",
+            "session-1",
+            "run-pre-spawn-fail",
+            0,
+            "server capacity timeout before agentic loop start",
+            PreSpawnFailureCode::RunAdmissionTimeout,
+        )
+        .await;
+        astra_logging::trace_context::active_run_error_code()
+    })
     .await;
+    assert_eq!(
+        root_outcome, None,
+        "an uncommitted terminal must not mark the root run"
+    );
 
     let durable = engine
         .load_run("user-1", "run-pre-spawn-fail")

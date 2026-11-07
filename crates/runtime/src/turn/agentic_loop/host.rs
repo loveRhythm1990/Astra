@@ -1418,6 +1418,7 @@ fn build_introspect_snapshot_with_tool_admission(
         current_round,
         tool_errors,
         circuit_breaker,
+        thinking: Some(state.thinking.clone()),
     };
 
     // Enrich live-metric fields from provider data when available.
@@ -8800,22 +8801,17 @@ pub(crate) mod tests {
     async fn edge_completion_window_accepts_independent_verifier_batch() {
         let write =
             make_edge_tool_with_args("write_file", json!({"path": "src/output.txt"}), "written");
-        let mut quality = make_edge_tool_with_args(
-            "bash",
-            json!({"command": "./quality-gate", "mode": "verify"}),
-            "quality ok",
-        );
+        let mut quality =
+            make_edge_tool_with_args("bash", json!({"command": "./quality-gate"}), "quality ok");
         quality.request_id = "req-quality".into();
-        let mut unit = make_edge_tool_with_args(
-            "bash",
-            json!({"command": "./unit-gate", "mode": "verify"}),
-            "unit ok",
-        );
+        let mut unit =
+            make_edge_tool_with_args("bash", json!({"command": "./unit-gate"}), "unit ok");
         unit.request_id = "req-unit".into();
         for receipt in [&mut quality, &mut unit] {
-            receipt.tool_result_fields.as_mut().unwrap().extend(
-                astra_tools::workspace_observation::explicit_workspace_verification_receipt(),
-            );
+            receipt.tool_result_fields.as_mut().unwrap().extend([
+                ("result_class".into(), json!("success")),
+                ("exit_semantics".into(), json!("success")),
+            ]);
         }
         let mut host = MockHost::new(vec![
             edge_tool_result(vec![write], 0, 0, Some(50)),
@@ -11342,7 +11338,6 @@ pub(crate) mod tests {
     fn original_execution_facts_keep_admitted_evaluation_thresholds() {
         use crate::turn::runtime_policy::evaluation_thresholds_from_policy;
         let mut policy = astra_config::runtime_config::ToolPolicyConfig {
-            redundant_reads_eval_threshold: 7,
             search_fanout_eval_threshold: 19,
             redundant_validation_retries_eval_threshold: 5,
             ..Default::default()
@@ -15266,7 +15261,6 @@ mod parallel_execution_tests {
                             r.snapshot.final_state.as_deref(),
                             Some("completed" | "interrupted")
                         ) && r.snapshot.read_only_round_streak >= 32
-                            && r.snapshot.redundant_read_count >= 6
                     })
                     .count()
                     >= 3,

@@ -1931,6 +1931,13 @@ fn apply_one_event(
                 }
                 match durable_run_terminal_from_event(event) {
                     Ok(Some(terminal)) => {
+                        if accum.run_terminal.is_none()
+                            && event.get("context_not_saved").and_then(Value::as_bool) == Some(true)
+                        {
+                            effects.push(SseRenderEffect::SystemWarning(
+                                "This turn's conversation history could not be saved. Check tool results and current state before continuing.".into(),
+                            ));
+                        }
                         if let Some(interruption) = terminal.interruption.as_ref() {
                             let coherent = accum.error_kind.is_none()
                                 && !accum.pending_attempt_error
@@ -2438,11 +2445,11 @@ mod tests {
                     "expected_result": "One verified result"
                 },
                 "entries": [{
-                    "signal": "read_coverage_overlap",
+                    "signal": "search_fanout",
                     "stage": "observe",
                     "observed_at_round": 2,
                     "evidence_count": 3,
-                    "recommendation": "review_read_coverage"
+                    "recommendation": "narrow_evidence_search"
                 }]
             }
         }))

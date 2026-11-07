@@ -30,6 +30,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 #[path = "responses.rs"]
 mod responses;
 
@@ -119,12 +120,51 @@ fn moi_model_gateway_error(
     }
     Some(ProviderHttpRejection {
         classified: astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::Unknown,
+            match code {
+                "provider_quota_exhausted" => astra_core::ErrorKind::ProviderQuotaExhausted,
+                "provider_forbidden" => astra_core::ErrorKind::ProviderForbidden,
+                "provider_authentication_failed" => astra_core::ErrorKind::Auth,
+                _ => astra_core::ErrorKind::Unknown,
+            },
             format!("MOI model gateway rejected inference: {code}"),
         )
         .with_details_json(details.to_string()),
         retryable,
     })
+}
+
+/// Only explicit machine fields identify provider quota or credentials. A
+/// generic 403 (including upstream_forbidden) proves neither cause. Never
+/// forward provider text: even an auth error body may echo arbitrary secrets.
+fn provider_access_error(status: u16, body: &str) -> Option<astra_core::ClassifiedError> {
+    use astra_core::ErrorKind;
+    let value = serde_json::from_str::<Value>(body).ok();
+    let code = value.as_ref().and_then(|value| {
+        value
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .or_else(|| value.pointer("/error/type").and_then(Value::as_str))
+    });
+    let kind = match (status, code) {
+        (403 | 429, Some("insufficient_quota" | "insufficient_balance")) => {
+            ErrorKind::ProviderQuotaExhausted
+        }
+        (401 | 403, Some("invalid_api_key" | "invalid_token" | "authentication_error"))
+        | (401, _) => ErrorKind::Auth,
+        (403, _) => ErrorKind::ProviderForbidden,
+        _ => return None,
+    };
+    let message = match kind {
+        ErrorKind::Auth => "LLM provider authentication failed",
+        ErrorKind::ProviderQuotaExhausted => "LLM provider account balance or quota exhausted",
+        ErrorKind::ProviderForbidden => "LLM provider denied inference; the reason is not known",
+        _ => unreachable!(),
+    };
+    Some(
+        astra_core::ClassifiedError::new(kind, message).with_details_json(
+            json!({"source":"llm_provider", "http_status":status, "retryable":false}).to_string(),
+        ),
+    )
 }
 
 /// Keep the billing owner's machine-readable reason without forwarding an
@@ -1627,6 +1667,7 @@ pub(crate) async fn finish_observed_provider_error(
     attempt_index: Option<u32>,
     error: &astra_core::ClassifiedError,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     finish_observed_provider_attempt(
         observer,
         attempt_index,
@@ -1641,6 +1682,7 @@ pub(crate) async fn finish_observed_provider_error_with_partial(
     error: &astra_core::ClassifiedError,
     partial: &LlmCallResult,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     note_observed_provider_usage_presence(observer, attempt_index, partial.usage_presence);
     finish_observed_provider_attempt(
         observer,
@@ -1656,6 +1698,7 @@ pub(crate) async fn finish_observed_provider_delivery_unknown(
     attempt_index: Option<u32>,
     error: &astra_core::ClassifiedError,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     finish_observed_provider_attempt(
         observer,
         attempt_index,
@@ -1670,6 +1713,7 @@ pub(crate) async fn finish_observed_provider_delivery_unknown_with_partial(
     error: &astra_core::ClassifiedError,
     partial: &LlmCallResult,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     note_observed_provider_usage_presence(observer, attempt_index, partial.usage_presence);
     finish_observed_provider_attempt(
         observer,
@@ -5403,6 +5447,36 @@ async fn read_provider_error_body(
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+struct LlmAttemptSpan {
+    span: tracing::Span,
+    failed: bool,
+}
+
+impl LlmAttemptSpan {
+    fn start() -> Self {
+        crate::server::run_trace::clear_attempt_code();
+        let span = tracing::info_span!(target: "astra.llm", "llm.call");
+        crate::server::run_trace::parent_to_active_run(&span);
+        let entered = span.clone();
+        let _entered = entered.enter();
+        Self { span, failed: true }
+    }
+
+    fn succeed(&mut self) {
+        self.failed = false;
+        crate::server::run_trace::clear_attempt_code();
+    }
+}
+
+impl Drop for LlmAttemptSpan {
+    fn drop(&mut self) {
+        if self.failed {
+            let code = crate::server::run_trace::attempt_code().unwrap_or("unknown");
+            astra_logging::trace_context::mark_error(&self.span, code);
+        }
+    }
+}
+
 async fn call_prepared_llm_with_total_budget(
     prepared: PreparedStreamingCall<'_>,
     cancel: LlmCancel<'_>,
@@ -5647,8 +5721,12 @@ async fn call_prepared_llm_with_total_budget(
                     .expect("observed attempt requires observer")
                     .note_dispatch_started(attempt_index);
             }
-            req.body(prepared_request.body()).send().await
+            let mut request = req.body(prepared_request.body()).build()?;
+            crate::server::outbound_trace::rewrite(&mut request);
+            client.execute(request).await
         };
+        let mut llm_attempt = LlmAttemptSpan::start();
+        let send_request = send_request.instrument(llm_attempt.span.clone());
         let send_result = tokio::select! {
             biased;
             _ = wait_llm_cancel(cancel) => {
@@ -5794,6 +5872,7 @@ async fn call_prepared_llm_with_total_budget(
                         {
                             return Err(attach_llm_result_details(error, &result));
                         }
+                        llm_attempt.succeed();
                         return Ok(result);
                     }
                     Err(crate::turn::bedrock::transport::BedrockStreamError::Cancelled {
@@ -6086,6 +6165,7 @@ async fn call_prepared_llm_with_total_budget(
                     {
                         return Err(attach_llm_result_details(error, &result));
                     }
+                    llm_attempt.succeed();
                     return Ok(result);
                 }
                 Err(StreamCollectError::Cancelled { partial }) => {
@@ -6321,7 +6401,17 @@ async fn call_prepared_llm_with_total_budget(
             }
         };
 
-        let structured_error = if status == 402
+        let direct_access_error = (subscription.is_none()
+            && !uses_moi_model_gateway_error_contract(header_overrides)
+            && model_gateway_error_contract.is_none())
+        .then(|| provider_access_error(status, &text))
+        .flatten();
+        let structured_error = if let Some(classified) = direct_access_error {
+            Some(ProviderHttpRejection {
+                classified,
+                retryable: false,
+            })
+        } else if status == 402
             && subscription.is_none()
             && !uses_moi_model_gateway_error_contract(header_overrides)
             && model_gateway_error_contract.is_none()
@@ -6444,16 +6534,9 @@ async fn call_prepared_llm_with_total_budget(
         // A negotiated gateway route must retain its versioned error boundary;
         // do not reinterpret a missing/mismatched contract as a provider error.
         // Likewise, an unsolicited gateway header is not trusted on BYOK routes.
-        // Auth responses can echo arbitrary credentials; do not log the body.
-        if status == 401 || status == 403 {
-            tracing::warn!(
-                target: "astra_runtime::llm_client",
-                "LLM auth error ({status}) on {model_key}",
-            );
-            let error = astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::Auth,
-                "LLM provider authentication failed".to_string(),
-            );
+        // Missing/mismatched gateway contracts retain only HTTP facts, never
+        // a provider-body interpretation of gateway-owned billing or identity.
+        if let Some(error) = provider_access_error(status, "") {
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
@@ -8232,11 +8315,15 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
                 .expect("observed attempt requires observer")
                 .note_dispatch_started(attempt_index);
         }
-        req.timeout(effective_timeout)
+        let mut request = req
+            .timeout(effective_timeout)
             .body(prepared_request.body())
-            .send()
-            .await
+            .build()?;
+        crate::server::outbound_trace::rewrite(&mut request);
+        client.execute(request).await
     };
+    let mut llm_attempt = LlmAttemptSpan::start();
+    let send_request = send_request.instrument(llm_attempt.span.clone());
     let resp = match send_request.await {
         Ok(response) => response,
         Err(e) => {
@@ -8289,6 +8376,11 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     };
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
+        let response_contract_version = resp
+            .headers()
+            .get(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let text = match resp.text().await {
             Ok(text) => text,
             Err(body_error) => {
@@ -8316,13 +8408,33 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
                 return Err(error);
             }
         };
-        if status == 402 {
+        if let Some(rejection) = moi_model_gateway_error(
+            status,
+            &text,
+            header_overrides,
+            response_contract_version.as_deref(),
+        ) {
+            let error = rejection.classified;
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            return Err(error);
+        }
+        let ordinary_provider = !uses_moi_model_gateway_error_contract(header_overrides)
+            && response_contract_version.is_none();
+        if let Some(error) =
+            provider_access_error(status, if ordinary_provider { &text } else { "" })
+        {
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            return Err(error);
+        }
+        if status == 402 && ordinary_provider {
             let error = payment_required_error(&text);
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
-        let kind = provider_http_error_kind(status, &text);
-        let message = if kind == astra_core::ErrorKind::Auth {
+        let kind = provider_http_error_kind(status, if ordinary_provider { &text } else { "" });
+        let message = if !ordinary_provider {
+            format!("LLM request rejected: {status}")
+        } else if kind == astra_core::ErrorKind::Auth {
             "LLM provider authentication failed".to_owned()
         } else {
             let detail = redact_provider_secrets(&text);
@@ -8455,6 +8567,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     {
         return Err(attach_llm_result_details(error, &result));
     }
+    llm_attempt.succeed();
     Ok(result)
 }
 
@@ -8731,8 +8844,10 @@ fn parse_anthropic_nonstream_response(v: &Value, model_name: &str) -> LlmCallRes
 /// Canonical HTTP recovery classification shared by inference protocols.
 fn provider_http_error_kind(status: u16, body: &str) -> astra_core::ErrorKind {
     use astra_core::ErrorKind;
-    if status == 401 || status == 403 {
+    if status == 401 {
         ErrorKind::Auth
+    } else if status == 403 {
+        ErrorKind::ProviderForbidden
     } else if is_rate_limit_status(status) {
         ErrorKind::RateLimit
     } else if status >= 500 {
@@ -17351,8 +17466,15 @@ mod tests {
                         .await
                         .unwrap_err()
                 };
-                assert_eq!(err.kind, astra_core::ErrorKind::Auth);
-                assert_eq!(err.message, "LLM provider authentication failed");
+                assert_eq!(
+                    err.kind,
+                    if status == 401 {
+                        astra_core::ErrorKind::Auth
+                    } else {
+                        astra_core::ErrorKind::ProviderForbidden
+                    }
+                );
+                assert!(!format!("{err:?}").contains("private-credential"));
             }
             assert_eq!(
                 hits.load(std::sync::atomic::Ordering::SeqCst),
