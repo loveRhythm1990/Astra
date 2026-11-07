@@ -1703,7 +1703,7 @@ impl ThinClient {
         Ok(response)
     }
 
-    /// Retry Server-owned loop admission on 429 and transport errors.
+    /// Retry Server-owned loop admission only on 429 or proven connector failures.
     ///
     /// A lost response before headers can still belong to an admitted Run.
     /// Callers that interpret admission proofs must use the payload variant's
@@ -1731,7 +1731,8 @@ impl ThinClient {
     /// Callers with an absolute execution deadline use this to publish a
     /// monotonically shrinking budget after 429 or transport waits.
     /// The caller owns live ambiguity evidence. Dispatch sets it before sending;
-    /// a complete response or proven connector failure settles only this attempt.
+    /// a proven connector failure or rejection settles only this attempt. Success
+    /// headers leave execution unknown until the caller observes a Run identity.
     /// Errors and a dropped deadline future retain evidence from any unsettled send.
     pub async fn post_developer_loop_retry_429_with_payload<F>(
         &self,
@@ -1756,7 +1757,9 @@ impl ThinClient {
                 .await;
             match result {
                 Ok(resp) => {
-                    *prior_dispatch_ambiguous = ambiguous_before_attempt;
+                    if resp.status().as_u16() == 429 {
+                        *prior_dispatch_ambiguous = ambiguous_before_attempt;
+                    }
                     if resp.status().as_u16() == 429 && attempt + 1 < max_attempts {
                         let delay_secs =
                             parse_retry_after(resp.headers()).unwrap_or(2u64 << attempt);
@@ -1780,7 +1783,12 @@ impl ThinClient {
                     if matches!(&e, ThinClientError::Http(error) if error.is_connect()) {
                         *prior_dispatch_ambiguous = ambiguous_before_attempt;
                     }
-                    if attempt + 1 < max_attempts && e.is_transport() {
+                    // A non-idempotent start may already have committed. Only
+                    // connector failure proves it is safe to start again.
+                    if attempt + 1 < max_attempts
+                        && matches!(&e, ThinClientError::Http(error) if error.is_connect())
+                        && !*prior_dispatch_ambiguous
+                    {
                         let delay_secs = 1u64 << attempt;
                         if !quiet {
                             tracing::warn!(
@@ -5642,8 +5650,8 @@ mod tests {
             .expect("second admission succeeds");
         assert_eq!(response.status().as_u16(), 200);
         assert!(
-            !ambiguous,
-            "429 responses are known rejections, not lost responses"
+            ambiguous,
+            "successful headers do not yet identify the accepted Run"
         );
         let requests = srv.received_requests().await.expect("request history");
         assert_eq!(requests.len(), 2);

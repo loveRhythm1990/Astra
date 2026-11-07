@@ -984,11 +984,12 @@ pub(crate) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<
                 return Vec::new();
             }
         };
-    if prefs.is_empty() {
-        return Vec::new();
-    }
+    apply_cloud_preferences(state, &prefs)
+}
+
+fn apply_cloud_preferences(state: &mut SessionState, prefs: &[(String, String)]) -> Vec<String> {
     let keys: Vec<String> = prefs.iter().map(|(k, _)| k.clone()).collect();
-    for (key, value) in &prefs {
+    for (key, value) in prefs {
         match key.as_str() {
             pref_keys::EXPLAIN_MODE => {
                 state.explain = match value.as_str() {
@@ -1049,6 +1050,7 @@ pub(crate) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<
     keys
 }
 
+#[cfg(test)]
 pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport {
     let auth_snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
     try_drain_sync_outbox_for_snapshot(limit, &auth_snapshot).await
@@ -1426,40 +1428,63 @@ fn append_cloud_pull_sync_journal_with_enqueue(
     }
 }
 
-/// Re-sync preferences and queued edge events after authentication. Login is
-/// still successful when sync is delayed, but the structured report makes the
-/// partial outcome visible to every UI path.
-pub(crate) async fn post_auth_cloud_resync(
-    profile: Option<&str>,
-    state: &mut SessionState,
-) -> SyncOutboxDrainReport {
-    let profile_name = profile.unwrap_or("default");
-    let pull = try_cloud_pull(profile_name).await;
-    let pref_keys = try_cloud_pull_preferences(state).await;
-    append_cloud_pull_sync_journal_for_immediate_drain(
-        state,
-        profile_name,
-        "post_login",
-        &pull,
-        &pref_keys,
-    );
-    let report = try_drain_sync_outbox(SYNC_OUTBOX_DRAIN_LIMIT).await;
-    if report.is_incomplete() {
-        tracing::warn!(
-            target: "astra_cli::cloud_sync",
-            attempted = report.attempted,
-            acked = report.acked,
-            failed = report.failed,
-            terminal = report.terminal,
-            remaining_ready = report.remaining_ready,
-            blocker = ?report.blocker,
-            "post-authentication cloud sync did not fully converge"
-        );
-    }
-    if report.can_retry_automatically() {
+/// Network result owned by the initiating identity. Applying it never waits
+/// for HTTP; the TUI can redraw, handle input and shut down during sync.
+pub(crate) struct PostAuthCloudResync {
+    pull: CloudPullResult,
+    preferences: Vec<(String, String)>,
+    pub(crate) report: SyncOutboxDrainReport,
+}
+
+pub(crate) async fn prepare_post_auth_cloud_resync(
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) -> PostAuthCloudResync {
+    let preferences = match owner
+        .native_binding
+        .as_ref()
+        .map(|binding| binding.endpoint().to_owned())
+        .or_else(resolve_cloud_base)
+    {
+        Some(base) => {
+            crate::cli::preferences_client::pull_all_preferences_for_owner(&base, owner).await
+        }
+        None => Err("cloud unconfigured".into()),
+    };
+    let pull = CloudPullResult {
+        cloud_reachable: preferences.is_ok(),
+    };
+    let preferences = preferences.unwrap_or_else(|_| {
+        tracing::warn!(target: "astra_cli::cloud_sync", operation = "post_auth_resync", error = "preference_pull_unavailable", "post-authentication preference pull skipped");
+        Vec::new()
+    });
+    let report = try_drain_sync_outbox_for_snapshot(SYNC_OUTBOX_DRAIN_LIMIT, owner).await;
+    if report.can_retry_automatically() && owner.is_current() {
         schedule_sync_outbox_drain();
     }
-    report
+    PostAuthCloudResync {
+        pull,
+        preferences,
+        report,
+    }
+}
+
+pub(crate) fn apply_post_auth_cloud_resync(
+    profile: Option<&str>,
+    state: &mut SessionState,
+    result: PostAuthCloudResync,
+) -> SyncOutboxDrainReport {
+    let keys = apply_cloud_preferences(state, &result.preferences);
+    append_cloud_pull_sync_journal_for_immediate_drain(
+        state,
+        profile.unwrap_or("default"),
+        "post_login",
+        &result.pull,
+        &keys,
+    );
+    // The marker just entered the canonical durable outbox. Its existing
+    // supervised drain owns delivery; never drain it serially on the UI loop.
+    schedule_sync_outbox_drain();
+    result.report
 }
 
 #[cfg(test)]
